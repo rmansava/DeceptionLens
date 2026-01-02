@@ -417,6 +417,152 @@ class DinoSearcher:
         print(f"Verification complete.")
         return matches
 
+    def get_match_visualization(self, query_bytes: bytes, match_path: str) -> tuple:
+        """
+        Get visualization data for matched keypoints between query and result.
+
+        Returns:
+            Tuple of (match_count, bounding_box) where bounding_box is (x, y, w, h) or None
+        """
+        if not self.extractor or not self.matcher or not KORNIA_AVAILABLE:
+            return (0, None)
+
+        try:
+            from io import BytesIO
+
+            # Load query image from bytes
+            query_pil = Image.open(BytesIO(query_bytes)).convert("RGB")
+            query_cv = cv2.cvtColor(np.array(query_pil), cv2.COLOR_RGB2BGR)
+
+            # Pad query image
+            h, w = query_cv.shape[:2]
+            new_h = ((h + 15) // 16) * 16
+            new_w = ((w + 15) // 16) * 16
+            if new_h - h > 0 or new_w - w > 0:
+                query_cv = cv2.copyMakeBorder(
+                    query_cv, 0, new_h - h, 0, new_w - w,
+                    cv2.BORDER_CONSTANT, value=[0, 0, 0]
+                )
+            query_cv = cv2.cvtColor(query_cv, cv2.COLOR_BGR2RGB)
+            query_tensor = K.image_to_tensor(query_cv, False).float() / 255.0
+            query_tensor = query_tensor.to(self.device)
+
+            # Load match image
+            match_img = self._load_torch_image(match_path)
+            if match_img is None:
+                return (0, None)
+
+            with torch.no_grad():
+                # Extract features
+                feats0_obj = self.extractor(query_tensor)[0]
+                feats0 = {
+                    "keypoints": feats0_obj.keypoints.unsqueeze(0),
+                    "descriptors": feats0_obj.descriptors.unsqueeze(0),
+                    "image_size": torch.tensor(query_tensor.shape[-2:][::-1]).view(1, 2).to(self.device)
+                }
+
+                feats1_obj = self.extractor(match_img)[0]
+                feats1 = {
+                    "keypoints": feats1_obj.keypoints.unsqueeze(0),
+                    "descriptors": feats1_obj.descriptors.unsqueeze(0),
+                    "image_size": torch.tensor(match_img.shape[-2:][::-1]).view(1, 2).to(self.device)
+                }
+
+                matches01 = self.matcher({"image0": feats0, "image1": feats1})
+                matches_idx = matches01["matches"][0]
+
+                # Get valid matches
+                valid_mask = matches_idx > -1
+                valid_count = valid_mask.sum().item()
+
+                if valid_count < 4:
+                    return (valid_count, None)
+
+                # Get matched keypoint coordinates in the match image
+                kpts0 = feats0["keypoints"][0]
+                kpts1 = feats1["keypoints"][0]
+
+                valid_indices = torch.where(valid_mask)[0]
+                matched_kpts1_indices = matches_idx[valid_mask]
+                matched_kpts1 = kpts1[matched_kpts1_indices].cpu().numpy()
+
+                # Calculate bounding box around matched keypoints
+                x_min = float(matched_kpts1[:, 0].min())
+                y_min = float(matched_kpts1[:, 1].min())
+                x_max = float(matched_kpts1[:, 0].max())
+                y_max = float(matched_kpts1[:, 1].max())
+
+                # Add padding (10%)
+                w = x_max - x_min
+                h = y_max - y_min
+                padding = max(w, h) * 0.1
+                x_min = max(0, x_min - padding)
+                y_min = max(0, y_min - padding)
+                x_max = x_max + padding
+                y_max = y_max + padding
+
+                bbox = {
+                    "x": x_min,
+                    "y": y_min,
+                    "width": x_max - x_min,
+                    "height": y_max - y_min
+                }
+
+                return (valid_count, bbox)
+
+        except Exception as e:
+            print(f"Visualization failed: {e}")
+            return (0, None)
+
+    def generate_visualization_image(self, query_bytes: bytes, match_path: str) -> bytes:
+        """
+        Generate a visualization image with bounding box drawn on the match.
+
+        Returns:
+            PNG image bytes with the matched region highlighted
+        """
+        match_count, bbox = self.get_match_visualization(query_bytes, match_path)
+
+        # Load the match image
+        img = cv2.imread(match_path)
+        if img is None:
+            return None
+
+        if bbox and match_count >= 4:
+            # Draw bounding box
+            x1 = int(bbox["x"])
+            y1 = int(bbox["y"])
+            x2 = int(bbox["x"] + bbox["width"])
+            y2 = int(bbox["y"] + bbox["height"])
+
+            # Draw semi-transparent overlay outside the box
+            overlay = img.copy()
+            mask = np.zeros(img.shape[:2], dtype=np.uint8)
+            mask[y1:y2, x1:x2] = 255
+
+            # Darken everything outside the box
+            overlay[mask == 0] = (overlay[mask == 0] * 0.4).astype(np.uint8)
+
+            # Draw bright box border
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 3)
+
+            # Add match count text
+            cv2.putText(
+                overlay,
+                f"{match_count} matches",
+                (x1 + 5, y1 + 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2
+            )
+
+            img = overlay
+
+        # Encode as PNG
+        _, buffer = cv2.imencode('.png', img)
+        return buffer.tobytes()
+
     def get_collection_stats(self, collection_name: str = "images") -> dict:
         """Get statistics for a collection."""
         stats = {

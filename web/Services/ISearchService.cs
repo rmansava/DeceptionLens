@@ -17,4 +17,7 @@ public interface ISearchService
 
     // Face search methods
     Task<List<SearchResult>> FaceSearchAsync(Stream imageStream, string fileName, int topK = 50, string collection = "images");
+
+    // Visualization methods
+    Task<byte[]?> GetVisualizationAsync(Stream queryImageStream, string fileName, string matchPath);
 }

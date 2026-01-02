@@ -39,6 +39,12 @@
                 <label for="verifyCheck">Geometric Verification</label>
             </div>
 
+            <!-- Visualize Checkbox -->
+            <div class="form-group checkbox-group">
+                <input type="checkbox" @bind="visualizeMatches" id="visualizeCheck" disabled="@(!verify)" />
+                <label for="visualizeCheck" class="@(!verify ? "disabled-label" : "")">Visualize Matches</label>
+            </div>
+
             <!-- DINOv2 Visual Search -->
             <div class="upload-area @(isDragging ? "dragging" : "")"
                  @ondragenter="HandleDragEnter"
@@ -239,13 +245,17 @@
             <div class="results-grid results-grid-@thumbnailSize">
                 @foreach (var (result, index) in results.Select((r, i) => (r, i)))
                 {
-                    <div class="result-card">
+                    <div class="result-card @(CanVisualize(result) ? "clickable" : "")" @onclick="() => HandleResultClick(result)">
                         <div class="result-image-container">
                             <img src="@SearchService.GetImageUrl(result.Path)"
                                  alt="Result @(index + 1)"
                                  loading="lazy"
                                  @onerror="HandleImageError" />
                             <span class="rank-badge">#@(index + 1)</span>
+                            @if (CanVisualize(result))
+                            {
+                                <span class="visualize-hint">Click to visualize</span>
+                            }
                         </div>
                         <div class="result-info">
                             <h3 class="result-filename" title="@result.Path">@result.FileName</h3>
@@ -258,7 +268,7 @@
                                 }
                                 <span class="score-badge">Score: @result.Score.ToString("F4")</span>
                             </div>
-                            <button class="open-btn" @onclick="() => OpenImage(result.Path)">
+                            <button class="open-btn" @onclick="() => OpenImage(result.Path)" @onclick:stopPropagation="true">
                                 Open Image
                             </button>
                         </div>
@@ -268,6 +278,27 @@
         }
     </section>
 </div>
+
+@if (visualizationUrl != null || isLoadingVisualization)
+{
+    <div class="visualization-overlay" @onclick="CloseVisualization">
+        <div class="visualization-content" @onclick:stopPropagation="true">
+            @if (isLoadingVisualization)
+            {
+                <div class="loading-container">
+                    <div class="spinner"></div>
+                    <p>Generating visualization...</p>
+                </div>
+            }
+            else
+            {
+                <img src="@visualizationUrl" alt="Match Visualization" />
+                <p class="visualization-path">@visualizingPath</p>
+            }
+            <button class="close-btn" @onclick="CloseVisualization">Close</button>
+        </div>
+    </div>
+}
 
 <style>
     .text-search-row {
@@ -400,6 +431,93 @@
         width: 24px;
         height: 24px;
     }
+
+    /* Disabled label */
+    .disabled-label {
+        color: #6b7280;
+    }
+
+    /* Clickable result card */
+    .result-card.clickable {
+        cursor: pointer;
+    }
+
+    .result-card.clickable:hover {
+        border-color: #3b82f6;
+    }
+
+    .visualize-hint {
+        position: absolute;
+        bottom: 8px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(59, 130, 246, 0.9);
+        color: white;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 0.7rem;
+        opacity: 0;
+        transition: opacity 0.2s;
+        pointer-events: none;
+        white-space: nowrap;
+    }
+
+    .result-card.clickable:hover .visualize-hint {
+        opacity: 1;
+    }
+
+    /* Visualization overlay */
+    .visualization-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.85);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+    }
+
+    .visualization-content {
+        max-width: 90vw;
+        max-height: 90vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+    }
+
+    .visualization-content img {
+        max-width: 100%;
+        max-height: 80vh;
+        object-fit: contain;
+        border-radius: 8px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    }
+
+    .visualization-path {
+        color: #9ca3af;
+        font-size: 0.875rem;
+        text-align: center;
+        word-break: break-all;
+        max-width: 100%;
+    }
+
+    .close-btn {
+        padding: 10px 24px;
+        background: #374151;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.875rem;
+    }
+
+    .close-btn:hover {
+        background: #4b5563;
+    }
 </style>
 
 @code {
@@ -410,6 +528,12 @@
     private string textQuery = "";
     private string lastSearchType = "";
     private string thumbnailSize = "medium";
+    private bool visualizeMatches = false;
+
+    // Visualization state
+    private string? visualizationUrl = null;
+    private string? visualizingPath = null;
+    private bool isLoadingVisualization = false;
 
     private List<SearchResult> results = new();
     private StatsResponse? stats;
@@ -688,7 +812,7 @@
     private void HandleDragEnter() => isDragging = true;
     private void HandleDragLeave() => isDragging = false;
 
-    private async Task HandleDrop(DragEventArgs e)
+    private void HandleDrop(DragEventArgs e)
     {
         isDragging = false;
     }
@@ -700,5 +824,57 @@
 
     private void HandleImageError()
     {
+    }
+
+    private bool CanVisualize(SearchResult result)
+    {
+        return visualizeMatches
+            && verify
+            && lastSearchType == "DINOv2 Visual"
+            && result.VerifiedMatches >= 4
+            && dinoFileBytes != null;
+    }
+
+    private async Task HandleResultClick(SearchResult result)
+    {
+        if (!CanVisualize(result)) return;
+
+        isLoadingVisualization = true;
+        visualizingPath = result.Path;
+        StateHasChanged();
+
+        try
+        {
+            using var ms = new MemoryStream(dinoFileBytes!);
+            var visBytes = await SearchService.GetVisualizationAsync(ms, dinoSelectedFile?.Name ?? "query.jpg", result.Path);
+
+            if (visBytes != null)
+            {
+                visualizationUrl = $"data:image/png;base64,{Convert.ToBase64String(visBytes)}";
+            }
+            else
+            {
+                errorMessage = "Failed to generate visualization";
+                CloseVisualization();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Visualization failed");
+            errorMessage = $"Visualization failed: {ex.Message}";
+            CloseVisualization();
+        }
+        finally
+        {
+            isLoadingVisualization = false;
+            StateHasChanged();
+        }
+    }
+
+    private void CloseVisualization()
+    {
+        visualizationUrl = null;
+        visualizingPath = null;
+        isLoadingVisualization = false;
     }
 }

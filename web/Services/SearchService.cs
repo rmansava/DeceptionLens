@@ -219,4 +219,32 @@ public class SearchService : ISearchService
             throw;
         }
     }
+
+    public async Task<byte[]?> GetVisualizationAsync(
+        Stream queryImageStream,
+        string fileName,
+        string matchPath)
+    {
+        try
+        {
+            using var content = new MultipartFormDataContent();
+            using var streamContent = new StreamContent(queryImageStream);
+            streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+            content.Add(streamContent, "file", fileName);
+
+            var url = $"/visualize?match_path={Uri.EscapeDataString(matchPath)}";
+
+            _logger.LogInformation("Getting visualization for: {MatchPath}", matchPath);
+
+            var response = await _httpClient.PostAsync(url, content);
+            response.EnsureSuccessStatusCode();
+
+            return await response.Content.ReadAsByteArrayAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Visualization failed for {MatchPath}", matchPath);
+            return null;
+        }
+    }
 }

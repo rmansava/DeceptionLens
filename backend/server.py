@@ -4,7 +4,7 @@ FastAPI backend for the web application.
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import shutil
 import os
@@ -306,6 +306,43 @@ async def search_faces(
 
     except Exception as e:
         logger.error(f"Face search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== Visualization Endpoints ==============
+
+@app.post("/visualize")
+async def visualize_match(
+    file: UploadFile = File(...),
+    match_path: str = Query(..., description="Path to the matched image")
+):
+    """
+    Generate a visualization showing where the query matches on the result image.
+
+    - **file**: Query image
+    - **match_path**: Path to the matched result image
+
+    Returns: PNG image with the matched region highlighted
+    """
+    s = get_searcher()
+    if s is None:
+        raise HTTPException(status_code=503, detail="Searcher not initialized")
+
+    try:
+        query_bytes = await file.read()
+        logger.info(f"Generating visualization for match: {match_path}")
+
+        vis_bytes = s.generate_visualization_image(query_bytes, match_path)
+
+        if vis_bytes is None:
+            raise HTTPException(status_code=404, detail="Could not generate visualization")
+
+        return Response(content=vis_bytes, media_type="image/png")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Visualization failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
