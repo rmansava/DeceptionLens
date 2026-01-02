@@ -1,0 +1,30 @@
+# DinoDeceptionLens Backend Requirements
+# GPU support: Install torch with CUDA from https://pytorch.org/get-started/locally/
+
+# Core ML
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+
+# Face Detection (InsightFace)
+insightface>=0.7.3
+onnxruntime-gpu>=1.15.0
+
+# Vector Database
+chromadb>=0.4.0
+
+# Geometric Verification (Optional)
+kornia>=0.7.0
+
+# Image Processing
+opencv-python>=4.8.0
+pillow>=10.0.0
+numpy>=1.24.0
+
+# Web Server
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+python-multipart>=0.0.6
+
+# Utilities
+tqdm

@@ -1,0 +1,611 @@
+@page "/"
+@inject ISearchService SearchService
+@inject ILogger<Index> Logger
+
+<PageTitle>Deception Lens - An Image Finder</PageTitle>
+
+<div class="search-container">
+    <!-- Left Panel: Search Controls -->
+    <aside class="search-panel">
+        <!-- Shared Settings -->
+        <div class="panel-section">
+            <h2 class="section-title">Settings</h2>
+
+            <!-- Collection Selector -->
+            <div class="form-group">
+                <label>Collection</label>
+                <select @bind="selectedCollection" class="form-select">
+                    @foreach (var col in collections)
+                    {
+                        <option value="@col">@col</option>
+                    }
+                </select>
+            </div>
+
+            <!-- Results Count -->
+            <div class="form-group">
+                <label>Results</label>
+                <input type="number" @bind="topK" min="1" max="500" class="form-input" />
+            </div>
+        </div>
+
+        <!-- DINOv2 Section -->
+        <div class="panel-section">
+            <h2 class="section-title">DINOv2 Search</h2>
+
+            <!-- Verify Checkbox -->
+            <div class="form-group checkbox-group">
+                <input type="checkbox" @bind="verify" id="verifyCheck" />
+                <label for="verifyCheck">Geometric Verification</label>
+            </div>
+
+            <!-- DINOv2 Visual Search -->
+            <div class="upload-area @(isDragging ? "dragging" : "")"
+                 @ondragenter="HandleDragEnter"
+                 @ondragleave="HandleDragLeave"
+                 @ondragover:preventDefault
+                 @ondrop="HandleDrop"
+                 @ondrop:preventDefault>
+
+                @if (dinoPreviewUrl != null)
+                {
+                    <img src="@dinoPreviewUrl" alt="DINOv2 Query" class="preview-image" />
+                    <button class="clear-btn" @onclick="ClearDinoQuery">Clear</button>
+                }
+                else
+                {
+                    <div class="upload-prompt">
+                        <svg class="upload-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                        </svg>
+                        <p>Drop image here</p>
+                    </div>
+                }
+
+                <InputFile OnChange="HandleDinoFileSelected" accept="image/*" class="file-input" />
+            </div>
+        </div>
+
+        <!-- CLIP Section -->
+        <div class="panel-section">
+            <h2 class="section-title">CLIP Search</h2>
+
+            <!-- CLIP Text Search -->
+            <div class="form-group">
+                <label>Text Search</label>
+                <div class="text-search-row">
+                    <input type="text" @bind="textQuery" @bind:event="oninput"
+                           @onkeydown="HandleTextKeyDown"
+                           placeholder="e.g., truck, red car, sunset..."
+                           class="form-input text-search-input" />
+                    <button class="search-btn" @onclick="PerformTextSearch" disabled="@(string.IsNullOrWhiteSpace(textQuery) || isSearching)">
+                        Go
+                    </button>
+                </div>
+            </div>
+
+            <!-- CLIP Visual Search -->
+            <div class="form-group">
+                <label>Visual Search</label>
+            </div>
+            <div class="upload-area @(isDragging ? "dragging" : "")"
+                 @ondragenter="HandleDragEnter"
+                 @ondragleave="HandleDragLeave"
+                 @ondragover:preventDefault
+                 @ondrop="HandleDrop"
+                 @ondrop:preventDefault>
+
+                @if (clipPreviewUrl != null)
+                {
+                    <img src="@clipPreviewUrl" alt="CLIP Query" class="preview-image" />
+                    <button class="clear-btn" @onclick="ClearClipQuery">Clear</button>
+                }
+                else
+                {
+                    <div class="upload-prompt">
+                        <svg class="upload-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                        </svg>
+                        <p>Drop image here</p>
+                    </div>
+                }
+
+                <InputFile OnChange="HandleClipFileSelected" accept="image/*" class="file-input" />
+            </div>
+        </div>
+
+        <!-- Stats -->
+        <div class="panel-section stats-section">
+            <h3 class="section-title-sm">Statistics</h3>
+            @if (stats != null)
+            {
+                <p>DINOv2: <span class="stat-value">@stats.VisualCount.ToString("N0")</span> images</p>
+            }
+            @if (clipStats != null)
+            {
+                <p>CLIP: <span class="stat-value">@clipStats.TotalImages.ToString("N0")</span> images</p>
+            }
+            @if (stats == null && clipStats == null)
+            {
+                <p class="text-muted">Loading...</p>
+            }
+        </div>
+
+        <!-- Status -->
+        <div class="panel-section status-section">
+            <p>Status: <span class="@(isSearching ? "status-searching" : "status-ready")">@(isSearching ? "Searching..." : "Ready")</span></p>
+            <p>Found: <span class="stat-value">@results.Count</span> matches</p>
+            @if (!string.IsNullOrEmpty(lastSearchType))
+            {
+                <p class="text-muted">Last: @lastSearchType</p>
+            }
+        </div>
+    </aside>
+
+    <!-- Right Panel: Results -->
+    <section class="results-panel">
+        <div class="results-header">
+            <div class="results-title-row">
+                <h2>Results</h2>
+                @if (results.Any())
+                {
+                    <span class="results-subtitle">
+                        @if (lastSearchType == "DINOv2 Visual" && verify)
+                        {
+                            @:Sorted by verified matches
+                        }
+                        else
+                        {
+                            @:Sorted by similarity score
+                        }
+                    </span>
+                }
+            </div>
+            <div class="thumbnail-size-selector">
+                <button class="size-btn @(thumbnailSize == "small" ? "active" : "")" @onclick="@(() => thumbnailSize = "small")" title="Small thumbnails">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                        <rect x="1" y="1" width="3" height="3" /><rect x="6" y="1" width="3" height="3" /><rect x="11" y="1" width="3" height="3" />
+                        <rect x="1" y="6" width="3" height="3" /><rect x="6" y="6" width="3" height="3" /><rect x="11" y="6" width="3" height="3" />
+                        <rect x="1" y="11" width="3" height="3" /><rect x="6" y="11" width="3" height="3" /><rect x="11" y="11" width="3" height="3" />
+                    </svg>
+                </button>
+                <button class="size-btn @(thumbnailSize == "medium" ? "active" : "")" @onclick="@(() => thumbnailSize = "medium")" title="Medium thumbnails">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                        <rect x="1" y="1" width="6" height="6" /><rect x="9" y="1" width="6" height="6" />
+                        <rect x="1" y="9" width="6" height="6" /><rect x="9" y="9" width="6" height="6" />
+                    </svg>
+                </button>
+                <button class="size-btn @(thumbnailSize == "large" ? "active" : "")" @onclick="@(() => thumbnailSize = "large")" title="Large thumbnails">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                        <rect x="1" y="1" width="14" height="6" />
+                        <rect x="1" y="9" width="14" height="6" />
+                    </svg>
+                </button>
+            </div>
+        </div>
+
+        @if (errorMessage != null)
+        {
+            <div class="error-message">
+                @errorMessage
+            </div>
+        }
+
+        @if (isSearching)
+        {
+            <div class="loading-container">
+                <div class="spinner"></div>
+                <p>Searching...</p>
+            </div>
+        }
+        else if (!results.Any() && hasSearched)
+        {
+            <div class="no-results">
+                <p>No results found. Try a different query.</p>
+            </div>
+        }
+        else
+        {
+            <div class="results-grid results-grid-@thumbnailSize">
+                @foreach (var (result, index) in results.Select((r, i) => (r, i)))
+                {
+                    <div class="result-card">
+                        <div class="result-image-container">
+                            <img src="@SearchService.GetImageUrl(result.Path)"
+                                 alt="Result @(index + 1)"
+                                 loading="lazy"
+                                 @onerror="HandleImageError" />
+                            <span class="rank-badge">#@(index + 1)</span>
+                        </div>
+                        <div class="result-info">
+                            <h3 class="result-filename" title="@result.Path">@result.FileName</h3>
+                            <div class="result-stats">
+                                @if (lastSearchType == "DINOv2 Visual" && verify && result.VerifiedMatches > 0)
+                                {
+                                    <span class="verified-badge verified-positive">
+                                        @result.VerifiedMatches verified
+                                    </span>
+                                }
+                                <span class="score-badge">Score: @result.Score.ToString("F4")</span>
+                            </div>
+                            <button class="open-btn" @onclick="() => OpenImage(result.Path)">
+                                Open Image
+                            </button>
+                        </div>
+                    </div>
+                }
+            </div>
+        }
+    </section>
+</div>
+
+<style>
+    .text-search-row {
+        display: flex;
+        gap: 8px;
+    }
+
+    .text-search-input {
+        flex: 1;
+    }
+
+    .search-btn {
+        padding: 8px 16px;
+        background: #3b82f6;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-weight: 500;
+    }
+
+    .search-btn:hover:not(:disabled) {
+        background: #2563eb;
+    }
+
+    .search-btn:disabled {
+        background: #9ca3af;
+        cursor: not-allowed;
+    }
+
+    .divider-text {
+        text-align: center;
+        color: #6b7280;
+        font-size: 0.875rem;
+        margin: 12px 0;
+        position: relative;
+    }
+
+    .divider-text::before,
+    .divider-text::after {
+        content: '';
+        position: absolute;
+        top: 50%;
+        width: 30%;
+        height: 1px;
+        background: #374151;
+    }
+
+    .divider-text::before {
+        left: 0;
+    }
+
+    .divider-text::after {
+        right: 0;
+    }
+
+    /* Results header layout */
+    .results-title-row {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+    }
+
+    /* Thumbnail size selector */
+    .thumbnail-size-selector {
+        display: flex;
+        gap: 4px;
+        background: #1f2937;
+        padding: 4px;
+        border-radius: 6px;
+    }
+
+    .size-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        background: transparent;
+        border: none;
+        border-radius: 4px;
+        color: #9ca3af;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .size-btn:hover {
+        background: #374151;
+        color: #e5e7eb;
+    }
+
+    .size-btn.active {
+        background: #3b82f6;
+        color: white;
+    }
+
+    /* Grid size variations */
+    .results-grid-small {
+        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)) !important;
+    }
+
+    .results-grid-medium {
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)) !important;
+    }
+
+    .results-grid-large {
+        grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)) !important;
+    }
+
+    /* Adjust card info for small size */
+    .results-grid-small .result-info {
+        padding: 0.5rem;
+    }
+
+    .results-grid-small .result-filename {
+        font-size: 0.65rem;
+    }
+
+    .results-grid-small .result-stats {
+        font-size: 0.6rem;
+    }
+
+    .results-grid-small .open-btn {
+        font-size: 0.65rem;
+        padding: 4px 8px;
+    }
+
+    .results-grid-small .rank-badge {
+        font-size: 0.6rem;
+        width: 24px;
+        height: 24px;
+    }
+</style>
+
+@code {
+    private List<string> collections = new() { "images" };
+    private string selectedCollection = "images";
+    private int topK = 50;
+    private bool verify = true;
+    private string textQuery = "";
+    private string lastSearchType = "";
+    private string thumbnailSize = "medium";
+
+    private List<SearchResult> results = new();
+    private StatsResponse? stats;
+    private ClipStatsResponse? clipStats;
+    private string? errorMessage;
+    private bool isSearching = false;
+    private bool hasSearched = false;
+    private bool isDragging = false;
+
+    // CLIP file state
+    private string? clipPreviewUrl;
+    private IBrowserFile? clipSelectedFile;
+    private byte[]? clipFileBytes;
+
+    // DINOv2 file state
+    private string? dinoPreviewUrl;
+    private IBrowserFile? dinoSelectedFile;
+    private byte[]? dinoFileBytes;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadCollections();
+        await LoadStats();
+        await LoadClipStats();
+    }
+
+    private async Task LoadCollections()
+    {
+        try
+        {
+            var cols = await SearchService.GetCollectionsAsync();
+            if (cols.Any())
+            {
+                var baseNames = cols
+                    .Select(c => c.Replace("_visual", "").Replace("_faces", ""))
+                    .Distinct()
+                    .ToList();
+
+                if (baseNames.Any())
+                {
+                    collections = baseNames;
+                    selectedCollection = collections.First();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load collections");
+        }
+    }
+
+    private async Task LoadStats()
+    {
+        try
+        {
+            stats = await SearchService.GetStatsAsync(selectedCollection);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load stats");
+        }
+    }
+
+    private async Task LoadClipStats()
+    {
+        try
+        {
+            clipStats = await SearchService.GetClipStatsAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load CLIP stats");
+        }
+    }
+
+    private async Task HandleTextKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !string.IsNullOrWhiteSpace(textQuery))
+        {
+            await PerformTextSearch();
+        }
+    }
+
+    private async Task PerformTextSearch()
+    {
+        if (string.IsNullOrWhiteSpace(textQuery)) return;
+
+        isSearching = true;
+        hasSearched = true;
+        errorMessage = null;
+        lastSearchType = $"Text: \"{textQuery}\"";
+        StateHasChanged();
+
+        try
+        {
+            results = await SearchService.ClipTextSearchAsync(textQuery, topK);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "CLIP text search failed");
+            errorMessage = $"Search failed: {ex.Message}";
+            results = new List<SearchResult>();
+        }
+        finally
+        {
+            isSearching = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task HandleClipFileSelected(InputFileChangeEventArgs e)
+    {
+        clipSelectedFile = e.File;
+
+        using var ms = new MemoryStream();
+        await clipSelectedFile.OpenReadStream(maxAllowedSize: 100 * 1024 * 1024).CopyToAsync(ms);
+        clipFileBytes = ms.ToArray();
+
+        clipPreviewUrl = $"data:{clipSelectedFile.ContentType};base64,{Convert.ToBase64String(clipFileBytes)}";
+
+        await PerformClipImageSearch();
+    }
+
+    private async Task HandleDinoFileSelected(InputFileChangeEventArgs e)
+    {
+        dinoSelectedFile = e.File;
+
+        using var ms = new MemoryStream();
+        await dinoSelectedFile.OpenReadStream(maxAllowedSize: 100 * 1024 * 1024).CopyToAsync(ms);
+        dinoFileBytes = ms.ToArray();
+
+        dinoPreviewUrl = $"data:{dinoSelectedFile.ContentType};base64,{Convert.ToBase64String(dinoFileBytes)}";
+
+        await PerformDinoImageSearch();
+    }
+
+    private async Task PerformClipImageSearch()
+    {
+        if (clipSelectedFile == null || clipFileBytes == null || clipFileBytes.Length == 0) return;
+
+        isSearching = true;
+        hasSearched = true;
+        errorMessage = null;
+        lastSearchType = "CLIP Visual";
+        StateHasChanged();
+
+        try
+        {
+            using var ms = new MemoryStream(clipFileBytes);
+            results = await SearchService.ClipImageSearchAsync(ms, clipSelectedFile.Name, topK);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "CLIP image search failed");
+            errorMessage = $"Search failed: {ex.Message}";
+            results = new List<SearchResult>();
+        }
+        finally
+        {
+            isSearching = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task PerformDinoImageSearch()
+    {
+        if (dinoSelectedFile == null || dinoFileBytes == null || dinoFileBytes.Length == 0) return;
+
+        isSearching = true;
+        hasSearched = true;
+        errorMessage = null;
+        lastSearchType = "DINOv2 Visual";
+        StateHasChanged();
+
+        try
+        {
+            using var ms = new MemoryStream(dinoFileBytes);
+            results = await SearchService.SearchAsync(
+                ms,
+                dinoSelectedFile.Name,
+                topK,
+                selectedCollection,
+                verify
+            );
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "DINOv2 image search failed");
+            errorMessage = $"Search failed: {ex.Message}";
+            results = new List<SearchResult>();
+        }
+        finally
+        {
+            isSearching = false;
+            StateHasChanged();
+        }
+    }
+
+    private void ClearClipQuery()
+    {
+        clipSelectedFile = null;
+        clipFileBytes = null;
+        clipPreviewUrl = null;
+    }
+
+    private void ClearDinoQuery()
+    {
+        dinoSelectedFile = null;
+        dinoFileBytes = null;
+        dinoPreviewUrl = null;
+    }
+
+    private void HandleDragEnter() => isDragging = true;
+    private void HandleDragLeave() => isDragging = false;
+
+    private async Task HandleDrop(DragEventArgs e)
+    {
+        isDragging = false;
+    }
+
+    private void OpenImage(string path)
+    {
+        var url = SearchService.GetImageUrl(path);
+    }
+
+    private void HandleImageError()
+    {
+    }
+}

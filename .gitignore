@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# ChromaDB
+chroma_db/
+*.db
+
+# Temp files
+temp_uploads/
+*.tmp
+*.temp
+batch_progress.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model cache (large files)
+.cache/
+models/
