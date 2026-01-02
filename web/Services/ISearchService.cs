@@ -14,4 +14,7 @@ public interface ISearchService
     Task<List<SearchResult>> ClipTextSearchAsync(string query, int topK = 50);
     Task<List<SearchResult>> ClipImageSearchAsync(Stream imageStream, string fileName, int topK = 50);
     Task<ClipStatsResponse?> GetClipStatsAsync();
+
+    // Face search methods
+    Task<List<SearchResult>> FaceSearchAsync(Stream imageStream, string fileName, int topK = 50, string collection = "images");
 }

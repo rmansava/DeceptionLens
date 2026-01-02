@@ -186,4 +186,37 @@ public class SearchService : ISearchService
             return null;
         }
     }
+
+    public async Task<List<SearchResult>> FaceSearchAsync(
+        Stream imageStream,
+        string fileName,
+        int topK = 50,
+        string collection = "images")
+    {
+        try
+        {
+            using var content = new MultipartFormDataContent();
+            using var streamContent = new StreamContent(imageStream);
+            streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+            content.Add(streamContent, "file", fileName);
+
+            var url = $"/search/faces?top_k={topK}&collection={Uri.EscapeDataString(collection)}";
+
+            _logger.LogInformation("Face search: {FileName}, topK: {TopK}, collection: {Collection}", fileName, topK, collection);
+
+            var response = await _httpClient.PostAsync(url, content);
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            var results = JsonSerializer.Deserialize<List<SearchResult>>(json) ?? new List<SearchResult>();
+
+            _logger.LogInformation("Found {Count} face results", results.Count);
+            return results;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Face search failed");
+            throw;
+        }
+    }
 }

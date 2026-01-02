@@ -114,6 +114,36 @@
             </div>
         </div>
 
+        <!-- Face Search Section -->
+        <div class="panel-section">
+            <h2 class="section-title">Face Search</h2>
+
+            <div class="upload-area @(isDragging ? "dragging" : "")"
+                 @ondragenter="HandleDragEnter"
+                 @ondragleave="HandleDragLeave"
+                 @ondragover:preventDefault
+                 @ondrop="HandleDrop"
+                 @ondrop:preventDefault>
+
+                @if (facePreviewUrl != null)
+                {
+                    <img src="@facePreviewUrl" alt="Face Query" class="preview-image" />
+                    <button class="clear-btn" @onclick="ClearFaceQuery">Clear</button>
+                }
+                else
+                {
+                    <div class="upload-prompt">
+                        <svg class="upload-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                        </svg>
+                        <p>Drop face image</p>
+                    </div>
+                }
+
+                <InputFile OnChange="HandleFaceFileSelected" accept="image/*" class="file-input" />
+            </div>
+        </div>
+
         <!-- Stats -->
         <div class="panel-section stats-section">
             <h3 class="section-title-sm">Statistics</h3>
@@ -399,6 +429,11 @@
     private IBrowserFile? dinoSelectedFile;
     private byte[]? dinoFileBytes;
 
+    // Face file state
+    private string? facePreviewUrl;
+    private IBrowserFile? faceSelectedFile;
+    private byte[]? faceFileBytes;
+
     protected override async Task OnInitializedAsync()
     {
         await LoadCollections();
@@ -590,6 +625,64 @@
         dinoSelectedFile = null;
         dinoFileBytes = null;
         dinoPreviewUrl = null;
+    }
+
+    private async Task HandleFaceFileSelected(InputFileChangeEventArgs e)
+    {
+        faceSelectedFile = e.File;
+
+        using var ms = new MemoryStream();
+        await faceSelectedFile.OpenReadStream(maxAllowedSize: 100 * 1024 * 1024).CopyToAsync(ms);
+        faceFileBytes = ms.ToArray();
+
+        facePreviewUrl = $"data:{faceSelectedFile.ContentType};base64,{Convert.ToBase64String(faceFileBytes)}";
+
+        await PerformFaceSearch();
+    }
+
+    private async Task PerformFaceSearch()
+    {
+        if (faceSelectedFile == null || faceFileBytes == null || faceFileBytes.Length == 0) return;
+
+        isSearching = true;
+        hasSearched = true;
+        errorMessage = null;
+        lastSearchType = "Face Search";
+        StateHasChanged();
+
+        try
+        {
+            using var ms = new MemoryStream(faceFileBytes);
+            results = await SearchService.FaceSearchAsync(
+                ms,
+                faceSelectedFile.Name,
+                topK,
+                selectedCollection
+            );
+
+            if (results.Count == 0)
+            {
+                errorMessage = "No faces detected in the image or no matches found";
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Face search failed");
+            errorMessage = $"Face search failed: {ex.Message}";
+            results = new List<SearchResult>();
+        }
+        finally
+        {
+            isSearching = false;
+            StateHasChanged();
+        }
+    }
+
+    private void ClearFaceQuery()
+    {
+        faceSelectedFile = null;
+        faceFileBytes = null;
+        facePreviewUrl = null;
     }
 
     private void HandleDragEnter() => isDragging = true;

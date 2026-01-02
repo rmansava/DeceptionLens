@@ -1,6 +1,6 @@
 """
-DinoDeceptionLens Searcher
-Performs similarity search using DINOv2 embeddings and optional geometric verification.
+Deception Lens Searcher
+Performs similarity search using DINOv2 embeddings, InsightFace, and optional geometric verification.
 """
 import torch
 from PIL import Image
@@ -20,6 +20,15 @@ except ImportError:
     K = None
     KORNIA_AVAILABLE = False
     print("Kornia not installed. Geometric verification will be disabled.")
+
+# Try importing InsightFace for face search (optional)
+try:
+    from insightface.app import FaceAnalysis
+    INSIGHTFACE_AVAILABLE = True
+except ImportError:
+    FaceAnalysis = None
+    INSIGHTFACE_AVAILABLE = False
+    print("InsightFace not installed. Face search will be disabled.")
 
 
 class DinoSearcher:
@@ -51,6 +60,10 @@ class DinoSearcher:
                 print("DISK + LightGlue loaded.")
             except Exception as e:
                 print(f"Failed to load DISK/LightGlue: {e}")
+
+        # Initialize InsightFace for face search (optional, lazy-loaded)
+        self.face_app = None
+        self.face_app_loaded = False
 
     def get_embedding(self, image_path: str) -> np.ndarray:
         """Generate DINOv2 embedding for a query image."""
@@ -178,6 +191,66 @@ class DinoSearcher:
         # Return only top_k results
         return matches[:top_k]
 
+    def _load_face_app(self):
+        """Lazy-load InsightFace to avoid memory conflicts with other models."""
+        if self.face_app_loaded:
+            return self.face_app is not None
+
+        if not INSIGHTFACE_AVAILABLE:
+            print("InsightFace not available for face search")
+            self.face_app_loaded = True
+            return False
+
+        try:
+            print("Loading InsightFace for face search...")
+            self.face_app = FaceAnalysis(
+                name='buffalo_l',
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+            )
+            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+            print("InsightFace loaded.")
+            self.face_app_loaded = True
+            return True
+        except Exception as e:
+            print(f"Failed to load InsightFace: {e}")
+            self.face_app_loaded = True
+            return False
+
+    def get_face_embedding(self, image_path: str) -> list:
+        """Extract face embeddings from an image using InsightFace."""
+        if not self._load_face_app():
+            return []
+
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                return []
+
+            faces = self.face_app.get(img)
+            embeddings = [face.embedding for face in faces]
+            return embeddings
+        except Exception as e:
+            print(f"Error extracting faces from {image_path}: {e}")
+            return []
+
+    def get_face_embedding_from_bytes(self, image_bytes: bytes) -> list:
+        """Extract face embeddings from image bytes using InsightFace."""
+        if not self._load_face_app():
+            return []
+
+        try:
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                return []
+
+            faces = self.face_app.get(img)
+            embeddings = [face.embedding for face in faces]
+            return embeddings
+        except Exception as e:
+            print(f"Error extracting faces from bytes: {e}")
+            return []
+
     def search_faces(
         self,
         query_path: str,
@@ -185,13 +258,82 @@ class DinoSearcher:
         collection_name: str = "images"
     ) -> list:
         """
-        Search for similar faces.
-        Requires InsightFace to extract face embedding from query.
+        Search for similar faces using InsightFace embeddings.
+
+        Args:
+            query_path: Path to query image containing face(s)
+            top_k: Number of results to return
+            collection_name: Base name of the collection
+
+        Returns:
+            List of match dictionaries with path, score, metadata
         """
-        # This would need InsightFace to be loaded - for now return empty
-        # The server can handle this separately if needed
-        print("Face search requires InsightFace - use the indexer with faces enabled")
-        return []
+        embeddings = self.get_face_embedding(query_path)
+        if not embeddings:
+            print("No faces detected in query image")
+            return []
+
+        # Use first detected face for search
+        query_emb = embeddings[0]
+        return self._search_faces_with_embedding(query_emb, top_k, collection_name)
+
+    def search_faces_by_bytes(
+        self,
+        image_bytes: bytes,
+        top_k: int = 50,
+        collection_name: str = "images"
+    ) -> list:
+        """Search for similar faces using image bytes."""
+        embeddings = self.get_face_embedding_from_bytes(image_bytes)
+        if not embeddings:
+            print("No faces detected in query image")
+            return []
+
+        # Use first detected face for search
+        query_emb = embeddings[0]
+        return self._search_faces_with_embedding(query_emb, top_k, collection_name)
+
+    def _search_faces_with_embedding(
+        self,
+        query_emb: np.ndarray,
+        top_k: int,
+        collection_name: str
+    ) -> list:
+        """Internal face search using pre-computed embedding."""
+        try:
+            collection = self.client.get_collection(name=f"{collection_name}_faces")
+        except Exception as e:
+            print(f"Collection {collection_name}_faces not found: {e}")
+            return []
+
+        results = collection.query(
+            query_embeddings=[query_emb.tolist()],
+            n_results=top_k,
+            include=["metadatas", "distances"]
+        )
+
+        matches = []
+        if not results['ids'] or not results['ids'][0]:
+            return matches
+
+        ids = results['ids'][0]
+        distances = results['distances'][0]
+        metadatas = results['metadatas'][0]
+
+        for id, dist, meta in zip(ids, distances, metadatas):
+            # Convert cosine distance to similarity score
+            score = max(0, 1 - dist)
+
+            match_data = {
+                "path": meta.get("path", id),
+                "score": score,
+                "metadata": meta,
+                "verified_matches": 0,
+                "face_id": id
+            }
+            matches.append(match_data)
+
+        return matches
 
     def _load_torch_image(self, path: str):
         """Load and prepare image for DISK/LightGlue."""

@@ -261,6 +261,54 @@ def delete_collection(collection_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============== Face Search Endpoints ==============
+
+@app.post("/search/faces", response_model=List[SearchResult])
+async def search_faces(
+    file: UploadFile = File(...),
+    top_k: int = Query(default=50, ge=1, le=500),
+    collection: str = Query(default="images")
+):
+    """
+    Search for similar faces using InsightFace.
+
+    - **file**: Query image containing face(s)
+    - **top_k**: Number of results to return (1-500)
+    - **collection**: Collection name to search in
+    """
+    s = get_searcher()
+    if s is None:
+        raise HTTPException(status_code=503, detail="Searcher not initialized")
+
+    try:
+        image_bytes = await file.read()
+        logger.info(f"Face searching with {len(image_bytes)} bytes")
+
+        matches = s.search_faces_by_bytes(
+            image_bytes,
+            top_k=top_k,
+            collection_name=collection
+        )
+
+        if not matches:
+            logger.info("No faces detected or no matches found")
+
+        results = []
+        for m in matches:
+            results.append(SearchResult(
+                path=m['path'],
+                score=m['score'],
+                verified_matches=m.get('verified_matches', 0),
+                metadata=m.get('metadata', {})
+            ))
+
+        return results
+
+    except Exception as e:
+        logger.error(f"Face search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============== CLIP Search Endpoints ==============
 
 class ClipStatsResponse(BaseModel):
