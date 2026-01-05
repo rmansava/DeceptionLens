@@ -1,0 +1,137 @@
+================================================================================
+PRINT ADS INDEXING SETUP GUIDE
+================================================================================
+
+This guide explains how to index print advertisements on a separate machine
+and transfer the indexes to your main search server.
+
+================================================================================
+STEP 1: SET UP THE INDEXING MACHINE
+================================================================================
+
+1. Copy the DinoDeceptionLens backend folder to the indexing machine
+
+2. Install dependencies:
+   pip install -r requirements.txt
+
+   For GPU support:
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+3. Place your print ad images in a folder, e.g.:
+   D:\PrintAds\
+   ├── magazine1\
+   │   ├── page001.jpg
+   │   ├── page002.jpg
+   │   └── ...
+   └── magazine2\
+       └── ...
+
+================================================================================
+STEP 2: RUN INDEXING
+================================================================================
+
+Run these commands in order (each uses different GPU memory, so run separately):
+
+# 1. Index with CLIP (creates FAISS index)
+python print_ads_indexer.py --mode clip --source "D:/PrintAds" --output "D:/faiss/print_ads"
+
+# 2. Index with DINOv2 (creates ChromaDB collection)
+python print_ads_indexer.py --mode dino_visual --source "D:/PrintAds"
+
+# 3. Optional: Index faces (if you want face search on print ads)
+python print_ads_indexer.py --mode dino_faces --source "D:/PrintAds"
+
+================================================================================
+STEP 3: TRANSFER INDEXES (SNAPSHOT)
+================================================================================
+
+After indexing completes, copy these files/folders to the main server:
+
+CLIP Index (FAISS):
+-------------------
+From indexing machine:  D:\faiss\print_ads\
+To main server:         D:\faiss\print_ads\
+
+Files to copy:
+  - index.faiss   (the vector index, typically 5-20GB depending on image count)
+  - paths.json    (image paths list, a few MB)
+
+DINOv2 Index (ChromaDB):
+------------------------
+From indexing machine:  .\chroma_db\
+To main server:         .\chroma_db\
+
+This is a SQLite-based database. The print_ads collections will be:
+  - print_ads_visual
+  - print_ads_faces (if indexed)
+
+IMPORTANT: If you already have a chroma_db folder on the main server with
+other collections (like 'books'), you need to merge carefully:
+
+Option A - Fresh start: Delete the entire chroma_db folder and copy the new one
+Option B - Merge: Copy the sqlite database files (complex, not recommended)
+Option C - Re-index everything on one machine
+
+For a quick transfer, use robocopy or rsync:
+
+Windows (robocopy):
+  robocopy "D:\faiss\print_ads" "\\SERVER\D$\faiss\print_ads" /E
+  robocopy ".\chroma_db" "\\SERVER\C$\path\to\backend\chroma_db" /E
+
+Linux (rsync):
+  rsync -avz /path/to/faiss/print_ads/ user@server:/path/to/faiss/print_ads/
+  rsync -avz ./chroma_db/ user@server:/path/to/backend/chroma_db/
+
+================================================================================
+STEP 4: VERIFY ON MAIN SERVER
+================================================================================
+
+1. Restart the backend server:
+   python server.py
+
+2. Check available collections:
+   curl http://localhost:8000/clip/collections
+
+   Expected output:
+   {
+     "collections": [
+       {"name": "books", "available": true, "image_count": 1234567},
+       {"name": "print_ads", "available": true, "image_count": 500000}
+     ]
+   }
+
+3. Test a search:
+   curl -X POST "http://localhost:8000/clip/search?collection=print_ads" \
+        -F "file=@test_image.jpg"
+
+================================================================================
+INDEX PATHS REFERENCE
+================================================================================
+
+Collection: books
+  CLIP:  D:/faiss/books/index.faiss
+  CLIP:  D:/faiss/books/paths.json
+  DINOv2: chroma_db (collection: images_visual)
+
+Collection: print_ads
+  CLIP:  D:/faiss/print_ads/index.faiss
+  CLIP:  D:/faiss/print_ads/paths.json
+  DINOv2: chroma_db (collection: print_ads_visual)
+
+================================================================================
+ADDING MORE COLLECTIONS
+================================================================================
+
+To add a new collection (e.g., "newspapers"):
+
+1. Edit clip_searcher.py, add to COLLECTION_PATHS:
+   "newspapers": {
+       "index": "D:/faiss/newspapers/index.faiss",
+       "paths": "D:/faiss/newspapers/paths.json"
+   }
+
+2. Run indexing:
+   python print_ads_indexer.py --mode clip --source "D:/Newspapers" \
+        --output "D:/faiss/newspapers" --collection newspapers
+
+3. Restart server and test

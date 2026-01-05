@@ -9,6 +9,7 @@ from transformers import AutoImageProcessor, AutoModel
 import numpy as np
 import cv2
 import os
+import time
 
 # Try importing Kornia for geometric verification (optional)
 try:
@@ -20,6 +21,28 @@ except ImportError:
     K = None
     KORNIA_AVAILABLE = False
     print("Kornia not installed. Geometric verification will be disabled.")
+
+# Try importing DISK feature cache - SQL Server (optional)
+try:
+    from disk_features import DiskFeatureStore, DiskFeatureData
+    DISK_SQL_AVAILABLE = True
+except ImportError:
+    DiskFeatureStore = None
+    DiskFeatureData = None
+    DISK_SQL_AVAILABLE = False
+
+# Try importing DISK feature cache - File-based (optional, preferred for NAS)
+try:
+    from disk_features_file import DiskFeatureFileStore, DiskFeatureData as DiskFeatureDataFile
+    DISK_FILE_AVAILABLE = True
+except ImportError:
+    DiskFeatureFileStore = None
+    DiskFeatureDataFile = None
+    DISK_FILE_AVAILABLE = False
+
+DISK_CACHE_AVAILABLE = DISK_SQL_AVAILABLE or DISK_FILE_AVAILABLE
+if not DISK_CACHE_AVAILABLE:
+    print("DISK cache not available. Geometric verification will be slower.")
 
 # Try importing InsightFace for face search (optional)
 try:
@@ -64,6 +87,33 @@ class DinoSearcher:
         # Initialize InsightFace for face search (optional, lazy-loaded)
         self.face_app = None
         self.face_app_loaded = False
+
+        # Initialize DISK feature cache (file-based or SQL Server)
+        self.disk_cache = None
+        self.disk_file_cache = None
+
+        # Try file-based cache first (preferred for NAS storage)
+        if DISK_FILE_AVAILABLE:
+            try:
+                # Production: T:\disk-features\books (NAS)
+                self.disk_file_cache = DiskFeatureFileStore(
+                    category="books",
+                    features_root=r"T:\disk-features",
+                    source_image_root=r"T:\archiverelated\books"
+                )
+                print("DISK feature cache connected (file-based, NAS).")
+            except Exception as e:
+                print(f"File-based DISK cache unavailable: {e}")
+                self.disk_file_cache = None
+
+        # Try SQL Server cache as fallback
+        if DISK_SQL_AVAILABLE and self.disk_file_cache is None:
+            try:
+                self.disk_cache = DiskFeatureStore()
+                print("DISK feature cache connected (SQL Server).")
+            except Exception as e:
+                print(f"SQL DISK cache unavailable: {e}")
+                self.disk_cache = None
 
     def get_embedding(self, image_path: str) -> np.ndarray:
         """Generate DINOv2 embedding for a query image."""
@@ -361,7 +411,7 @@ class DinoSearcher:
     def _verify_matches(self, query_path: str, matches: list) -> list:
         """
         Perform geometric verification using DISK + LightGlue.
-        Checks ALL candidates for maximum accuracy.
+        Uses SQL-cached features when available for ~10x speedup.
         """
         if not self.extractor or not self.matcher:
             return matches
@@ -372,7 +422,9 @@ class DinoSearcher:
 
         total = len(matches)
         print(f"Verifying {total} candidates...")
+        start_time = time.time()
 
+        # Extract query features
         with torch.no_grad():
             feats0_obj = self.extractor(query_img)[0]
             feats0 = {
@@ -381,9 +433,37 @@ class DinoSearcher:
                 "image_size": torch.tensor(query_img.shape[-2:][::-1]).view(1, 2).to(self.device)
             }
 
+        # Bulk load cached DISK features (file-based or SQL)
+        cached_features = {}
+        cache_hits = 0
+        cache_misses = 0
+        match_paths = [m['path'] for m in matches if os.path.exists(m.get('path', ''))]
+
+        if self.disk_file_cache:
+            # Try file-based cache first (NAS)
+            load_start = time.time()
+            cached_features = self.disk_file_cache.load_bulk(match_paths)
+            load_time = time.time() - load_start
+            cache_hits = len(cached_features)
+            cache_misses = len(match_paths) - cache_hits
+            print(f"  File cache: {cache_hits} hits, {cache_misses} misses (loaded in {load_time:.1f}s)")
+        elif self.disk_cache:
+            # Fall back to SQL cache
+            load_start = time.time()
+            cached_features = self.disk_cache.load_bulk(match_paths)
+            load_time = time.time() - load_start
+            cache_hits = len(cached_features)
+            cache_misses = len(match_paths) - cache_hits
+            print(f"  SQL cache: {cache_hits} hits, {cache_misses} misses (loaded in {load_time:.1f}s)")
+
+        # Verify each candidate
+        verify_start = time.time()
         for i, match in enumerate(matches):
-            if i % 100 == 0 and i > 0:
-                print(f"  Verified {i}/{total}...")
+            if i % 500 == 0 and i > 0:
+                elapsed = time.time() - verify_start
+                rate = i / elapsed
+                eta = (total - i) / rate if rate > 0 else 0
+                print(f"  Verified {i}/{total} ({rate:.1f}/s, ETA: {eta:.0f}s)...")
 
             try:
                 match_path = match['path']
@@ -391,19 +471,31 @@ class DinoSearcher:
                     match['verified_matches'] = 0
                     continue
 
-                match_img = self._load_torch_image(match_path)
-                if match_img is None:
-                    match['verified_matches'] = 0
-                    continue
-
-                with torch.no_grad():
-                    feats1_obj = self.extractor(match_img)[0]
+                # Try to use cached features
+                if match_path in cached_features:
+                    cached = cached_features[match_path]
                     feats1 = {
-                        "keypoints": feats1_obj.keypoints.unsqueeze(0),
-                        "descriptors": feats1_obj.descriptors.unsqueeze(0),
-                        "image_size": torch.tensor(match_img.shape[-2:][::-1]).view(1, 2).to(self.device)
+                        "keypoints": torch.from_numpy(cached.keypoints).unsqueeze(0).to(self.device),
+                        "descriptors": torch.from_numpy(cached.descriptors).T.unsqueeze(0).to(self.device),
+                        "image_size": torch.tensor([cached.padded_size[1], cached.padded_size[0]]).view(1, 2).to(self.device)
                     }
+                else:
+                    # Fall back to on-the-fly extraction
+                    match_img = self._load_torch_image(match_path)
+                    if match_img is None:
+                        match['verified_matches'] = 0
+                        continue
 
+                    with torch.no_grad():
+                        feats1_obj = self.extractor(match_img)[0]
+                        feats1 = {
+                            "keypoints": feats1_obj.keypoints.unsqueeze(0),
+                            "descriptors": feats1_obj.descriptors.unsqueeze(0),
+                            "image_size": torch.tensor(match_img.shape[-2:][::-1]).view(1, 2).to(self.device)
+                        }
+
+                # Run LightGlue matching
+                with torch.no_grad():
                     matches01 = self.matcher({"image0": feats0, "image1": feats1})
                     matches_idx = matches01["matches"][0]
                     # Count only valid matches (LightGlue returns -1 for non-matches)
@@ -414,7 +506,10 @@ class DinoSearcher:
                 print(f"Verification failed for {match.get('path', 'unknown')}: {e}")
                 match['verified_matches'] = 0
 
-        print(f"Verification complete.")
+        total_time = time.time() - start_time
+        verify_time = time.time() - verify_start
+        rate = total / verify_time if verify_time > 0 else 0
+        print(f"Verification complete: {total} images in {total_time:.1f}s ({rate:.1f}/s)")
         return matches
 
     def get_match_visualization(self, query_bytes: bytes, match_path: str) -> tuple:

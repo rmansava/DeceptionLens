@@ -39,12 +39,6 @@
                 <label for="verifyCheck">Geometric Verification</label>
             </div>
 
-            <!-- Visualize Checkbox -->
-            <div class="form-group checkbox-group">
-                <input type="checkbox" @bind="visualizeMatches" id="visualizeCheck" disabled="@(!verify)" />
-                <label for="visualizeCheck" class="@(!verify ? "disabled-label" : "")">Visualize Matches</label>
-            </div>
-
             <!-- DINOv2 Visual Search -->
             <div class="upload-area @(isDragging ? "dragging" : "")"
                  @ondragenter="HandleDragEnter"
@@ -183,10 +177,21 @@
         <div class="results-header">
             <div class="results-title-row">
                 <h2>Results</h2>
+                <button class="history-btn" @onclick="ToggleHistoryPanel" title="Search History">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <polyline points="12,6 12,12 16,14"/>
+                    </svg>
+                    History
+                </button>
                 @if (results.Any())
                 {
                     <span class="results-subtitle">
-                        @if (lastSearchType == "DINOv2 Visual" && verify)
+                        @if (lastSearchType == "Deep Search")
+                        {
+                            @:CLIP + DINOv2 + Template Matching
+                        }
+                        else if (lastSearchType == "DINOv2 Visual" && verify)
                         {
                             @:Sorted by verified matches
                         }
@@ -195,6 +200,12 @@
                             @:Sorted by similarity score
                         }
                     </span>
+                }
+                @if (results.Any() && CanDeepSearch() && lastSearchType != "Deep Search")
+                {
+                    <button class="deep-search-btn" @onclick="PerformDeepSearch" disabled="@isSearching">
+                        Deeper Search
+                    </button>
                 }
             </div>
             <div class="thumbnail-size-selector">
@@ -245,17 +256,13 @@
             <div class="results-grid results-grid-@thumbnailSize">
                 @foreach (var (result, index) in results.Select((r, i) => (r, i)))
                 {
-                    <div class="result-card @(CanVisualize(result) ? "clickable" : "")" @onclick="() => HandleResultClick(result)">
+                    <div class="result-card">
                         <div class="result-image-container">
                             <img src="@SearchService.GetImageUrl(result.Path)"
                                  alt="Result @(index + 1)"
                                  loading="lazy"
                                  @onerror="HandleImageError" />
                             <span class="rank-badge">#@(index + 1)</span>
-                            @if (CanVisualize(result))
-                            {
-                                <span class="visualize-hint">Click to visualize</span>
-                            }
                         </div>
                         <div class="result-info">
                             <h3 class="result-filename" title="@result.Path">@result.FileName</h3>
@@ -268,7 +275,7 @@
                                 }
                                 <span class="score-badge">Score: @result.Score.ToString("F4")</span>
                             </div>
-                            <button class="open-btn" @onclick="() => OpenImage(result.Path)" @onclick:stopPropagation="true">
+                            <button class="open-btn" @onclick="() => OpenImage(result.Path)">
                                 Open Image
                             </button>
                         </div>
@@ -277,28 +284,61 @@
             </div>
         }
     </section>
-</div>
 
-@if (visualizationUrl != null || isLoadingVisualization)
-{
-    <div class="visualization-overlay" @onclick="CloseVisualization">
-        <div class="visualization-content" @onclick:stopPropagation="true">
-            @if (isLoadingVisualization)
+    <!-- History Panel -->
+    @if (showHistoryPanel)
+    {
+        <div class="history-overlay" @onclick="ToggleHistoryPanel"></div>
+        <aside class="history-panel">
+            <div class="history-panel-header">
+                <h3>Search History</h3>
+                <button class="close-btn" @onclick="ToggleHistoryPanel">&times;</button>
+            </div>
+            @if (isLoadingHistory)
             {
-                <div class="loading-container">
-                    <div class="spinner"></div>
-                    <p>Generating visualization...</p>
+                <div class="history-loading">
+                    <div class="spinner-sm"></div>
+                    <span>Loading...</span>
+                </div>
+            }
+            else if (historyEntries == null || !historyEntries.Any())
+            {
+                <div class="history-empty">
+                    <p>No search history yet.</p>
                 </div>
             }
             else
             {
-                <img src="@visualizationUrl" alt="Match Visualization" />
-                <p class="visualization-path">@visualizingPath</p>
+                <div class="history-list">
+                    @foreach (var entry in historyEntries)
+                    {
+                        <div class="history-item" @onclick="() => LoadHistoryEntry(entry.Id)">
+                            <div class="history-item-image">
+                                @if (!string.IsNullOrEmpty(entry.QueryImageName))
+                                {
+                                    <img src="@SearchService.GetSearchHistoryImageUrl(entry.Id)" alt="Query" />
+                                }
+                                else if (!string.IsNullOrEmpty(entry.QueryText))
+                                {
+                                    <div class="history-text-icon">T</div>
+                                }
+                                else
+                                {
+                                    <div class="history-no-image">?</div>
+                                }
+                            </div>
+                            <div class="history-item-info">
+                                <span class="history-type @GetHistoryTypeCssClass(entry.SearchType)">@entry.SearchType</span>
+                                <span class="history-date">@FormatHistoryDate(entry.ParsedDate)</span>
+                                <span class="history-results">@entry.ResultCount results</span>
+                            </div>
+                        </div>
+                    }
+                </div>
             }
-            <button class="close-btn" @onclick="CloseVisualization">Close</button>
-        </div>
-    </div>
-}
+        </aside>
+    }
+</div>
 
 <style>
     .text-search-row {
@@ -432,108 +472,215 @@
         height: 24px;
     }
 
-    /* Disabled label */
-    .disabled-label {
-        color: #6b7280;
-    }
-
-    /* Clickable result card */
-    .result-card.clickable {
-        cursor: pointer;
-    }
-
-    .result-card.clickable:hover {
-        border-color: #3b82f6;
-    }
-
-    .visualize-hint {
-        position: absolute;
-        bottom: 8px;
-        left: 50%;
-        transform: translateX(-50%);
-        background: rgba(59, 130, 246, 0.9);
+    /* Deep Search button */
+    .deep-search-btn {
+        padding: 6px 14px;
+        background: linear-gradient(135deg, #8b5cf6, #3b82f6);
         color: white;
-        padding: 4px 8px;
-        border-radius: 4px;
-        font-size: 0.7rem;
-        opacity: 0;
-        transition: opacity 0.2s;
-        pointer-events: none;
-        white-space: nowrap;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 0.85rem;
+        transition: all 0.2s;
+        margin-left: auto;
     }
 
-    .result-card.clickable:hover .visualize-hint {
-        opacity: 1;
+    .deep-search-btn:hover:not(:disabled) {
+        background: linear-gradient(135deg, #7c3aed, #2563eb);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(139, 92, 246, 0.3);
     }
 
-    /* Visualization overlay */
-    .visualization-overlay {
+    .deep-search-btn:disabled {
+        background: #6b7280;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+    }
+
+    /* History button */
+    .history-btn {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        background: #374151;
+        color: #d1d5db;
+        border: 1px solid #4b5563;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.85rem;
+        transition: all 0.2s;
+    }
+
+    .history-btn:hover {
+        background: #4b5563;
+        color: #f3f4f6;
+    }
+
+    /* History panel overlay */
+    .history-overlay {
         position: fixed;
         top: 0;
         left: 0;
         right: 0;
         bottom: 0;
-        background: rgba(0, 0, 0, 0.85);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        z-index: 1000;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 100;
     }
 
-    .visualization-content {
-        max-width: 90vw;
-        max-height: 90vh;
+    /* History panel */
+    .history-panel {
+        position: fixed;
+        top: 0;
+        right: 0;
+        width: 320px;
+        height: 100vh;
+        background: #1f2937;
+        border-left: 1px solid #374151;
+        z-index: 101;
         display: flex;
         flex-direction: column;
+        animation: slideIn 0.2s ease-out;
+    }
+
+    @@keyframes slideIn {
+        from { transform: translateX(100%); }
+        to { transform: translateX(0); }
+    }
+
+    .history-panel-header {
+        display: flex;
+        justify-content: space-between;
         align-items: center;
-        gap: 16px;
+        padding: 16px;
+        border-bottom: 1px solid #374151;
     }
 
-    .visualization-content img {
-        max-width: 100%;
-        max-height: 80vh;
-        object-fit: contain;
-        border-radius: 8px;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-    }
-
-    .visualization-path {
-        color: #9ca3af;
-        font-size: 0.875rem;
-        text-align: center;
-        word-break: break-all;
-        max-width: 100%;
+    .history-panel-header h3 {
+        margin: 0;
+        color: #f3f4f6;
+        font-size: 1.1rem;
     }
 
     .close-btn {
-        padding: 10px 24px;
-        background: #374151;
-        color: white;
+        background: transparent;
         border: none;
-        border-radius: 6px;
+        color: #9ca3af;
+        font-size: 24px;
         cursor: pointer;
-        font-size: 0.875rem;
+        line-height: 1;
     }
 
     .close-btn:hover {
-        background: #4b5563;
+        color: #f3f4f6;
     }
+
+    .history-loading, .history-empty {
+        padding: 40px 20px;
+        text-align: center;
+        color: #9ca3af;
+    }
+
+    .spinner-sm {
+        width: 24px;
+        height: 24px;
+        border: 2px solid #374151;
+        border-top-color: #3b82f6;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        margin: 0 auto 12px;
+    }
+
+    .history-list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 8px;
+    }
+
+    .history-item {
+        display: flex;
+        gap: 12px;
+        padding: 10px;
+        background: #111827;
+        border-radius: 8px;
+        margin-bottom: 8px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .history-item:hover {
+        background: #1e3a5f;
+        transform: translateX(-4px);
+    }
+
+    .history-item-image {
+        width: 50px;
+        height: 50px;
+        flex-shrink: 0;
+        border-radius: 6px;
+        overflow: hidden;
+        background: #374151;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .history-item-image img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+    }
+
+    .history-text-icon, .history-no-image {
+        color: #9ca3af;
+        font-size: 1.2rem;
+        font-weight: bold;
+    }
+
+    .history-item-info {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+    }
+
+    .history-type {
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 2px 6px;
+        border-radius: 4px;
+        width: fit-content;
+    }
+
+    .history-type.dino { background: #7c3aed; color: white; }
+    .history-type.clip { background: #3b82f6; color: white; }
+    .history-type.deep { background: linear-gradient(135deg, #8b5cf6, #3b82f6); color: white; }
+    .history-type.face { background: #10b981; color: white; }
+    .history-type.text { background: #f59e0b; color: black; }
+
+    .history-date {
+        font-size: 0.75rem;
+        color: #9ca3af;
+    }
+
+    .history-results {
+        font-size: 0.8rem;
+        color: #d1d5db;
+    }
+
 </style>
 
 @code {
-    private List<string> collections = new() { "images" };
-    private string selectedCollection = "images";
+    private List<string> collections = new() { "books" };
+    private string selectedCollection = "books";
     private int topK = 50;
     private bool verify = true;
     private string textQuery = "";
     private string lastSearchType = "";
     private string thumbnailSize = "medium";
-    private bool visualizeMatches = false;
-
-    // Visualization state
-    private string? visualizationUrl = null;
-    private string? visualizingPath = null;
-    private bool isLoadingVisualization = false;
 
     private List<SearchResult> results = new();
     private StatsResponse? stats;
@@ -557,6 +704,11 @@
     private string? facePreviewUrl;
     private IBrowserFile? faceSelectedFile;
     private byte[]? faceFileBytes;
+
+    // History state
+    private bool showHistoryPanel = false;
+    private bool isLoadingHistory = false;
+    private List<SearchHistoryEntry>? historyEntries;
 
     protected override async Task OnInitializedAsync()
     {
@@ -826,55 +978,175 @@
     {
     }
 
-    private bool CanVisualize(SearchResult result)
+    private bool CanDeepSearch()
     {
-        return visualizeMatches
-            && verify
-            && lastSearchType == "DINOv2 Visual"
-            && result.VerifiedMatches >= 4
-            && dinoFileBytes != null;
+        // Can do deep search if we have an image loaded (from dino or clip)
+        return (dinoFileBytes != null && dinoFileBytes.Length > 0) ||
+               (clipFileBytes != null && clipFileBytes.Length > 0);
     }
 
-    private async Task HandleResultClick(SearchResult result)
+    private async Task PerformDeepSearch()
     {
-        if (!CanVisualize(result)) return;
+        // Use whichever image is available (prefer the one used for last search)
+        byte[]? imageBytes = null;
+        string? fileName = null;
 
-        isLoadingVisualization = true;
-        visualizingPath = result.Path;
+        if (lastSearchType == "DINOv2 Visual" && dinoFileBytes != null)
+        {
+            imageBytes = dinoFileBytes;
+            fileName = dinoSelectedFile?.Name ?? "query.jpg";
+        }
+        else if (lastSearchType == "CLIP Visual" && clipFileBytes != null)
+        {
+            imageBytes = clipFileBytes;
+            fileName = clipSelectedFile?.Name ?? "query.jpg";
+        }
+        else if (dinoFileBytes != null)
+        {
+            imageBytes = dinoFileBytes;
+            fileName = dinoSelectedFile?.Name ?? "query.jpg";
+        }
+        else if (clipFileBytes != null)
+        {
+            imageBytes = clipFileBytes;
+            fileName = clipSelectedFile?.Name ?? "query.jpg";
+        }
+
+        if (imageBytes == null || imageBytes.Length == 0) return;
+
+        isSearching = true;
+        hasSearched = true;
+        errorMessage = null;
+        lastSearchType = "Deep Search";
         StateHasChanged();
 
         try
         {
-            using var ms = new MemoryStream(dinoFileBytes!);
-            var visBytes = await SearchService.GetVisualizationAsync(ms, dinoSelectedFile?.Name ?? "query.jpg", result.Path);
-
-            if (visBytes != null)
-            {
-                visualizationUrl = $"data:image/png;base64,{Convert.ToBase64String(visBytes)}";
-            }
-            else
-            {
-                errorMessage = "Failed to generate visualization";
-                CloseVisualization();
-            }
+            using var ms = new MemoryStream(imageBytes);
+            results = await SearchService.DeepSearchAsync(ms, fileName, topK);
         }
         catch (Exception ex)
         {
-            Logger.LogError(ex, "Visualization failed");
-            errorMessage = $"Visualization failed: {ex.Message}";
-            CloseVisualization();
+            Logger.LogError(ex, "Deep search failed");
+            errorMessage = $"Deep search failed: {ex.Message}";
+            results = new List<SearchResult>();
         }
         finally
         {
-            isLoadingVisualization = false;
+            isSearching = false;
             StateHasChanged();
         }
     }
 
-    private void CloseVisualization()
+    private async Task ToggleHistoryPanel()
     {
-        visualizationUrl = null;
-        visualizingPath = null;
-        isLoadingVisualization = false;
+        showHistoryPanel = !showHistoryPanel;
+        if (showHistoryPanel && historyEntries == null)
+        {
+            await LoadHistoryEntries();
+        }
+    }
+
+    private async Task LoadHistoryEntries()
+    {
+        isLoadingHistory = true;
+        StateHasChanged();
+
+        try
+        {
+            var response = await SearchService.GetSearchHistoryAsync(page: 1, pageSize: 50);
+            historyEntries = response?.Entries ?? new List<SearchHistoryEntry>();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load history");
+            historyEntries = new List<SearchHistoryEntry>();
+        }
+        finally
+        {
+            isLoadingHistory = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task LoadHistoryEntry(int searchId)
+    {
+        showHistoryPanel = false;
+        isSearching = true;
+        hasSearched = true;
+        errorMessage = null;
+        StateHasChanged();
+
+        try
+        {
+            var detail = await SearchService.GetSearchHistoryDetailAsync(searchId);
+            if (detail != null)
+            {
+                lastSearchType = detail.SearchType;
+                results = detail.Results.Select(r => new SearchResult
+                {
+                    Path = r.ImagePath,
+                    Score = r.Score,
+                    VerifiedMatches = r.VerifiedMatches ?? 0
+                }).ToList();
+
+                // Load the query image if available
+                if (!string.IsNullOrEmpty(detail.QueryImageName))
+                {
+                    var imageUrl = SearchService.GetSearchHistoryImageUrl(searchId);
+                    if (detail.SearchType.Contains("CLIP"))
+                    {
+                        clipPreviewUrl = imageUrl;
+                    }
+                    else if (detail.SearchType.Contains("DINOv2"))
+                    {
+                        dinoPreviewUrl = imageUrl;
+                    }
+                    else if (detail.SearchType.Contains("Face"))
+                    {
+                        facePreviewUrl = imageUrl;
+                    }
+                }
+
+                // Set text query if it was a text search
+                if (!string.IsNullOrEmpty(detail.QueryText))
+                {
+                    textQuery = detail.QueryText;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to load history entry");
+            errorMessage = $"Failed to load history: {ex.Message}";
+            results = new List<SearchResult>();
+        }
+        finally
+        {
+            isSearching = false;
+            StateHasChanged();
+        }
+    }
+
+    private string GetHistoryTypeCssClass(string searchType)
+    {
+        return searchType switch
+        {
+            "DINOv2 Visual" => "dino",
+            "CLIP Visual" => "clip",
+            "Deep Search" => "deep",
+            "Face Search" => "face",
+            _ when searchType.Contains("Text") => "text",
+            _ => ""
+        };
+    }
+
+    private string FormatHistoryDate(DateTime date)
+    {
+        if (date.Date == DateTime.Today)
+            return $"Today {date:HH:mm}";
+        if (date.Date == DateTime.Today.AddDays(-1))
+            return $"Yesterday {date:HH:mm}";
+        return date.ToString("MMM d, HH:mm");
     }
 }

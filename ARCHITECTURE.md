@@ -5,24 +5,31 @@ An image finder using CLIP for text-to-image and visual similarity search, plus 
 ## System Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                           Deception Lens                                  │
-├──────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌──────────────────┐         ┌────────────────────────────────────────┐│
-│  │  Blazor Server   │  HTTP   │           FastAPI Backend              ││
-│  │  (C# Frontend)   │◄───────►│           (Python)                     ││
-│  │  Port 5000       │         │           Port 8000                    ││
-│  └──────────────────┘         └────────────────────────────────────────┘│
-│                                          │                               │
-│                    ┌─────────────────────┼─────────────────────┐        │
-│                    ▼                     ▼                     ▼        │
-│         ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐│
-│         │    FAISS Index   │  │     ChromaDB     │  │ Geometric Verify ││
-│         │  (CLIP Vectors)  │  │ (DINOv2 Vectors) │  │ (DISK+LightGlue) ││
-│         │  D:/faiss/books  │  │   ./chroma_db    │  │                  ││
-│         └──────────────────┘  └──────────────────┘  └──────────────────┘│
-└──────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                              Deception Lens                                    │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  ┌──────────────────┐         ┌─────────────────────────────────────────────┐│
+│  │  Blazor Server   │  HTTP   │              FastAPI Backend                ││
+│  │  (C# Frontend)   │◄───────►│              (Python)                       ││
+│  │  Port 5000       │         │              Port 8000                      ││
+│  └──────────────────┘         └─────────────────────────────────────────────┘│
+│                                             │                                 │
+│              ┌──────────────────────────────┼──────────────────────────────┐ │
+│              ▼                              ▼                              ▼ │
+│   ┌──────────────────┐         ┌──────────────────┐         ┌─────────────────┐
+│   │    FAISS Index   │         │    OpenSearch    │         │  Geometric      │
+│   │  (CLIP Vectors)  │         │ (DINOv2 Vectors) │         │  Verification   │
+│   │  D:/faiss/books  │         │ dinov2-books idx │         │ (DISK+LightGlue)│
+│   └──────────────────┘         └──────────────────┘         └────────┬────────┘
+│                                                                      │        │
+│                                                                      ▼        │
+│                                                         ┌──────────────────┐  │
+│                                                         │   SQL Server     │  │
+│                                                         │ trivia.DiskFeatures│
+│                                                         │ (cached keypoints)│  │
+│                                                         └──────────────────┘  │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Search Modes
@@ -36,29 +43,52 @@ An image finder using CLIP for text-to-image and visual similarity search, plus 
 ```
 DeceptionLens/
 ├── backend/
-│   ├── main.py           # CLI entry point for indexing/searching
-│   ├── indexer.py        # DinoIndexer class - DINOv2 indexing
-│   ├── searcher.py       # DinoSearcher class - DINOv2 searching
-│   ├── clip_indexer.py   # ClipIndexer class - CLIP/FAISS indexing
-│   ├── clip_searcher.py  # ClipSearcher class - CLIP text/image search
-│   ├── server.py         # FastAPI REST API server
-│   ├── batch_index.py    # Batch processing script for DINOv2
-│   └── chroma_db/        # ChromaDB persistent storage (DINOv2)
+│   ├── main.py                    # CLI entry point for indexing/searching
+│   ├── indexer.py                 # DinoIndexer class - DINOv2 indexing
+│   ├── searcher.py                # DinoSearcher class - DINOv2 searching
+│   ├── clip_indexer.py            # ClipIndexer class - CLIP/FAISS indexing
+│   ├── clip_searcher.py           # ClipSearcher class - CLIP text/image search
+│   ├── server.py                  # FastAPI REST API server
+│   ├── batch_index.py             # Batch processing script for DINOv2
+│   │
+│   ├── # DISK Feature Cache (SQL Server)
+│   ├── disk_features.py           # SQL storage for DISK keypoints
+│   ├── disk_indexer.py            # DISK extraction (SQL storage)
+│   ├── batch_disk_index.py        # Batch DISK indexing (SQL)
+│   │
+│   ├── # DISK Feature Cache (File-Based / NAS)
+│   ├── disk_features_file.py      # File storage for DISK keypoints (.npz)
+│   ├── disk_indexer_file.py       # DISK extraction (file storage)
+│   ├── batch_disk_index_file.py   # Batch DISK indexing (files)
+│   │
+│   ├── sql/
+│   │   └── create_disk_features_table.sql  # SQL schema
+│   └── chroma_db/                 # ChromaDB persistent storage (DINOv2)
 │
 ├── web/
 │   ├── Pages/
-│   │   └── Index.razor   # Main search UI page
+│   │   └── Index.razor            # Main search UI page
 │   ├── Services/
-│   │   └── SearchService.cs  # HTTP client for backend API
+│   │   └── SearchService.cs       # HTTP client for backend API
 │   ├── Models/
-│   │   └── SearchResult.cs   # Data models
-│   └── Program.cs        # ASP.NET Core startup
+│   │   └── SearchResult.cs        # Data models
+│   └── Program.cs                 # ASP.NET Core startup
 │
-├── D:/faiss/books/       # CLIP FAISS index (external)
-│   ├── index.faiss       # CLIP embeddings (~9GB)
-│   └── paths.json        # Image path mapping
+├── D:/faiss/books/                # CLIP FAISS index (external)
+│   ├── index.faiss                # CLIP embeddings (~9GB)
+│   └── paths.json                 # Image path mapping
 │
-└── ARCHITECTURE.md       # This file
+├── D:/disk-features/              # DISK features (local indexing)
+│   └── books/                     # Category folder
+│       └── {BookName}/*.npz       # Per-image feature files
+│
+├── T:/disk-features/              # DISK features (NAS production)
+│   └── books/                     # Move from D: after indexing
+│
+├── SQL Server (trivia DB)         # DISK feature cache (alternative)
+│   └── dbo.DiskFeatures           # Pre-computed keypoints/descriptors
+│
+└── ARCHITECTURE.md                # This file
 ```
 
 ---
@@ -459,6 +489,9 @@ kornia
 # CLIP / FAISS
 clip (git+https://github.com/openai/CLIP.git)
 faiss-cpu (or faiss-gpu)
+
+# DISK Feature Cache (SQL Server)
+pyodbc
 ```
 
 ### C# (web):
@@ -522,13 +555,457 @@ Collections use HNSW index with cosine similarity metric.
 
 ---
 
+## OpenSearch Backend (books collection)
+
+The `books` collection uses OpenSearch for vector storage instead of ChromaDB for better scalability.
+
+### OpenSearch Indices:
+- `dinov2-books`: Visual embeddings (768-dim, HNSW with cosinesimil)
+- `faces-books`: Face embeddings (512-dim, HNSW with cosinesimil)
+
+### Two-Stage Search Pipeline:
+
+```
+Query Image (e.g., cropped snippet)
+         │
+         ▼
+┌─────────────────────┐
+│ Stage 1: OpenSearch │  DINOv2 embedding similarity
+│ Fetch top 5000      │  Global image similarity
+│ candidates          │  (crop vs full page = LOW ~0.25)
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│ Stage 2: LightGlue  │  Local keypoint matching
+│ Geometric verify    │  (crop vs full page = HIGH matches)
+│ all 5000 candidates │
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│ Re-rank by matches  │  Sort by (verified_matches, score) DESC
+│ Return top K        │
+└─────────────────────┘
+```
+
+---
+
+## Test Case: Cropped Image Search
+
+This demonstrates the two-stage search finding a cropped snippet within a full page.
+
+### Test Setup:
+- **Query Image**: `D:/trivpics/2023-5.jpg` (cropped Manglosaurus dinosaur)
+- **Target Page**: `D:\books\pdf-images\encyclopedia of monsters\encyclopedia of monsters-page210.jpg`
+- **Target Content**: Full page with 3 figures (Manglosaurus, Manglord, Manglodactyl) + text
+
+### The Problem with Global Embeddings:
+
+DINOv2 computes a **global embedding** for the entire image. When comparing:
+- Cropped dinosaur image vs full page with multiple figures + text
+- **Cosine similarity = 0.249** (very low!)
+
+The crop would NOT appear in top search results based on embedding alone.
+
+### How LightGlue Fixes This:
+
+LightGlue performs **local keypoint matching** using DISK features:
+- Finds matching keypoints between crop and full page
+- The Manglosaurus dinosaur in both images produces **662 verified matches**
+- Even though global similarity is low, local matches are HIGH
+
+### Initial OpenSearch Ranking (Before LightGlue):
+
+- **Page210 initial rank: 2589** out of 5000 candidates
+- **Score: 0.6246** (low due to crop vs full page)
+
+Without LightGlue verification, page210 would be buried at rank 2589 and never shown to the user.
+
+### Final Results (After LightGlue Re-ranking):
+
+| Rank | Image | DINOv2 Score | Keypoint Matches |
+|------|-------|--------------|------------------|
+| **1** | encyclopedia of monsters-page210.jpg | 0.625 | **662** |
+| 2 | The encyclopedia of monsters -- Jeff Rovin-page212.jpg | 0.625 | 524 |
+| 3 | 50 Great Comedy Film Posters-page19.jpg | 0.611 | 202 |
+| ... | (other results) | ... | ... |
+
+**Rank improvement: 2589 → 1** (thanks to 662 keypoint matches)
+
+### Key Configuration:
+
+```python
+# server.py - Must fetch MANY candidates for crops to work
+fetch_k = 5000  # Large pool for LightGlue to search
+```
+
+**Why 5000?** With only embedding similarity, the target page might rank #3000+.
+LightGlue needs it in the candidate pool to find the keypoint matches.
+
+---
+
 ## Performance Notes
 
-1. **Geometric verification is slow** but accurate - checks entire collection
+1. **Geometric verification is slow** but accurate - checks entire candidate pool
 2. **Indexing is GPU-bound** - processes ~1-3 images/second on RTX 3090
 3. **Face detection adds overhead** - only finds faces in ~15% of book pages
-4. **ChromaDB is fast** - cosine search is nearly instant even with 1M+ vectors
-5. **Batch indexing resumes** - progress saved to `batch_progress.txt`
+4. **OpenSearch k-NN is fast** - uses HNSW algorithm for approximate nearest neighbors
+5. **Batch indexing resumes** - progress saved to `batch_progress_opensearch.txt`
+6. **Crop search requires large candidate pool** - fetch_k=5000 for snippets to work
+7. **DISK feature cache** - pre-computed features reduce verification from ~17min to ~2-3min
+
+---
+
+## DISK Feature Cache (SQL Server)
+
+The geometric verification step (DISK + LightGlue) was the main bottleneck. Pre-computing DISK features provides ~6-8x speedup.
+
+### The Problem
+
+Without caching, each verification requires:
+1. Load image from disk (~5-10ms)
+2. Run DISK feature extraction (~150-250ms)
+3. Run LightGlue matching (~15-30ms)
+
+**Total: ~200ms × 5000 candidates = ~17 minutes per search**
+
+### The Solution
+
+Pre-compute and store DISK features in SQL Server:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DISK Feature Cache                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────┐     ┌────────────────────────────────────┐ │
+│  │  disk_indexer   │────►│  SQL Server: trivia.dbo.DiskFeatures│ │
+│  │  (batch index)  │     │  - Keypoints (gzipped float32)     │ │
+│  └─────────────────┘     │  - Descriptors (gzipped float16)   │ │
+│                          │  - Image dimensions                 │ │
+│  ┌─────────────────┐     └────────────────────────────────────┘ │
+│  │  searcher.py    │◄────────────────┘                          │
+│  │  (bulk load)    │     Verification: ~20-35ms per image       │
+│  └─────────────────┘                                            │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### SQL Table Schema
+
+```sql
+-- Database: trivia
+CREATE TABLE dbo.DiskFeatures (
+    Id INT IDENTITY PRIMARY KEY,
+    ImagePath NVARCHAR(500) NOT NULL UNIQUE,
+    BookName NVARCHAR(200),
+    Keypoints VARBINARY(MAX),      -- gzipped (N,2) float32
+    Descriptors VARBINARY(MAX),    -- gzipped (N,128) float16
+    KeypointCount SMALLINT,
+    ImageWidth SMALLINT,
+    ImageHeight SMALLINT,
+    PaddedWidth SMALLINT,          -- DISK requires multiples of 16
+    PaddedHeight SMALLINT,
+    CreatedAt DATETIME2 DEFAULT SYSUTCDATETIME()
+);
+```
+
+### Storage Estimates
+
+| Compression | Per Image | 2.9M Images |
+|-------------|-----------|-------------|
+| None (float32) | ~260 KB | ~750 GB |
+| float16 descriptors | ~140 KB | ~400 GB |
+| float16 + gzip | ~60-80 KB | ~175-230 GB |
+
+### Performance Comparison
+
+| Step | Without Cache | With Cache |
+|------|---------------|------------|
+| Load image | 5-10ms | 0 |
+| DISK extraction | 150-250ms | 0 |
+| SQL bulk load | 0 | ~2-5ms/image |
+| Decompress | 0 | ~1ms |
+| LightGlue | 15-30ms | 15-30ms |
+| **Total per image** | **~200ms** | **~20-35ms** |
+| **5000 candidates** | **~17 min** | **~2-3 min** |
+
+### Components
+
+#### 1. disk_features.py - SQL Storage Layer
+
+```python
+from disk_features import DiskFeatureStore
+
+store = DiskFeatureStore()
+
+# Save features
+store.save(image_path, keypoints, descriptors, image_size, padded_size, book_name)
+
+# Bulk load for search (efficient)
+features = store.load_bulk(image_paths)  # Returns dict[path -> DiskFeatureData]
+
+# Check statistics
+stats = store.get_stats()
+```
+
+#### 2. disk_indexer.py - Feature Extraction
+
+```python
+from disk_indexer import DiskIndexer
+
+# Single directory
+indexer = DiskIndexer(batch_size=20)
+result = indexer.index_directory("D:/books/pdf-images/BookName")
+
+# With path remapping (read from D:, store as T:)
+indexer = DiskIndexer(
+    batch_size=20,
+    path_remap=("D:\\books", "T:\\archiverelated\\books")
+)
+```
+
+CLI usage:
+```bash
+# Index single book
+python disk_indexer.py "D:\books\pdf-images\BookName"
+
+# With path remapping
+python disk_indexer.py "D:\books\pdf-images\BookName" \
+    --remap-from "D:\books" \
+    --remap-to "T:\archiverelated\books"
+
+# Show stats
+python disk_indexer.py --stats
+```
+
+#### 3. batch_disk_index.py - Batch Processing
+
+```bash
+python batch_disk_index.py
+```
+
+Features:
+- Processes all books in `D:\books\pdf-images`
+- Path remapping built-in: `D:\books` → `T:\archiverelated\books`
+- Resume support via `batch_disk_progress.txt`
+- Logs to `batch_disk_index.log`
+- Skips already indexed images
+
+#### 4. searcher.py Integration
+
+The `DinoSearcher` automatically uses cached features when available:
+
+```python
+# In _verify_matches():
+if self.disk_cache:
+    # Bulk load from SQL (fast)
+    cached_features = self.disk_cache.load_bulk(match_paths)
+
+for match in matches:
+    if match_path in cached_features:
+        # Use cached features (fast path)
+        feats1 = cached_to_tensor(cached_features[match_path])
+    else:
+        # Fall back to on-the-fly extraction (slow path)
+        feats1 = self.extractor(load_image(match_path))
+
+    # LightGlue matching (same either way)
+    matches01 = self.matcher({"image0": feats0, "image1": feats1})
+```
+
+### Path Remapping
+
+For NAS storage, images may be on a different drive during indexing vs. production:
+
+| Phase | Local Path | NAS Path |
+|-------|------------|----------|
+| Indexing | `D:\books\pdf-images\...` | - |
+| Production | - | `T:\archiverelated\books\pdf-images\...` |
+
+The indexer reads from D: but stores T: paths in SQL, so no migration needed later.
+
+### Setup Steps (SQL Server)
+
+1. **Create SQL table**:
+```bash
+sqlcmd -S localhost -d trivia -E -i backend/sql/create_disk_features_table.sql
+```
+
+2. **Install pyodbc**:
+```bash
+pip install pyodbc
+```
+
+3. **Run batch indexer**:
+```bash
+cd backend
+python batch_disk_index.py
+```
+
+4. **Monitor progress**:
+```sql
+SELECT * FROM trivia.dbo.vw_DiskFeaturesStats;
+```
+
+---
+
+## DISK Feature Cache (File-Based / NAS)
+
+Alternative to SQL Server for NAS-based storage. Uses compressed `.npz` files for maximum portability.
+
+### Directory Structure
+
+```
+T:\disk-features\                    # NAS root
+├── books\                           # Category folder
+│   ├── Encyclopedia of Monsters\    # Book folder
+│   │   ├── page_001.npz            # Compressed features
+│   │   ├── page_002.npz
+│   │   └── ...
+│   └── ...
+├── printads\                        # Another category
+│   └── ...
+└── ...
+```
+
+### File Format
+
+Each `.npz` file contains:
+- `keypoints`: (N, 2) float32 array - keypoint x,y coordinates
+- `descriptors`: (N, 128) float16 array - DISK descriptors
+- `image_size`: (2,) int32 - original (height, width)
+- `padded_size`: (2,) int32 - padded dimensions (multiples of 16)
+- `image_path`: string - reference to source image path
+
+### Indexing Workflow
+
+The batch indexer writes to local SSD for speed, then automatically moves completed books to NAS:
+
+```bash
+# Run the batch indexer (or use run_disk_indexer.bat)
+cd backend
+python batch_disk_index_file.py
+```
+
+**What happens:**
+1. Indexes to `D:\disk-features\books\{BookName}\` (local SSD, fast writes)
+2. After each book completes, queues it for background move to `T:\disk-features\books\`
+3. Background thread moves one book at a time to NAS (doesn't block indexing)
+4. Console shows progress with [MOVE] messages in cyan
+
+**Features:**
+- Resume support: tracks completed books in `batch_disk_progress_file.txt`
+- Logs to `batch_disk_index_file.log`
+- ETA display based on average processing time
+- Graceful shutdown: waits for pending moves before exiting
+
+### Components
+
+#### 1. disk_features_file.py - File Storage Layer
+
+```python
+from disk_features_file import DiskFeatureFileStore
+
+store = DiskFeatureFileStore(
+    category="books",
+    features_root=r"T:\disk-features",
+    source_image_root=r"T:\archiverelated\books"
+)
+
+# Bulk load for search (parallel I/O)
+features = store.load_bulk(image_paths)  # Returns dict[path -> DiskFeatureData]
+
+# Check statistics
+stats = store.get_stats()
+```
+
+#### 2. disk_indexer_file.py - File-Based Feature Extraction
+
+```python
+from disk_indexer_file import DiskIndexerFile
+
+indexer = DiskIndexerFile(
+    category="books",
+    features_root=r"D:\disk-features",  # Local for speed
+    batch_size=20,
+    path_remap=("D:\\books", "T:\\archiverelated\\books")
+)
+result = indexer.index_directory("D:/books/pdf-images/BookName")
+```
+
+CLI usage:
+```bash
+# Index single book
+python disk_indexer_file.py "D:\books\pdf-images\BookName" \
+    --category books \
+    --features-root "D:\disk-features"
+
+# Show stats
+python disk_indexer_file.py --stats --category books
+```
+
+#### 3. batch_disk_index_file.py - Batch Processing
+
+```bash
+# Run directly or via batch file
+python batch_disk_index_file.py
+# Or: run_disk_indexer.bat
+```
+
+Features:
+- Processes all books in `D:\books\pdf-images`
+- Writes to `D:\disk-features\books` (local SSD for speed)
+- **Auto-moves** each completed book to `T:\disk-features\books` (NAS)
+- Background move queue: 1 book at a time, doesn't block indexing
+- Path remapping: stores `T:\archiverelated\books` paths in .npz files
+- Resume support via `batch_disk_progress_file.txt`
+- Logs to `batch_disk_index_file.log`
+
+### Storage Comparison
+
+| Storage | Per Image | 2.9M Images | Notes |
+|---------|-----------|-------------|-------|
+| SQL Server | ~1.7 MB | ~4.9 TB | Requires local SQL |
+| .npz files | ~1.5 MB | ~4.3 TB | Portable, NAS-friendly |
+| .npz (aggressive) | ~0.8-1.0 MB | ~2.5-3 TB | Lower compression level |
+
+### Search Integration
+
+The `DinoSearcher` automatically tries file cache first, falls back to SQL:
+
+```python
+# Priority order:
+# 1. File-based cache (T:\disk-features\books)
+# 2. SQL Server cache (trivia.dbo.DiskFeatures)
+# 3. On-the-fly extraction (slow)
+
+# In searcher.py __init__:
+if DISK_FILE_AVAILABLE:
+    self.disk_file_cache = DiskFeatureFileStore(
+        category="books",
+        features_root=r"T:\disk-features",
+        source_image_root=r"T:\archiverelated\books"
+    )
+elif DISK_SQL_AVAILABLE:
+    self.disk_cache = DiskFeatureStore()
+```
+
+### Benefits of File-Based Storage
+
+1. **NAS Compatible**: No SQL Server required on NAS
+2. **Portable**: Can move/copy directories freely
+3. **Parallel I/O**: ThreadPoolExecutor for bulk loading
+4. **Easy Backup**: Standard file copy/robocopy
+5. **Incremental Updates**: Add new books by adding folders
+6. **Multiple Categories**: books, printads, etc. in separate folders
+
+### Performance Notes
+
+- **Local SSD writes**: ~50-100 images/second during indexing
+- **NAS bulk load**: ~10-20ms per image (parallel threads)
+- **Total verification time**: Similar to SQL (~2-3 min for 5000 candidates)
 
 ---
 

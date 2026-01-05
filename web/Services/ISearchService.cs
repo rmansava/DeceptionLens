@@ -20,4 +20,14 @@ public interface ISearchService
 
     // Visualization methods
     Task<byte[]?> GetVisualizationAsync(Stream queryImageStream, string fileName, string matchPath);
+
+    // Deep search (parallel CLIP + DINOv2 with reranking)
+    Task<List<SearchResult>> DeepSearchAsync(Stream imageStream, string fileName, int topK = 50, int retrievalK = 20000, int rerankK = 1000);
+
+    // Search history methods
+    Task<SearchHistoryListResponse?> GetSearchHistoryAsync(int page = 1, int pageSize = 20, string? searchType = null);
+    Task<SearchHistoryDetail?> GetSearchHistoryDetailAsync(int searchId);
+    string GetSearchHistoryImageUrl(int searchId);
+    Task<SaveSearchResponse?> SaveSearchHistoryAsync(Stream? imageStream, string? fileName, string searchType, string? queryText, List<SearchResult> results, int? durationMs, string? collection);
+    Task<bool> DeleteSearchHistoryAsync(int searchId);
 }

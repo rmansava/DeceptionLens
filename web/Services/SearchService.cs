@@ -247,4 +247,155 @@ public class SearchService : ISearchService
             return null;
         }
     }
+
+    public async Task<List<SearchResult>> DeepSearchAsync(
+        Stream imageStream,
+        string fileName,
+        int topK = 50,
+        int retrievalK = 20000,
+        int rerankK = 1000)
+    {
+        try
+        {
+            using var content = new MultipartFormDataContent();
+            using var streamContent = new StreamContent(imageStream);
+            streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+            content.Add(streamContent, "file", fileName);
+
+            var url = $"/search/deep?top_k={topK}&retrieval_k={retrievalK}&rerank_k={rerankK}";
+
+            _logger.LogInformation("Deep search: {FileName}, topK: {TopK}, retrievalK: {RetrievalK}, rerankK: {RerankK}",
+                fileName, topK, retrievalK, rerankK);
+
+            var response = await _httpClient.PostAsync(url, content);
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            var results = JsonSerializer.Deserialize<List<SearchResult>>(json) ?? new List<SearchResult>();
+
+            _logger.LogInformation("Deep search found {Count} results", results.Count);
+            return results;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Deep search failed");
+            throw;
+        }
+    }
+
+    // Search History Methods
+
+    public async Task<SearchHistoryListResponse?> GetSearchHistoryAsync(int page = 1, int pageSize = 20, string? searchType = null)
+    {
+        try
+        {
+            var url = $"/history?page={page}&page_size={pageSize}";
+            if (!string.IsNullOrEmpty(searchType))
+            {
+                url += $"&search_type={Uri.EscapeDataString(searchType)}";
+            }
+
+            _logger.LogInformation("Getting search history: page={Page}, pageSize={PageSize}", page, pageSize);
+
+            var response = await _httpClient.GetAsync(url);
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<SearchHistoryListResponse>(json);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get search history");
+            return null;
+        }
+    }
+
+    public async Task<SearchHistoryDetail?> GetSearchHistoryDetailAsync(int searchId)
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync($"/history/{searchId}");
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<SearchHistoryDetail>(json);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get search history detail for {SearchId}", searchId);
+            return null;
+        }
+    }
+
+    public string GetSearchHistoryImageUrl(int searchId)
+    {
+        return $"{_apiBaseUrl}/history/{searchId}/image";
+    }
+
+    public async Task<SaveSearchResponse?> SaveSearchHistoryAsync(
+        Stream? imageStream,
+        string? fileName,
+        string searchType,
+        string? queryText,
+        List<SearchResult> results,
+        int? durationMs,
+        string? collection)
+    {
+        try
+        {
+            // Convert results to JSON
+            var resultsJson = JsonSerializer.Serialize(results.Select(r => new
+            {
+                path = r.Path,
+                score = r.Score,
+                verified_matches = r.VerifiedMatches
+            }));
+
+            using var content = new MultipartFormDataContent();
+
+            // Add image if provided
+            if (imageStream != null && !string.IsNullOrEmpty(fileName))
+            {
+                var streamContent = new StreamContent(imageStream);
+                streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+                content.Add(streamContent, "file", fileName);
+            }
+
+            var url = $"/history?search_type={Uri.EscapeDataString(searchType)}&results_json={Uri.EscapeDataString(resultsJson)}";
+
+            if (!string.IsNullOrEmpty(queryText))
+                url += $"&query_text={Uri.EscapeDataString(queryText)}";
+            if (durationMs.HasValue)
+                url += $"&search_duration_ms={durationMs}";
+            if (!string.IsNullOrEmpty(collection))
+                url += $"&collection={Uri.EscapeDataString(collection)}";
+
+            _logger.LogInformation("Saving search history: type={SearchType}, results={Count}", searchType, results.Count);
+
+            var response = await _httpClient.PostAsync(url, content);
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<SaveSearchResponse>(json);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save search history");
+            return null;
+        }
+    }
+
+    public async Task<bool> DeleteSearchHistoryAsync(int searchId)
+    {
+        try
+        {
+            var response = await _httpClient.DeleteAsync($"/history/{searchId}");
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to delete search history {SearchId}", searchId);
+            return false;
+        }
+    }
 }

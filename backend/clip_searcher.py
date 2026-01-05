@@ -2,6 +2,7 @@
 CLIP Searcher for DinoDeceptionLens
 Uses pre-built FAISS index from ImageSnippetSearch
 Supports both image-to-image and text-to-image search
+Supports multiple collections (books, print_ads, etc.)
 """
 import os
 import json
@@ -11,6 +12,18 @@ import faiss
 import numpy as np
 from PIL import Image
 from pathlib import Path
+
+# Collection index paths
+COLLECTION_PATHS = {
+    "books": {
+        "index": "D:/faiss/books/index.faiss",
+        "paths": "D:/faiss/books/paths.json"
+    },
+    "print_ads": {
+        "index": "D:/faiss/print_ads/index.faiss",
+        "paths": "D:/faiss/print_ads/paths.json"
+    }
+}
 
 
 class ClipSearcher:
@@ -170,6 +183,91 @@ class ClipSearcher:
             print(f"CLIP text search error: {e}")
             return []
 
+    def search_with_rerank(
+        self,
+        image_path: str,
+        top_k: int = 50,
+        retrieval_k: int = 20000,
+        rerank_k: int = 1000,
+        verbose: bool = True
+    ) -> list:
+        """
+        Search using CLIP + ORB keypoints + Template matching re-ranking.
+
+        Pipeline:
+        1. CLIP semantic search -> get retrieval_k candidates
+        2. ORB keypoint filtering -> filter blanks, sort by matches
+        3. Template matching on top rerank_k -> precise ranking
+        4. Combined scoring -> final ranking
+
+        Args:
+            image_path: Path to query image
+            top_k: Number of final results to return
+            retrieval_k: Number of CLIP candidates to retrieve
+            rerank_k: Number of candidates to run template matching on
+            verbose: Print progress
+
+        Returns:
+            List of results with combined scoring
+        """
+        from clip_reranker import rerank_with_orb_and_template
+
+        # Step 1: Get CLIP candidates
+        if verbose:
+            print(f"CLIP search: retrieving {retrieval_k} candidates...")
+
+        results = self.search_by_image(image_path, top_k=retrieval_k)
+
+        if not results:
+            return []
+
+        if verbose:
+            print(f"  Got {len(results)} CLIP results")
+
+        # Step 2-3: Apply ORB + Template re-ranking
+        reranked = rerank_with_orb_and_template(
+            query_image_path=image_path,
+            results=results,
+            top_for_template=rerank_k,
+            verbose=verbose
+        )
+
+        # Return top_k
+        return reranked[:top_k]
+
+    def search_by_image_bytes_with_rerank(
+        self,
+        image_bytes: bytes,
+        top_k: int = 50,
+        retrieval_k: int = 20000,
+        rerank_k: int = 1000,
+        verbose: bool = True
+    ) -> list:
+        """
+        Search with re-ranking using image bytes.
+        Saves to temp file then calls search_with_rerank.
+        """
+        import tempfile
+        import os
+
+        # Save to temp file for re-ranking (needs path for cv2.imread)
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+            f.write(image_bytes)
+            temp_path = f.name
+
+        try:
+            results = self.search_with_rerank(
+                image_path=temp_path,
+                top_k=top_k,
+                retrieval_k=retrieval_k,
+                rerank_k=rerank_k,
+                verbose=verbose
+            )
+        finally:
+            os.unlink(temp_path)
+
+        return results
+
     def get_stats(self) -> dict:
         """Get index statistics."""
         self._ensure_loaded()
@@ -178,3 +276,76 @@ class ClipSearcher:
             "model": self.model_name,
             "index_path": self.index_path
         }
+
+
+# Factory functions for multi-collection support
+
+def get_clip_searcher(collection: str = "books") -> ClipSearcher:
+    """
+    Get a CLIP searcher for a specific collection.
+
+    Args:
+        collection: Collection name ("books", "print_ads", etc.)
+
+    Returns:
+        ClipSearcher instance configured for that collection
+    """
+    if collection not in COLLECTION_PATHS:
+        raise ValueError(f"Unknown collection: {collection}. Available: {list(COLLECTION_PATHS.keys())}")
+
+    paths = COLLECTION_PATHS[collection]
+    return ClipSearcher(
+        index_path=paths["index"],
+        paths_path=paths["paths"]
+    )
+
+
+def list_clip_collections() -> list:
+    """
+    List all available CLIP collections with their status.
+
+    Returns:
+        List of dicts with collection info and availability
+    """
+    result = []
+    for name, paths in COLLECTION_PATHS.items():
+        index_exists = os.path.exists(paths["index"])
+        paths_exists = os.path.exists(paths["paths"])
+
+        count = 0
+        if index_exists:
+            try:
+                idx = faiss.read_index(paths["index"])
+                count = idx.ntotal
+            except:
+                pass
+
+        result.append({
+            "name": name,
+            "index_path": paths["index"],
+            "paths_path": paths["paths"],
+            "available": index_exists and paths_exists,
+            "image_count": count
+        })
+
+    return result
+
+
+# Cache of loaded searchers to avoid reloading
+_searcher_cache = {}
+
+
+def get_cached_clip_searcher(collection: str = "books") -> ClipSearcher:
+    """
+    Get a cached CLIP searcher for a collection.
+    Searchers are reused to avoid reloading models and indexes.
+
+    Args:
+        collection: Collection name
+
+    Returns:
+        Cached ClipSearcher instance
+    """
+    if collection not in _searcher_cache:
+        _searcher_cache[collection] = get_clip_searcher(collection)
+    return _searcher_cache[collection]
