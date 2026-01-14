@@ -1,17 +1,16 @@
 r"""
-Verify OpenSearch coverage - ensure dinov2-books and faces-books have embeddings for every image in D:\books.
+Verify OpenSearch coverage - ensure dinov2-books has embeddings for every image in D:\books.
 
-Checks OpenSearch visual and face indexes to ensure they're in sync with D:\books\pdf-images.
+Checks OpenSearch visual index to ensure it's in sync with D:\books\pdf-images.
+Note: Face index is not checked since it only contains images with detected faces (partial by design).
 
 Usage:
     python verify_opensearch_coverage.py           # Full report
     python verify_opensearch_coverage.py --summary # Just totals
-    python verify_opensearch_coverage.py --missing # List books with missing embeddings
     python verify_opensearch_coverage.py --fix     # Index missing images automatically
 
 Log file: verify_opensearch_coverage.log (same directory)
 """
-import os
 import sys
 import logging
 from pathlib import Path
@@ -23,17 +22,14 @@ LOG_FILE = Path(__file__).parent / "verify_opensearch_coverage.log"
 
 def setup_logging():
     """Configure logging to both file and console."""
-    # Create logger
     logger = logging.getLogger("verify_opensearch")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    # File handler - append mode
     file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter('%(message)s'))
 
-    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter('%(message)s'))
@@ -49,7 +45,6 @@ BOOKS_ROOT = r"D:\books\pdf-images"
 OPENSEARCH_HOST = "localhost"
 OPENSEARCH_PORT = 9200
 VISUAL_INDEX = "dinov2-books"
-FACES_INDEX = "faces-books"
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
 
@@ -76,7 +71,6 @@ def get_indexed_paths(client: OpenSearch, index: str, book_name: str) -> set:
     """Get all indexed image paths for a book from OpenSearch."""
     indexed = set()
     try:
-        # Scroll through all documents for this book
         query = {
             "query": {
                 "term": {"book": book_name}
@@ -84,7 +78,6 @@ def get_indexed_paths(client: OpenSearch, index: str, book_name: str) -> set:
             "_source": ["path"]
         }
 
-        # Initial search
         response = client.search(
             index=index,
             body=query,
@@ -95,13 +88,11 @@ def get_indexed_paths(client: OpenSearch, index: str, book_name: str) -> set:
         scroll_id = response.get("_scroll_id")
         hits = response["hits"]["hits"]
 
-        # Process initial batch
         for hit in hits:
             path = hit["_source"].get("path")
             if path:
                 indexed.add(path)
 
-        # Continue scrolling
         while len(hits) > 0:
             response = client.scroll(scroll_id=scroll_id, scroll="2m")
             scroll_id = response.get("_scroll_id")
@@ -112,7 +103,6 @@ def get_indexed_paths(client: OpenSearch, index: str, book_name: str) -> set:
                 if path:
                     indexed.add(path)
 
-        # Clean up scroll
         if scroll_id:
             client.clear_scroll(scroll_id=scroll_id)
 
@@ -170,14 +160,11 @@ def delete_book_from_index(client: OpenSearch, index: str, book_name: str) -> in
 
 def cleanup_orphaned_books(client: OpenSearch, books_path: Path) -> dict:
     """Delete entries from OpenSearch for books that don't exist in D:\books anymore."""
-    deleted_visual = 0
-    deleted_faces = 0
+    deleted = 0
     failed = 0
 
-    # Get actual books in D:\books\pdf-images
     actual_books = set(d.name for d in books_path.iterdir() if d.is_dir())
 
-    # Check visual index
     try:
         indexed_books = get_all_indexed_books(client, VISUAL_INDEX)
         orphaned = indexed_books - actual_books
@@ -185,48 +172,29 @@ def cleanup_orphaned_books(client: OpenSearch, books_path: Path) -> dict:
         for book in orphaned:
             count = delete_book_from_index(client, VISUAL_INDEX, book)
             if count > 0:
-                deleted_visual += count
-                logger.info(f"  Deleted from visual: {book} ({count} docs)")
+                deleted += count
+                logger.info(f"  Deleted: {book} ({count} docs)")
             else:
                 failed += 1
 
     except Exception as e:
-        logger.info(f"  Failed to cleanup visual index: {e}")
+        logger.info(f"  Failed to cleanup: {e}")
         failed += 1
 
-    # Check faces index
-    try:
-        indexed_books = get_all_indexed_books(client, FACES_INDEX)
-        orphaned = indexed_books - actual_books
-
-        for book in orphaned:
-            count = delete_book_from_index(client, FACES_INDEX, book)
-            if count > 0:
-                deleted_faces += count
-                logger.info(f"  Deleted from faces: {book} ({count} docs)")
-            else:
-                failed += 1
-
-    except Exception as e:
-        logger.info(f"  Failed to cleanup faces index: {e}")
-        failed += 1
-
-    return {"deleted_visual": deleted_visual, "deleted_faces": deleted_faces, "failed": failed}
+    return {"deleted": deleted, "failed": failed}
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Verify OpenSearch coverage")
+    parser = argparse.ArgumentParser(description="Verify OpenSearch visual coverage")
     parser.add_argument("--summary", action="store_true", help="Just show totals")
-    parser.add_argument("--missing", action="store_true", help="List books with missing embeddings")
     parser.add_argument("--fix", action="store_true", help="Index any missing images")
     parser.add_argument("--book", type=str, help="Check a specific book")
     args = parser.parse_args()
 
-    # Log start time
     logger.info("")
     logger.info("=" * 80)
-    logger.info(f"OpenSearch Coverage Verification - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"OpenSearch Visual Coverage - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
 
     books_path = Path(BOOKS_ROOT)
@@ -234,10 +202,8 @@ def main():
         logger.info(f"Books root not found: {BOOKS_ROOT}")
         sys.exit(1)
 
-    # Connect to OpenSearch
     client = get_opensearch_client()
 
-    # Get all books
     all_books = sorted([d.name for d in books_path.iterdir() if d.is_dir()])
 
     if args.book:
@@ -247,53 +213,30 @@ def main():
             sys.exit(1)
 
     total_images = 0
-    total_visual = 0
-    total_faces = 0
-    missing_visual_books = []  # (book, img_count, visual_count, missing_count)
-    missing_faces_books = []   # (book, img_count, faces_count, missing_count)
+    total_indexed = 0
+    missing_books = []  # (book, img_count, indexed_count, missing_count, missing_paths)
 
     logger.info(f"Checking {len(all_books)} books...")
     logger.info("")
 
     for idx, book in enumerate(all_books):
-        # Show progress (console only, not logged)
-        needs_fix = len(missing_visual_books) + len(missing_faces_books)
+        needs_fix = len(missing_books)
         fix_str = f" | {needs_fix} need fixing" if needs_fix > 0 else ""
         print(f"\r  Scanning [{idx+1}/{len(all_books)}] {book[:45]:<45}{fix_str:<20}", end="", flush=True)
 
         book_path = books_path / book
         images = count_images(book_path)
-
-        # Check visual index
-        visual_indexed = get_indexed_paths(client, VISUAL_INDEX, book)
-
-        # Check faces index (just count unique source images, not individual faces)
-        faces_indexed = get_indexed_paths(client, FACES_INDEX, book)
+        indexed = get_indexed_paths(client, VISUAL_INDEX, book)
 
         total_images += len(images)
-        total_visual += len(visual_indexed)
-        total_faces += len(faces_indexed)
+        total_indexed += len(indexed)
 
-        # Check for missing
-        missing_visual = images - visual_indexed
-        missing_faces = images - faces_indexed
+        missing = images - indexed
 
-        if missing_visual:
-            missing_visual_books.append((book, len(images), len(visual_indexed), len(missing_visual), missing_visual))
-            # Log immediately when issue found
-            logger.info(f"MISSING VISUAL: {book} | {len(images)} imgs, {len(visual_indexed)} indexed, {len(missing_visual)} missing")
+        if missing:
+            missing_books.append((book, len(images), len(indexed), len(missing), missing))
+            logger.info(f"MISSING: {book} | {len(images)} imgs, {len(indexed)} indexed, {len(missing)} missing")
 
-        if missing_faces:
-            missing_faces_books.append((book, len(images), len(faces_indexed), len(missing_faces), missing_faces))
-            # Log immediately when issue found
-            logger.info(f"MISSING FACES: {book} | {len(images)} imgs, {len(faces_indexed)} indexed, {len(missing_faces)} missing")
-
-        if not args.summary and not args.missing and not args.fix:
-            visual_status = "OK" if not missing_visual else f"MISSING {len(missing_visual)}"
-            faces_status = "OK" if not missing_faces else f"MISSING {len(missing_faces)}"
-            print(f"\r  {book[:50]:<50} | {len(images):>4} imgs | Visual: {visual_status:<20} | Faces: {faces_status:<20}")
-
-    # Clear progress line
     print("\r" + " " * 120 + "\r", end="")
     logger.info("")
     logger.info("=" * 80)
@@ -301,46 +244,27 @@ def main():
     logger.info("=" * 80)
     logger.info(f"Total books:          {len(all_books):,}")
     logger.info(f"Total images:         {total_images:,}")
-    logger.info(f"Visual embeddings:    {total_visual:,}")
-    logger.info(f"Face source images:   {total_faces:,}")
+    logger.info(f"Visual embeddings:    {total_indexed:,}")
 
-    visual_coverage = (total_visual / total_images * 100) if total_images > 0 else 0
-    faces_coverage = (total_faces / total_images * 100) if total_images > 0 else 0
-    logger.info(f"Visual coverage:      {visual_coverage:.2f}%")
-    logger.info(f"Faces coverage:       {faces_coverage:.2f}%")
+    coverage = (total_indexed / total_images * 100) if total_images > 0 else 0
+    logger.info(f"Coverage:             {coverage:.2f}%")
 
-    # Report missing visual
-    if missing_visual_books:
+    if missing_books:
         logger.info("")
-        logger.info(f"Books with missing visual embeddings: {len(missing_visual_books)}")
+        logger.info(f"Books with missing embeddings: {len(missing_books)}")
         if not args.summary:
             logger.info("")
-            for book, imgs, indexed, missing_count, _ in missing_visual_books:
-                logger.info(f"  {book[:70]:<70} | {imgs} imgs, {indexed} indexed, {missing_count} missing")
+            for book, imgs, indexed, missing_count, _ in missing_books:
+                logger.info(f"  {book} | {imgs} imgs, {indexed} indexed, {missing_count} missing")
 
-        total_missing_visual = sum(m[3] for m in missing_visual_books)
-        logger.info(f"\nTotal missing visual embeddings: {total_missing_visual:,}")
+        total_missing = sum(m[3] for m in missing_books)
+        logger.info(f"\nTotal missing: {total_missing:,}")
     else:
         logger.info("")
         logger.info("All images have visual embeddings!")
 
-    # Report missing faces
-    if missing_faces_books:
-        logger.info("")
-        logger.info(f"Books with missing face embeddings: {len(missing_faces_books)}")
-        if not args.summary:
-            logger.info("")
-            for book, imgs, indexed, missing_count, _ in missing_faces_books:
-                logger.info(f"  {book[:70]:<70} | {imgs} imgs, {indexed} indexed, {missing_count} missing")
-
-        total_missing_faces = sum(m[3] for m in missing_faces_books)
-        logger.info(f"\nTotal missing face embeddings: {total_missing_faces:,}")
-    else:
-        logger.info("")
-        logger.info("All images have face embeddings!")
-
     # Fix missing if requested
-    if args.fix and (missing_visual_books or missing_faces_books):
+    if args.fix and missing_books:
         logger.info("")
         logger.info("=" * 80)
         logger.info("FIXING MISSING EMBEDDINGS")
@@ -351,44 +275,28 @@ def main():
 
         indexer = OpenSearchIndexer(
             visual_index=VISUAL_INDEX,
-            faces_index=FACES_INDEX,
             enable_visual=True,
-            enable_faces=True
+            enable_faces=False
         )
 
-        # Combine missing books (some may be in both lists)
-        all_missing = {}
-        for book, imgs, indexed, missing_count, missing_paths in missing_visual_books:
-            if book not in all_missing:
-                all_missing[book] = set()
-            all_missing[book].update(missing_paths)
+        total_fixed = 0
 
-        for book, imgs, indexed, missing_count, missing_paths in missing_faces_books:
-            if book not in all_missing:
-                all_missing[book] = set()
-            all_missing[book].update(missing_paths)
+        for i, (book, imgs, indexed, missing_count, missing_paths) in enumerate(missing_books):
+            logger.info(f"[{i+1}/{len(missing_books)}] {book} - {missing_count} missing")
 
-        total_indexed_visual = 0
-        total_indexed_faces = 0
-
-        for i, (book, missing_paths) in enumerate(all_missing.items()):
-            logger.info(f"[{i+1}/{len(all_missing)}] {book} - {len(missing_paths)} missing images")
-
-            # Re-index the entire book directory (simpler and ensures consistency)
             book_path = books_path / book
             try:
                 result = indexer.index_directory(str(book_path), book_name=book)
-                total_indexed_visual += result.get("visual", 0)
-                total_indexed_faces += result.get("faces", 0)
-                logger.info(f"  Indexed: {result.get('visual', 0)} visual, {result.get('faces', 0)} faces")
+                total_fixed += result.get("visual", 0)
+                logger.info(f"  Indexed: {result.get('visual', 0)}")
             except Exception as e:
-                logger.info(f"  Error indexing {book}: {e}")
+                logger.info(f"  Error: {e}")
 
         logger.info("")
         logger.info("=" * 80)
         logger.info("FIX COMPLETE")
         logger.info("=" * 80)
-        logger.info(f"Indexed: {total_indexed_visual:,} visual, {total_indexed_faces:,} faces")
+        logger.info(f"Indexed: {total_fixed:,} visual embeddings")
 
     # Check for orphaned books
     print()
@@ -398,10 +306,9 @@ def main():
         logger.info("Scanning for orphaned book entries...")
         result = cleanup_orphaned_books(client, books_path)
 
-        if result['deleted_visual'] > 0 or result['deleted_faces'] > 0:
+        if result['deleted'] > 0:
             logger.info("")
-            logger.info(f"Deleted {result['deleted_visual']} visual embeddings")
-            logger.info(f"Deleted {result['deleted_faces']} face embeddings")
+            logger.info(f"Deleted {result['deleted']} orphaned embeddings")
             if result['failed'] > 0:
                 logger.info(f"Failed: {result['failed']}")
         else:
