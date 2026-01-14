@@ -126,18 +126,24 @@ def main():
         book_path = books_path / book
         images = count_images(book_path)
 
-        # Check NAS first, then local
+        # Check both NAS and local, merge feature sets
         nas_features_path = Path(NAS_FEATURES_ROOT) / book
         local_features_path = Path(LOCAL_FEATURES_ROOT) / book
 
-        if nas_features_path.exists():
-            features = count_features(nas_features_path)
+        nas_features = count_features(nas_features_path) if nas_features_path.exists() else set()
+        local_features = count_features(local_features_path) if local_features_path.exists() else set()
+
+        # Merge both locations
+        features = nas_features | local_features
+
+        # Determine primary location
+        if nas_features_path.exists() and local_features_path.exists():
+            location = "both"
+        elif nas_features_path.exists():
             location = "NAS"
         elif local_features_path.exists():
-            features = count_features(local_features_path)
             location = "local"
         else:
-            features = set()
             location = "NONE"
 
         total_images += len(images)
@@ -237,7 +243,8 @@ def main():
             print(f"Failed:  {total_failed:,}")
             print(f"Time:    {elapsed:.1f}s ({total_indexed/elapsed:.1f} img/s)" if elapsed > 0 else "")
             print()
-            print("Note: Run again to verify, or run batch indexer to move to NAS.")
+            print("Note: Features saved to LOCAL (D:\\disk-features\\books).")
+            print("      Run batch indexer (run_disk_indexer.bat) to move to NAS.")
     else:
         print()
         print("All images have DISK features!")
