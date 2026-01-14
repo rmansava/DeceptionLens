@@ -1,15 +1,18 @@
 """
-Verify DISK feature coverage - ensure every image has a corresponding .npz file.
+Verify DISK feature coverage - ensure NAS has .npz for every image in D:\books.
+
+Checks NAS (T:\disk-features\books) to ensure it's in sync with D:\books\pdf-images.
 
 Usage:
     python verify_disk_coverage.py           # Full report
     python verify_disk_coverage.py --summary # Just totals
     python verify_disk_coverage.py --missing # List books with missing features
-    python verify_disk_coverage.py --fix     # Index any missing images
+    python verify_disk_coverage.py --fix     # Index missing and sync to NAS automatically
 """
 import os
 import sys
 import time
+import shutil
 from pathlib import Path
 
 BOOKS_ROOT = r"D:\books\pdf-images"
@@ -52,7 +55,7 @@ def get_missing_image_paths(book_path: Path, missing_stems: set) -> list:
 
 
 def cleanup_orphaned_features(extra_features_books: list, books_path: Path) -> dict:
-    """Delete orphaned .npz files that have no corresponding image."""
+    """Delete orphaned .npz files from NAS that have no corresponding image."""
     deleted = 0
     failed = 0
 
@@ -65,17 +68,14 @@ def cleanup_orphaned_features(extra_features_books: list, books_path: Path) -> d
             if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS:
                 images.add(f.stem.lower())
 
-        # Check NAS first, then local
+        # Check NAS only (source of truth)
         nas_features_path = Path(NAS_FEATURES_ROOT) / book
-        local_features_path = Path(LOCAL_FEATURES_ROOT) / book
 
-        features_path = nas_features_path if nas_features_path.exists() else local_features_path
-
-        if not features_path.exists():
+        if not nas_features_path.exists():
             continue
 
         # Delete orphaned .npz files
-        for npz_file in features_path.glob("*.npz"):
+        for npz_file in nas_features_path.glob("*.npz"):
             if npz_file.stem.lower() not in images:
                 try:
                     npz_file.unlink()
@@ -126,25 +126,11 @@ def main():
         book_path = books_path / book
         images = count_images(book_path)
 
-        # Check both NAS and local, merge feature sets
+        # Check NAS only (source of truth for production)
         nas_features_path = Path(NAS_FEATURES_ROOT) / book
-        local_features_path = Path(LOCAL_FEATURES_ROOT) / book
 
-        nas_features = count_features(nas_features_path) if nas_features_path.exists() else set()
-        local_features = count_features(local_features_path) if local_features_path.exists() else set()
-
-        # Merge both locations
-        features = nas_features | local_features
-
-        # Determine primary location
-        if nas_features_path.exists() and local_features_path.exists():
-            location = "both"
-        elif nas_features_path.exists():
-            location = "NAS"
-        elif local_features_path.exists():
-            location = "local"
-        else:
-            location = "NONE"
+        features = count_features(nas_features_path) if nas_features_path.exists() else set()
+        location = "NAS" if nas_features_path.exists() else "NONE"
 
         total_images += len(images)
         total_features += len(features)
@@ -213,7 +199,12 @@ def main():
 
             total_indexed = 0
             total_failed = 0
+            total_moved = 0
+            move_failed = 0
             start_time = time.time()
+
+            # Track which books need moving
+            books_to_move = set()
 
             for i, (book, imgs, feats, missing_count, loc, missing_stems) in enumerate(missing_books):
                 book_path = books_path / book
@@ -221,18 +212,63 @@ def main():
 
                 print(f"[{i+1}/{len(missing_books)}] {book[:50]} - {len(missing_paths)} missing")
 
+                book_indexed = 0
                 for image_path in missing_paths:
                     try:
                         success = indexer.index_image(image_path, book_name=book)
                         if success:
                             total_indexed += 1
+                            book_indexed += 1
                         else:
                             total_failed += 1
                     except Exception as e:
                         print(f"  Error: {e}")
                         total_failed += 1
 
+                # Track book for moving if we indexed anything
+                if book_indexed > 0:
+                    books_to_move.add(book)
+
             indexer.close()
+
+            # Move indexed books from local to NAS
+            if books_to_move:
+                print()
+                print("=" * 80)
+                print("MOVING TO NAS")
+                print("=" * 80)
+                print()
+
+                for book in books_to_move:
+                    local_book_path = Path(LOCAL_FEATURES_ROOT) / book
+                    nas_book_path = Path(NAS_FEATURES_ROOT) / book
+
+                    if not local_book_path.exists():
+                        print(f"  Skip {book[:50]} - not found in local")
+                        continue
+
+                    try:
+                        # Create NAS parent if needed
+                        nas_book_path.parent.mkdir(parents=True, exist_ok=True)
+
+                        # If NAS book exists, merge by copying files
+                        if nas_book_path.exists():
+                            for npz_file in local_book_path.glob("*.npz"):
+                                dest_file = nas_book_path / npz_file.name
+                                shutil.copy2(npz_file, dest_file)
+                            # Remove local after copying
+                            shutil.rmtree(local_book_path)
+                            print(f"  Merged {book[:50]}")
+                        else:
+                            # Move entire folder
+                            shutil.move(str(local_book_path), str(nas_book_path))
+                            print(f"  Moved {book[:50]}")
+
+                        total_moved += 1
+
+                    except Exception as e:
+                        print(f"  Failed {book[:40]} - {e}")
+                        move_failed += 1
 
             elapsed = time.time() - start_time
             print()
@@ -241,10 +277,11 @@ def main():
             print("=" * 80)
             print(f"Indexed: {total_indexed:,}")
             print(f"Failed:  {total_failed:,}")
+            if books_to_move:
+                print(f"Moved to NAS: {total_moved}/{len(books_to_move)} books")
+                if move_failed > 0:
+                    print(f"Move failed: {move_failed}")
             print(f"Time:    {elapsed:.1f}s ({total_indexed/elapsed:.1f} img/s)" if elapsed > 0 else "")
-            print()
-            print("Note: Features saved to LOCAL (D:\\disk-features\\books).")
-            print("      Run batch indexer (run_disk_indexer.bat) to move to NAS.")
     else:
         print()
         print("All images have DISK features!")

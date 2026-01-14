@@ -682,6 +682,26 @@ Key parameters in `DiskIndexerFile`:
 - `prefetch_size=32` - Images buffered ahead of GPU
 - `batch_size=20` - Features batched before async save
 
+### DISK Coverage Verification
+
+The `verify_disk_coverage.py` tool verifies that NAS storage has DISK features for every image:
+
+```bash
+# Check coverage (NAS only)
+python verify_disk_coverage.py --summary
+
+# Fix missing features and sync to NAS automatically
+python verify_disk_coverage.py --fix
+```
+
+**What it does:**
+1. Scans all images in `D:\books\pdf-images`
+2. Checks if corresponding `.npz` exists on NAS (`T:\disk-features\books`)
+3. With `--fix`: Indexes missing images → moves to NAS → cleans up orphaned features
+4. Ensures NAS is the source of truth and stays in sync
+
+Run `verify_disk_coverage.bat` after batch indexing to ensure 100% coverage.
+
 ---
 
 ## DISK Feature Cache (SQL Server)
