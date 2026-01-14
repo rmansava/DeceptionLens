@@ -11,6 +11,9 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from typing import List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
 
 # Kornia for DISK feature extraction
 try:
@@ -41,7 +44,10 @@ class DiskIndexerFile:
         batch_size: int = 10,
         path_remap: Tuple[str, str] = None,
         show_progress: bool = True,
-        device: str = None
+        device: str = None,
+        num_workers: int = 8,
+        prefetch_size: int = 32,
+        gpu_batch_size: int = 4
     ):
         """
         Initialize DISK indexer with file-based storage.
@@ -54,6 +60,9 @@ class DiskIndexerFile:
                         E.g., ("D:\\books", "T:\\archiverelated\\books") reads from D: but stores T: paths.
             show_progress: Show tqdm progress bar (default True, set False for batch scripts)
             device: Force device ("cpu" or "cuda"). Default None = auto-detect (prefer GPU)
+            num_workers: Number of worker threads for parallel image loading (default 8)
+            prefetch_size: Number of images to prefetch ahead (default 32)
+            gpu_batch_size: Number of images to batch for GPU inference (default 4)
         """
         if not KORNIA_AVAILABLE:
             raise RuntimeError("Kornia is required for DISK feature extraction")
@@ -63,6 +72,9 @@ class DiskIndexerFile:
         self.batch_size = batch_size
         self.path_remap = path_remap
         self.show_progress = show_progress
+        self.num_workers = num_workers
+        self.prefetch_size = prefetch_size
+        self.gpu_batch_size = gpu_batch_size
 
         if device:
             self.device = device
@@ -102,12 +114,12 @@ class DiskIndexerFile:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def _load_and_pad_image(self, image_path: str) -> Optional[Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int]]]:
+    def _preprocess_image_cpu(self, image_path: str, max_dimension: int = 1600) -> Optional[Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int]]]:
         """
-        Load image and pad to dimensions divisible by 16 (required by DISK).
+        Load and preprocess image on CPU only (for parallel loading).
 
         Returns:
-            Tuple of (tensor, original_size, padded_size) or None if failed
+            Tuple of (cpu_tensor, original_size, padded_size) or None if failed
         """
         try:
             # Use cv2.imdecode for non-ASCII paths on Windows
@@ -117,6 +129,14 @@ class DiskIndexerFile:
 
             h, w = img.shape[:2]
             original_size = (h, w)
+
+            # Resize if too large (prevents GPU OOM)
+            if max(h, w) > max_dimension:
+                scale = max_dimension / max(h, w)
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                h, w = new_h, new_w
 
             # Pad to multiples of 16
             new_h = ((h + 15) // 16) * 16
@@ -129,16 +149,31 @@ class DiskIndexerFile:
                     cv2.BORDER_CONSTANT, value=[0, 0, 0]
                 )
 
-            # Convert to tensor
+            # Convert to tensor (stays on CPU)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             tensor = K.image_to_tensor(img, False).float() / 255.0
-            tensor = tensor.to(self.device)
+            # Don't move to GPU here - that happens in main thread
 
             return tensor, original_size, padded_size
 
         except Exception as e:
-            print(f"Error loading {image_path}: {e}")
+            # Silently fail - will be counted as failed
             return None
+
+    def _load_and_pad_image(self, image_path: str, max_dimension: int = 1600) -> Optional[Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int]]]:
+        """
+        Load image, resize if too large, and pad to dimensions divisible by 16 (required by DISK).
+
+        Returns:
+            Tuple of (tensor, original_size, padded_size) or None if failed
+        """
+        result = self._preprocess_image_cpu(image_path, max_dimension)
+        if result is None:
+            return None
+
+        tensor, original_size, padded_size = result
+        tensor = tensor.to(self.device)
+        return tensor, original_size, padded_size
 
     def extract_features(self, image_path: str) -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[int, int], Tuple[int, int]]]:
         """
@@ -185,6 +220,105 @@ class DiskIndexerFile:
         store_path = self._remap_path(image_path)
         return self.store.save(store_path, keypoints, descriptors, image_size, padded_size, book_name)
 
+    def _process_gpu_batch(self, gpu_batch: list, book_name: str) -> list:
+        """
+        Process a batch of images through GPU in one call.
+
+        Args:
+            gpu_batch: List of (image_path, tensor, original_size, padded_size)
+            book_name: Book name for storage
+
+        Returns:
+            List of (store_path, keypoints, descriptors, original_size, padded_size, book_name)
+        """
+        if not gpu_batch:
+            return []
+
+        results = []
+
+        # Group by padded size for efficient batching
+        size_groups = {}
+        for item in gpu_batch:
+            image_path, tensor, original_size, padded_size = item
+            key = padded_size  # (height, width)
+            if key not in size_groups:
+                size_groups[key] = []
+            size_groups[key].append(item)
+
+        # Process each size group as a batch
+        for padded_size, group in size_groups.items():
+            try:
+                # Stack tensors into batch
+                tensors = [item[1] for item in group]
+                batch_tensor = torch.cat(tensors, dim=0).to(self.device)
+
+                with torch.no_grad():
+                    # DISK returns list of features, one per image in batch
+                    feats_list = self.extractor(batch_tensor)
+
+                # Extract results for each image
+                for i, item in enumerate(group):
+                    image_path, _, original_size, padded_size = item
+                    feats = feats_list[i]
+                    keypoints = feats.keypoints.cpu().numpy()
+                    descriptors = feats.descriptors.cpu().numpy()
+                    store_path = self._remap_path(image_path)
+                    results.append((store_path, keypoints, descriptors, original_size, padded_size, book_name))
+
+                del batch_tensor
+
+            except Exception as e:
+                # Fall back to individual processing on error
+                for item in group:
+                    image_path, tensor, original_size, padded_size = item
+                    try:
+                        tensor = tensor.to(self.device)
+                        with torch.no_grad():
+                            feats = self.extractor(tensor)[0]
+                            keypoints = feats.keypoints.cpu().numpy()
+                            descriptors = feats.descriptors.cpu().numpy()
+                        store_path = self._remap_path(image_path)
+                        results.append((store_path, keypoints, descriptors, original_size, padded_size, book_name))
+                    except:
+                        pass  # Skip failed images
+
+        return results
+
+    def _prefetch_worker(self, file_queue: queue.Queue, result_queue: queue.Queue, stop_event: threading.Event):
+        """Worker thread that loads and preprocesses images."""
+        while not stop_event.is_set():
+            try:
+                image_path = file_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if image_path is None:  # Poison pill
+                file_queue.task_done()
+                break
+
+            # Preprocess on CPU
+            result = self._preprocess_image_cpu(image_path)
+            result_queue.put((image_path, result))
+            file_queue.task_done()
+
+    def _save_worker(self, save_queue: queue.Queue, stop_event: threading.Event, stats: dict):
+        """Worker thread that saves batches to disk asynchronously."""
+        while not stop_event.is_set():
+            try:
+                batch = save_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if batch is None:  # Poison pill
+                save_queue.task_done()
+                break
+
+            # Save batch to disk
+            saved = self.store.save_batch(batch)
+            stats['indexed'] += saved
+            stats['failed'] += len(batch) - saved
+            save_queue.task_done()
+
     def index_directory(
         self,
         dir_path: str,
@@ -192,7 +326,7 @@ class DiskIndexerFile:
         skip_existing: bool = True
     ) -> dict:
         """
-        Index all images in a directory.
+        Index all images in a directory using parallel prefetching.
 
         Args:
             dir_path: Directory containing images
@@ -236,41 +370,116 @@ class DiskIndexerFile:
             print("All images already indexed!")
             return {"total": len(files), "indexed": 0, "skipped": skipped, "failed": 0}
 
-        # Process images
-        indexed = 0
-        failed = 0
+        # Set up parallel prefetching
+        # Large queues to prevent workers from blocking
+        file_queue = queue.Queue(maxsize=self.prefetch_size * 4)
+        result_queue = queue.Queue(maxsize=self.prefetch_size * 2)
+        save_queue = queue.Queue(maxsize=10)  # Queue for async batch saves
+        stop_event = threading.Event()
+
+        # Shared stats for save worker (needs to be mutable)
+        save_stats = {'indexed': 0, 'failed': 0}
+
+        # Start prefetch worker threads
+        workers = []
+        for _ in range(self.num_workers):
+            t = threading.Thread(target=self._prefetch_worker, args=(file_queue, result_queue, stop_event))
+            t.daemon = True
+            t.start()
+            workers.append(t)
+
+        # Start save worker thread (async disk writes)
+        save_thread = threading.Thread(target=self._save_worker, args=(save_queue, stop_event, save_stats))
+        save_thread.daemon = True
+        save_thread.start()
+
+        # Feed files to workers
+        def file_feeder():
+            for image_path in to_process:
+                file_queue.put(image_path)
+            # Send poison pills to stop workers
+            for _ in range(self.num_workers):
+                file_queue.put(None)
+
+        feeder_thread = threading.Thread(target=file_feeder)
+        feeder_thread.daemon = True
+        feeder_thread.start()
+
+        # Process results
+        local_failed = 0
         batch = []
+        processed = 0
 
-        iterator = tqdm(to_process, desc="Indexing DISK features") if self.show_progress else to_process
-        for image_path in iterator:
-            result = self.extract_features(image_path)
+        pbar = tqdm(total=len(to_process), desc="Indexing DISK features") if self.show_progress else None
 
-            if result is None:
-                failed += 1
-                continue
+        try:
+            while processed < len(to_process):
+                try:
+                    image_path, preprocess_result = result_queue.get(timeout=5.0)
+                except queue.Empty:
+                    continue
 
-            keypoints, descriptors, image_size, padded_size = result
-            # Use remapped path for storage
-            store_path = self._remap_path(image_path)
-            batch.append((store_path, keypoints, descriptors, image_size, padded_size, book_name))
+                processed += 1
+                if pbar:
+                    pbar.update(1)
 
-            # Batch save
-            if len(batch) >= self.batch_size:
-                saved = self.store.save_batch(batch)
-                indexed += saved
-                failed += len(batch) - saved
-                batch = []
+                if preprocess_result is None:
+                    local_failed += 1
+                    continue
 
-            # Garbage collection
-            gc.collect()
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
+                tensor, original_size, padded_size = preprocess_result
 
-        # Save remaining
+                # Move to GPU and extract features
+                try:
+                    tensor = tensor.to(self.device)
+                    with torch.no_grad():
+                        feats = self.extractor(tensor)[0]
+                        keypoints = feats.keypoints.cpu().numpy()
+                        descriptors = feats.descriptors.cpu().numpy()
+
+                    # Use remapped path for storage
+                    store_path = self._remap_path(image_path)
+                    batch.append((store_path, keypoints, descriptors, original_size, padded_size, book_name))
+
+                    # Queue batch for async save (non-blocking)
+                    if len(batch) >= self.batch_size:
+                        save_queue.put(batch)
+                        batch = []
+
+                except Exception as e:
+                    local_failed += 1
+
+                # Clean up tensor
+                del tensor
+                if processed % 500 == 0:
+                    gc.collect()
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+
+        finally:
+            if pbar:
+                pbar.close()
+
+        # Save remaining batch
         if batch:
-            saved = self.store.save_batch(batch)
-            indexed += saved
-            failed += len(batch) - saved
+            save_queue.put(batch)
+
+        # Signal save worker to stop and wait for it to finish
+        save_queue.put(None)
+        save_queue.join()
+
+        # Now safe to stop prefetch workers
+        stop_event.set()
+
+        # Combine stats
+        indexed = save_stats['indexed']
+        failed = local_failed + save_stats['failed']
+
+        # Wait for threads to finish
+        feeder_thread.join(timeout=1.0)
+        for t in workers:
+            t.join(timeout=1.0)
+        save_thread.join(timeout=1.0)
 
         print(f"Indexed {indexed} images, {failed} failed, {skipped} skipped")
         return {

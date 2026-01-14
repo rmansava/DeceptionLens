@@ -648,12 +648,39 @@ LightGlue needs it in the candidate pool to find the keypoint matches.
 ## Performance Notes
 
 1. **Geometric verification is slow** but accurate - checks entire candidate pool
-2. **Indexing is GPU-bound** - processes ~1-3 images/second on RTX 3090
+2. **DISK indexing is optimized** - parallel prefetch + async saves achieves ~10-13 img/s on RTX 4070 Super
 3. **Face detection adds overhead** - only finds faces in ~15% of book pages
 4. **OpenSearch k-NN is fast** - uses HNSW algorithm for approximate nearest neighbors
 5. **Batch indexing resumes** - progress saved to `batch_progress_opensearch.txt`
 6. **Crop search requires large candidate pool** - fetch_k=5000 for snippets to work
 7. **DISK feature cache** - pre-computed features reduce verification from ~17min to ~2-3min
+
+### DISK Indexing Optimization
+
+The `disk_indexer_file.py` uses a multi-threaded pipeline to maximize GPU utilization:
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  File Feeder    │────►│  Prefetch Queue │────►│  GPU Inference  │
+│  (1 thread)     │     │  (8 workers)    │     │  (main thread)  │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+                                                         │
+                        ┌─────────────────┐              │
+                        │  Save Worker    │◄─────────────┘
+                        │  (async disk)   │
+                        └─────────────────┘
+```
+
+| Configuration | Rate | Notes |
+|---------------|------|-------|
+| Sequential (original) | ~8 img/s | GPU idle 50%+ waiting on I/O |
+| Parallel prefetch only | ~6 img/s | Batch saves still block |
+| **Parallel + async save** | **~10-13 img/s** | GPU stays fed, saves non-blocking |
+
+Key parameters in `DiskIndexerFile`:
+- `num_workers=8` - CPU threads for image decode/resize
+- `prefetch_size=32` - Images buffered ahead of GPU
+- `batch_size=20` - Features batched before async save
 
 ---
 
