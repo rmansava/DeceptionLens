@@ -22,6 +22,7 @@ temp_uploads/
 batch_progress.txt
 batch_disk_progress_file.txt
 batch_progress_fast.txt
+batch_progress_opensearch.txt
 tmpclaude-*
 
 # IDE

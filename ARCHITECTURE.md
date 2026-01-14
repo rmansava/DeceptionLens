@@ -707,6 +707,31 @@ python verify_disk_coverage.py --fix
 
 Run `verify_disk_coverage.bat` after batch indexing to ensure 100% coverage. The tool is smart about reusing work - if features exist locally but aren't on NAS yet, it moves them instead of re-computing.
 
+### OpenSearch Coverage Verification
+
+The `verify_opensearch_coverage.py` tool verifies that OpenSearch has embeddings for every image:
+
+```bash
+# Check coverage
+python verify_opensearch_coverage.py --summary
+
+# Fix missing embeddings automatically
+python verify_opensearch_coverage.py --fix
+```
+
+**What it does:**
+1. Scans all images in `D:\books\pdf-images`
+2. Queries OpenSearch to check which images are indexed in `dinov2-books` and `faces-books`
+3. Reports missing visual and face embeddings separately
+4. With `--fix`:
+   - Re-indexes books with missing embeddings
+   - Uses the existing `OpenSearchIndexer` to ensure consistency
+   - Reports total indexed visual and face embeddings
+   - Prompts to clean up orphaned entries from renamed/deleted books
+5. Ensures OpenSearch indexes stay in sync with source images
+
+Run `verify_opensearch_coverage.bat` after batch indexing to ensure 100% coverage. The tool queries OpenSearch efficiently using scroll API and term aggregations.
+
 ---
 
 ## DISK Feature Cache (SQL Server)
