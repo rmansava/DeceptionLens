@@ -53,6 +53,7 @@ FOLDER_LOCATIONS = [
     r"D:\books\pdf-images",
     r"T:\archiverelated\books\pdf-images",
     r"T:\archive\books\pdf-tesseract-text",
+    r"D:\disk-features\books",
     r"T:\disk-features\books",
 ]
 

@@ -272,10 +272,10 @@ def main():
     if missing_visual_books:
         print()
         print(f"Books with missing visual embeddings: {len(missing_visual_books)}")
-        if args.missing or (not args.summary and not args.fix):
+        if not args.summary:
             print()
             for book, imgs, indexed, missing_count, _ in missing_visual_books[:50]:
-                print(f"  {book[:50]:<50} | {imgs} imgs, {indexed} indexed, {missing_count} missing")
+                print(f"  {book[:60]:<60} | {imgs} imgs, {indexed} indexed, {missing_count} missing")
             if len(missing_visual_books) > 50:
                 print(f"  ... and {len(missing_visual_books) - 50} more")
 
@@ -289,10 +289,10 @@ def main():
     if missing_faces_books:
         print()
         print(f"Books with missing face embeddings: {len(missing_faces_books)}")
-        if args.missing or (not args.summary and not args.fix):
+        if not args.summary:
             print()
             for book, imgs, indexed, missing_count, _ in missing_faces_books[:50]:
-                print(f"  {book[:50]:<50} | {imgs} imgs, {indexed} indexed, {missing_count} missing")
+                print(f"  {book[:60]:<60} | {imgs} imgs, {indexed} indexed, {missing_count} missing")
             if len(missing_faces_books) > 50:
                 print(f"  ... and {len(missing_faces_books) - 50} more")
 
