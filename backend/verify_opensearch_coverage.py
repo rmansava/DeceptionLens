@@ -284,6 +284,11 @@ def main():
         for i, (book, imgs, indexed, missing_count, missing_paths) in enumerate(missing_books):
             logger.info(f"[{i+1}/{len(missing_books)}] {book} - {missing_count} missing")
 
+            # Delete existing stale entries first (handles renamed files)
+            if indexed > 0:
+                deleted = delete_book_from_index(client, VISUAL_INDEX, book)
+                logger.info(f"  Deleted {deleted} stale entries")
+
             book_path = books_path / book
             try:
                 result = indexer.index_directory(str(book_path), book_name=book)
