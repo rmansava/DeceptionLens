@@ -79,7 +79,7 @@ def get_indexed_paths(client: OpenSearch, index: str, book_name: str) -> set:
         # Scroll through all documents for this book
         query = {
             "query": {
-                "term": {"book.keyword": book_name}
+                "term": {"book": book_name}
             },
             "_source": ["path"]
         }
@@ -131,7 +131,7 @@ def get_all_indexed_books(client: OpenSearch, index: str) -> set:
             "aggs": {
                 "unique_books": {
                     "terms": {
-                        "field": "book.keyword",
+                        "field": "book",
                         "size": 10000
                     }
                 }
@@ -155,7 +155,7 @@ def delete_book_from_index(client: OpenSearch, index: str, book_name: str) -> in
     try:
         query = {
             "query": {
-                "term": {"book.keyword": book_name}
+                "term": {"book": book_name}
             }
         }
 
@@ -280,9 +280,13 @@ def main():
 
         if missing_visual:
             missing_visual_books.append((book, len(images), len(visual_indexed), len(missing_visual), missing_visual))
+            # Log immediately when issue found
+            logger.info(f"MISSING VISUAL: {book} | {len(images)} imgs, {len(visual_indexed)} indexed, {len(missing_visual)} missing")
 
         if missing_faces:
             missing_faces_books.append((book, len(images), len(faces_indexed), len(missing_faces), missing_faces))
+            # Log immediately when issue found
+            logger.info(f"MISSING FACES: {book} | {len(images)} imgs, {len(faces_indexed)} indexed, {len(missing_faces)} missing")
 
         if not args.summary and not args.missing and not args.fix:
             visual_status = "OK" if not missing_visual else f"MISSING {len(missing_visual)}"
