@@ -20,6 +20,9 @@ temp_uploads/
 *.tmp
 *.temp
 batch_progress.txt
+batch_disk_progress_file.txt
+batch_progress_fast.txt
+tmpclaude-*
 
 # IDE
 .idea/
