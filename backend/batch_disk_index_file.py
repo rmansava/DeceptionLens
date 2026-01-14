@@ -1,4 +1,4 @@
-"""
+r"""
 Batch DISK feature indexer - FILE-BASED storage version.
 Pre-computes DISK keypoints and descriptors and saves as .npz files.
 
@@ -35,6 +35,7 @@ move_stats = {"moved": 0, "failed": 0, "pending": 0, "current": None}
 
 # ANSI color codes
 CYAN = "\033[96m"
+PINK = "\033[95m"
 RESET = "\033[0m"
 
 
@@ -192,9 +193,22 @@ def main():
             completed = set(line.strip() for line in f if line.strip())
         log(f"Resuming: {len(completed)} books already completed")
 
-    # Filter out completed
-    to_index = [b for b in books if b not in completed]
+    # Filter out completed and those already on NAS
+    to_index = []
+    skipped_nas = 0
+    for b in books:
+        if b in completed:
+            continue
+        # Check if already exists on NAS
+        nas_path = os.path.join(NAS_FEATURES_ROOT, CATEGORY, b)
+        if os.path.exists(nas_path):
+            skipped_nas += 1
+            continue
+        to_index.append(b)
+
     log(f"Remaining to index: {len(to_index)}")
+    if skipped_nas > 0:
+        log(f"Skipped {skipped_nas} books (already on NAS)", color=PINK)
 
     if not to_index:
         log("All books already indexed!")
@@ -211,7 +225,7 @@ def main():
         batch_size=20,
         path_remap=PATH_REMAP,
         show_progress=False,  # Disable tqdm to avoid interleaved output with background moves
-        device="cpu"  # Force CPU so GPU is free for other tasks (DINOv2 indexer)
+        device="cuda"  # Use GPU for faster indexing
     )
     log("DISK model loaded.")
 
