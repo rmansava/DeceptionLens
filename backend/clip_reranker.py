@@ -16,6 +16,24 @@ from typing import List, Dict, Tuple, Optional
 import os
 
 
+def normalize_path(path: str) -> str:
+    """
+    Normalize file paths to handle encoding mismatches.
+    Fixes common issues like straight apostrophe (') vs curly apostrophe (').
+    """
+    if os.path.exists(path):
+        return path
+    # Try replacing straight apostrophe with curly apostrophe
+    normalized = path.replace("'", "'")
+    if os.path.exists(normalized):
+        return normalized
+    # Try the reverse
+    normalized = path.replace("'", "'")
+    if os.path.exists(normalized):
+        return normalized
+    return path
+
+
 # ============================================================================
 # TIER 2: ORB KEYPOINT MATCHING
 # ============================================================================
@@ -120,7 +138,8 @@ def is_blank_page(img_gray: np.ndarray, threshold: int = 30) -> bool:
 def load_image_gray(path: str) -> Optional[np.ndarray]:
     """Load image as grayscale, return None if failed."""
     try:
-        img = cv2.imread(path)
+        normalized = normalize_path(path)
+        img = cv2.imread(normalized)
         if img is None:
             return None
         return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)

@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 BOOKS_ROOT = r"D:\books\pdf-images"
+NAS_BACKUP = r"T:\archiverelated\books\pdf-images"
 LOG_FILE = "batch_disk_index.log"
 PROGRESS_FILE = "batch_disk_progress.txt"
 
@@ -19,11 +20,23 @@ PROGRESS_FILE = "batch_disk_progress.txt"
 PATH_REMAP = (r"D:\books", r"T:\archiverelated\books")
 
 
-def log(msg):
+class Colors:
+    PINK = '\033[95m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RESET = '\033[0m'
+
+
+def log(msg, color=None):
     """Print to console and append to log file."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line, flush=True)
+    # Colored console output
+    if color:
+        print(f"{color}{line}{Colors.RESET}", flush=True)
+    else:
+        print(line, flush=True)
+    # Plain text to file
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(line + '\n')
 
@@ -70,9 +83,22 @@ def main():
             completed = set(line.strip() for line in f if line.strip())
         log(f"Resuming: {len(completed)} books already completed")
 
-    # Filter out completed
-    to_index = [b for b in books if b not in completed]
+    # Filter out completed and those already on NAS
+    to_index = []
+    skipped_nas = 0
+    for b in books:
+        if b in completed:
+            continue
+        # Check if already exists on NAS backup
+        nas_path = os.path.join(NAS_BACKUP, b)
+        if os.path.exists(nas_path):
+            skipped_nas += 1
+            continue
+        to_index.append(b)
+
     log(f"Remaining to index: {len(to_index)}")
+    if skipped_nas > 0:
+        log(f"Skipped {skipped_nas} books (already on NAS)", Colors.PINK)
 
     if not to_index:
         log("All books already indexed!")

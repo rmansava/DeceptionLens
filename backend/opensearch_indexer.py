@@ -108,12 +108,14 @@ class OpenSearchIndexer:
     def index_directory(self, dir_path: str, book_name: str = None, batch_size: int = 100):
         """Index all images in a directory (both visual and face embeddings)."""
         # Find all image files
+        # Note: Use glob.escape() to handle special chars like [ ] in folder names
         image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.webp', '*.gif', '*.bmp']
         files_set = set()
+        escaped_path = glob.escape(dir_path)
         for ext in image_extensions:
-            for f in glob.glob(os.path.join(dir_path, '**', ext), recursive=True):
+            for f in glob.glob(os.path.join(escaped_path, '**', ext), recursive=True):
                 files_set.add(os.path.normpath(f))
-            for f in glob.glob(os.path.join(dir_path, '**', ext.upper()), recursive=True):
+            for f in glob.glob(os.path.join(escaped_path, '**', ext.upper()), recursive=True):
                 files_set.add(os.path.normpath(f))
 
         files = sorted(list(files_set))

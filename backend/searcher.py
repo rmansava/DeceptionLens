@@ -4,7 +4,7 @@ Performs similarity search using DINOv2 embeddings, InsightFace, and optional ge
 """
 import torch
 from PIL import Image
-import chromadb
+from opensearchpy import OpenSearch
 from transformers import AutoImageProcessor, AutoModel
 import numpy as np
 import cv2
@@ -54,14 +54,42 @@ except ImportError:
     print("InsightFace not installed. Face search will be disabled.")
 
 
+def normalize_path(path: str) -> str:
+    """
+    Normalize file paths to handle encoding mismatches.
+
+    Fixes common issues like:
+    - Straight apostrophe (') vs curly apostrophe (')
+    - Other Unicode normalization issues
+
+    If the original path doesn't exist, tries the normalized version.
+    """
+    if os.path.exists(path):
+        return path
+
+    # Try replacing straight apostrophe with curly apostrophe
+    # ' (U+0027) -> ' (U+2019)
+    normalized = path.replace("'", "'")
+    if os.path.exists(normalized):
+        return normalized
+
+    # Try the reverse: curly to straight
+    normalized = path.replace("'", "'")
+    if os.path.exists(normalized):
+        return normalized
+
+    # Return original if neither works
+    return path
+
+
 class DinoSearcher:
     """
-    Searches indexed images using DINOv2 visual similarity.
-    Optionally performs geometric verification using LightGlue.
+    Provides geometric verification using DISK + LightGlue.
+    ChromaDB removed - use OpenSearchSearcher for actual search.
     """
 
-    def __init__(self, db_path: str = "./chroma_db"):
-        self.client = chromadb.PersistentClient(path=db_path)
+    def __init__(self, db_path: str = None):
+        # db_path kept for backwards compatibility but ignored
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Searcher using device: {self.device}")
 
@@ -142,104 +170,8 @@ class DinoSearcher:
             print(f"Error getting embedding from bytes: {e}")
             return None
 
-    def search(
-        self,
-        query_path: str,
-        top_k: int = 50,
-        verify: bool = False,
-        collection_name: str = "images"
-    ) -> list:
-        """
-        Search for similar images.
-
-        Args:
-            query_path: Path to query image
-            top_k: Number of results to return
-            verify: Whether to perform geometric verification
-            collection_name: Base name of the collection
-
-        Returns:
-            List of match dictionaries with path, score, verified_matches, metadata
-        """
-        query_emb = self.get_embedding(query_path)
-        if query_emb is None:
-            return []
-
-        return self._search_with_embedding(query_emb, top_k, verify, collection_name, query_path)
-
-    def search_by_bytes(
-        self,
-        image_bytes: bytes,
-        top_k: int = 50,
-        verify: bool = False,
-        collection_name: str = "images"
-    ) -> list:
-        """Search for similar images using image bytes."""
-        query_emb = self.get_embedding_from_bytes(image_bytes)
-        if query_emb is None:
-            return []
-
-        return self._search_with_embedding(query_emb, top_k, verify, collection_name)
-
-    def _search_with_embedding(
-        self,
-        query_emb: np.ndarray,
-        top_k: int,
-        verify: bool,
-        collection_name: str,
-        query_path: str = None
-    ) -> list:
-        """Internal search using pre-computed embedding."""
-        try:
-            collection = self.client.get_collection(name=f"{collection_name}_visual")
-        except Exception as e:
-            print(f"Collection {collection_name}_visual not found: {e}")
-            return []
-
-        # When verifying, check ALL candidates - accuracy over speed
-        # The correct match could be ranked last by embedding but first by keypoints
-        if verify:
-            collection_size = collection.count()
-            fetch_k = collection_size  # Check everything
-        else:
-            fetch_k = top_k
-
-        results = collection.query(
-            query_embeddings=[query_emb.tolist()],
-            n_results=fetch_k,
-            include=["metadatas", "distances"]
-        )
-
-        matches = []
-        if not results['ids'] or not results['ids'][0]:
-            return matches
-
-        ids = results['ids'][0]
-        distances = results['distances'][0]
-        metadatas = results['metadatas'][0]
-
-        for id, dist, meta in zip(ids, distances, metadatas):
-            # Convert cosine distance to similarity score
-            # ChromaDB returns squared L2 distance by default, but we set cosine
-            # For cosine: distance = 1 - similarity, so similarity = 1 - distance
-            score = max(0, 1 - dist)
-
-            match_data = {
-                "path": meta.get("path", id),
-                "score": score,
-                "metadata": meta,
-                "verified_matches": 0
-            }
-            matches.append(match_data)
-
-        # Geometric verification (optional)
-        if verify and self.matcher and query_path and os.path.exists(query_path):
-            matches = self._verify_matches(query_path, matches)
-            # Re-sort by verified matches then score
-            matches.sort(key=lambda x: (x['verified_matches'], x['score']), reverse=True)
-
-        # Return only top_k results
-        return matches[:top_k]
+    # NOTE: search() and search_by_bytes() removed - use OpenSearchSearcher instead
+    # This class is now only used for geometric verification via _verify_matches()
 
     def _load_face_app(self):
         """Lazy-load InsightFace to avoid memory conflicts with other models."""
@@ -272,7 +204,11 @@ class DinoSearcher:
             return []
 
         try:
-            img = cv2.imread(image_path)
+            normalized = normalize_path(image_path)
+            # Use imdecode to handle non-ASCII paths on Windows
+            with open(normalized, 'rb') as f:
+                data = f.read()
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 return []
 
@@ -301,93 +237,21 @@ class DinoSearcher:
             print(f"Error extracting faces from bytes: {e}")
             return []
 
-    def search_faces(
-        self,
-        query_path: str,
-        top_k: int = 50,
-        collection_name: str = "images"
-    ) -> list:
-        """
-        Search for similar faces using InsightFace embeddings.
-
-        Args:
-            query_path: Path to query image containing face(s)
-            top_k: Number of results to return
-            collection_name: Base name of the collection
-
-        Returns:
-            List of match dictionaries with path, score, metadata
-        """
-        embeddings = self.get_face_embedding(query_path)
-        if not embeddings:
-            print("No faces detected in query image")
-            return []
-
-        # Use first detected face for search
-        query_emb = embeddings[0]
-        return self._search_faces_with_embedding(query_emb, top_k, collection_name)
-
-    def search_faces_by_bytes(
-        self,
-        image_bytes: bytes,
-        top_k: int = 50,
-        collection_name: str = "images"
-    ) -> list:
-        """Search for similar faces using image bytes."""
-        embeddings = self.get_face_embedding_from_bytes(image_bytes)
-        if not embeddings:
-            print("No faces detected in query image")
-            return []
-
-        # Use first detected face for search
-        query_emb = embeddings[0]
-        return self._search_faces_with_embedding(query_emb, top_k, collection_name)
-
-    def _search_faces_with_embedding(
-        self,
-        query_emb: np.ndarray,
-        top_k: int,
-        collection_name: str
-    ) -> list:
-        """Internal face search using pre-computed embedding."""
-        try:
-            collection = self.client.get_collection(name=f"{collection_name}_faces")
-        except Exception as e:
-            print(f"Collection {collection_name}_faces not found: {e}")
-            return []
-
-        results = collection.query(
-            query_embeddings=[query_emb.tolist()],
-            n_results=top_k,
-            include=["metadatas", "distances"]
-        )
-
-        matches = []
-        if not results['ids'] or not results['ids'][0]:
-            return matches
-
-        ids = results['ids'][0]
-        distances = results['distances'][0]
-        metadatas = results['metadatas'][0]
-
-        for id, dist, meta in zip(ids, distances, metadatas):
-            # Convert cosine distance to similarity score
-            score = max(0, 1 - dist)
-
-            match_data = {
-                "path": meta.get("path", id),
-                "score": score,
-                "metadata": meta,
-                "verified_matches": 0,
-                "face_id": id
-            }
-            matches.append(match_data)
-
-        return matches
+    # NOTE: search_faces() and search_faces_by_bytes() removed - use OpenSearchSearcher instead
 
     def _load_torch_image(self, path: str):
         """Load and prepare image for DISK/LightGlue."""
-        img = cv2.imread(path)
+        normalized = normalize_path(path)
+
+        # Use imdecode instead of imread to handle non-ASCII paths on Windows
+        # cv2.imread fails with special characters like apostrophes
+        try:
+            with open(normalized, 'rb') as f:
+                data = f.read()
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        except Exception:
+            img = None
+
         if img is None:
             return None
 
@@ -437,7 +301,7 @@ class DinoSearcher:
         cached_features = {}
         cache_hits = 0
         cache_misses = 0
-        match_paths = [m['path'] for m in matches if os.path.exists(m.get('path', ''))]
+        match_paths = [normalize_path(m['path']) for m in matches if os.path.exists(normalize_path(m.get('path', '')))]
 
         if self.disk_file_cache:
             # Try file-based cache first (NAS)
@@ -466,7 +330,7 @@ class DinoSearcher:
                 print(f"  Verified {i}/{total} ({rate:.1f}/s, ETA: {eta:.0f}s)...")
 
             try:
-                match_path = match['path']
+                match_path = normalize_path(match['path'])
                 if not os.path.exists(match_path):
                     match['verified_matches'] = 0
                     continue
@@ -618,8 +482,14 @@ class DinoSearcher:
         """
         match_count, bbox = self.get_match_visualization(query_bytes, match_path)
 
-        # Load the match image
-        img = cv2.imread(match_path)
+        # Load the match image (use imdecode for non-ASCII paths on Windows)
+        normalized = normalize_path(match_path)
+        try:
+            with open(normalized, 'rb') as f:
+                data = f.read()
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        except Exception:
+            img = None
         if img is None:
             return None
 
@@ -658,23 +528,4 @@ class DinoSearcher:
         _, buffer = cv2.imencode('.png', img)
         return buffer.tobytes()
 
-    def get_collection_stats(self, collection_name: str = "images") -> dict:
-        """Get statistics for a collection."""
-        stats = {
-            "visual_count": 0,
-            "face_count": 0
-        }
-
-        try:
-            visual_col = self.client.get_collection(f"{collection_name}_visual")
-            stats["visual_count"] = visual_col.count()
-        except:
-            pass
-
-        try:
-            face_col = self.client.get_collection(f"{collection_name}_faces")
-            stats["face_count"] = face_col.count()
-        except:
-            pass
-
-        return stats
+    # NOTE: get_collection_stats() removed - use OpenSearchSearcher.get_counts() instead

@@ -36,7 +36,7 @@ class OpenSearchSearcher:
         self.client = OpenSearch(
             hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
             http_compress=True,
-            timeout=30
+            timeout=86400  # 24 hours
         )
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"

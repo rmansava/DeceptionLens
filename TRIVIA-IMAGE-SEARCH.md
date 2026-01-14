@@ -47,7 +47,7 @@ Result: Poor match (global embeddings don't align)
 - **Strength**: Understanding "what" is in the image semantically
 - **Weakness**: May match conceptually similar but wrong images
 
-```
+``` 
 Query: [crop of dinosaur]
 CLIP sees: "dinosaur character, cartoon style"
 Page has: "encyclopedia page about dinosaur"
@@ -139,13 +139,28 @@ Upload image ───────┤                    ├─→ Merge unique 
 
 ## Performance Comparison
 
-### Test Case: Cropped Dinosaur → Encyclopedia of Monsters page 210
+### Test Case 1: Cropped Dinosaur → Encyclopedia of Monsters page 210
 
 | Method | Target Rank | Notes |
 |--------|-------------|-------|
 | Raw DINOv2 | Not in top 10,000 | Visual embedding fails for small crop |
 | Raw CLIP | Not in top 100 | Semantic match buried by noise |
 | CLIP + Rerank | **#19** | Template matching finds exact crop |
+
+### Test Case 2: King Koko Dog → Ad boy Vintage advertising page 98
+
+Query: Grayscale crop of "King Koko" dog mascot (Puppy Palace hot dogs)
+Source: `D:\books\pdf-images\Ad boy Vintage advertising with character - Warren Dotz\...-page98.jpg`
+
+| Method | Target Rank | Score | Verified Matches |
+|--------|-------------|-------|------------------|
+| Raw DINOv2 | **#70** | 0.7631 | N/A |
+| DINOv2 + LightGlue | **#1** | 0.7631 | **1920** |
+
+**Key Finding**: Geometric verification (DISK + LightGlue) dramatically improves ranking:
+- Page 140 had higher DINOv2 score (0.7753) but only 8 keypoint matches
+- Page 98 had lower DINOv2 score but 1920 keypoint matches → correct source
+- Sorting by `verified_matches` moves correct result from #70 to #1
 
 ### When to Use What
 
@@ -299,6 +314,30 @@ template_scales = [0.25, 0.3, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 - FAISS index on CPU with GPU for encoding only
 - OpenSearch handles DINOv2 index server-side
 - Re-ranking done on CPU with parallel workers
+
+---
+
+### Problem 9: cv2.imread Fails on Windows with Non-ASCII Paths
+**Symptom**: Geometric verification shows 0 verified matches for ALL results, even when files exist.
+
+**Example**:
+```
+Path: D:\books\pdf-images\...\Anna's Archive\...-page100.jpg
+os.path.exists(): True
+cv2.imread(): None (FAILED)
+cv2.imdecode(): Success
+```
+
+**Why**: OpenCV's `cv2.imread()` on Windows cannot handle paths with special characters like curly apostrophes (`'`), certain Unicode characters, or non-ASCII filenames. This is a known OpenCV bug.
+
+**Solution**: Replace all `cv2.imread(path)` calls with:
+```python
+with open(path, 'rb') as f:
+    data = f.read()
+img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+```
+
+**Fixed in**: `searcher.py` - `_load_torch_image()`, `get_face_embedding()`, `generate_visualization_image()`
 
 ---
 

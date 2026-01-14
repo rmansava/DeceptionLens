@@ -257,7 +257,7 @@
                 @foreach (var (result, index) in results.Select((r, i) => (r, i)))
                 {
                     <div class="result-card">
-                        <div class="result-image-container">
+                        <div class="result-image-container" @ondblclick="() => OpenImage(result.Path)">
                             <img src="@SearchService.GetImageUrl(result.Path)"
                                  alt="Result @(index + 1)"
                                  loading="lazy"
@@ -275,9 +275,6 @@
                                 }
                                 <span class="score-badge">Score: @result.Score.ToString("F4")</span>
                             </div>
-                            <button class="open-btn" @onclick="() => OpenImage(result.Path)">
-                                Open Image
-                            </button>
                         </div>
                     </div>
                 }
@@ -337,6 +334,18 @@
                 </div>
             }
         </aside>
+    }
+
+    <!-- Fullscreen Image Popup -->
+    @if (showImagePopup && !string.IsNullOrEmpty(popupImageUrl))
+    {
+        <div class="image-popup-overlay" @onclick="CloseImagePopup">
+            <div class="image-popup-container">
+                <button class="popup-close-btn" @onclick="CloseImagePopup">&times;</button>
+                <img src="@popupImageUrl" alt="Full size image" class="popup-image"
+                     @onclick:stopPropagation @ondblclick="CloseImagePopup" />
+            </div>
+        </div>
     }
 </div>
 
@@ -671,6 +680,75 @@
         color: #d1d5db;
     }
 
+    /* Fullscreen Image Popup */
+    .image-popup-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.95);
+        z-index: 200;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        animation: fadeIn 0.2s ease-out;
+    }
+
+    @@keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
+    }
+
+    .image-popup-container {
+        position: relative;
+        max-width: 95vw;
+        max-height: 95vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .popup-image {
+        max-width: 95vw;
+        max-height: 95vh;
+        object-fit: contain;
+        cursor: zoom-out;
+        border-radius: 4px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    }
+
+    .popup-close-btn {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        width: 48px;
+        height: 48px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 2px solid rgba(255, 255, 255, 0.3);
+        border-radius: 50%;
+        color: white;
+        font-size: 28px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.2s;
+        z-index: 201;
+    }
+
+    .popup-close-btn:hover {
+        background: rgba(255, 255, 255, 0.2);
+        border-color: rgba(255, 255, 255, 0.5);
+        transform: scale(1.1);
+    }
+
+    /* Make result images show they're double-clickable */
+    .result-image-container {
+        cursor: zoom-in;
+    }
+
 </style>
 
 @code {
@@ -709,6 +787,10 @@
     private bool showHistoryPanel = false;
     private bool isLoadingHistory = false;
     private List<SearchHistoryEntry>? historyEntries;
+
+    // Image popup state
+    private bool showImagePopup = false;
+    private string? popupImageUrl;
 
     protected override async Task OnInitializedAsync()
     {
@@ -971,7 +1053,14 @@
 
     private void OpenImage(string path)
     {
-        var url = SearchService.GetImageUrl(path);
+        popupImageUrl = SearchService.GetImageUrl(path);
+        showImagePopup = true;
+    }
+
+    private void CloseImagePopup()
+    {
+        showImagePopup = false;
+        popupImageUrl = null;
     }
 
     private void HandleImageError()

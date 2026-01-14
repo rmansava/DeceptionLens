@@ -28,6 +28,7 @@ python-multipart>=0.0.6
 
 # Utilities
 tqdm
+watchdog>=3.0.0
 
 # Database (SQL Server)
 pyodbc>=4.0.0
