@@ -1,4 +1,4 @@
-"""
+r"""
 Verify DISK feature coverage - ensure NAS has .npz for every image in D:\books.
 
 Checks NAS (T:\disk-features\books) to ensure it's in sync with D:\books\pdf-images.
@@ -205,11 +205,33 @@ def main():
 
             # Track which books need moving
             books_to_move = set()
+            books_with_local_features = set()
 
+            # First pass: check which books already have features in local
+            print("Checking for existing features in local storage...")
+            for book, imgs, feats, missing_count, loc, missing_stems in missing_books:
+                local_book_path = Path(LOCAL_FEATURES_ROOT) / book
+                if local_book_path.exists():
+                    local_features = count_features(local_book_path)
+                    # Check if local has the missing features
+                    if missing_stems & local_features:  # Intersection - some overlap
+                        books_with_local_features.add(book)
+                        books_to_move.add(book)
+
+            if books_with_local_features:
+                print(f"Found {len(books_with_local_features)} books with features in local - will move to NAS")
+            print()
+
+            # Second pass: index only what's truly missing
             for i, (book, imgs, feats, missing_count, loc, missing_stems) in enumerate(missing_books):
                 book_path = books_path / book
-                missing_paths = get_missing_image_paths(book_path, missing_stems)
 
+                # If book has local features, skip indexing
+                if book in books_with_local_features:
+                    print(f"[{i+1}/{len(missing_books)}] {book[:50]} - skipping (already in local)")
+                    continue
+
+                missing_paths = get_missing_image_paths(book_path, missing_stems)
                 print(f"[{i+1}/{len(missing_books)}] {book[:50]} - {len(missing_paths)} missing")
 
                 book_indexed = 0

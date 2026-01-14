@@ -697,10 +697,15 @@ python verify_disk_coverage.py --fix
 **What it does:**
 1. Scans all images in `D:\books\pdf-images`
 2. Checks if corresponding `.npz` exists on NAS (`T:\disk-features\books`)
-3. With `--fix`: Indexes missing images → moves to NAS → cleans up orphaned features
+3. With `--fix`:
+   - Checks local storage (`D:\disk-features\books`) for existing features
+   - Reuses local features instead of re-indexing (fast!)
+   - Indexes only truly missing features
+   - Moves all to NAS and merges if needed
+   - Prompts to clean up orphaned features
 4. Ensures NAS is the source of truth and stays in sync
 
-Run `verify_disk_coverage.bat` after batch indexing to ensure 100% coverage.
+Run `verify_disk_coverage.bat` after batch indexing to ensure 100% coverage. The tool is smart about reusing work - if features exist locally but aren't on NAS yet, it moves them instead of re-computing.
 
 ---
 
