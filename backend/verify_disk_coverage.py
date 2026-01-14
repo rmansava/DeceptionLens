@@ -87,6 +87,44 @@ def cleanup_orphaned_features(extra_features_books: list, books_path: Path) -> d
     return {"deleted": deleted, "failed": failed}
 
 
+def cleanup_orphaned_books(books_path: Path) -> dict:
+    """Delete book folders from local and NAS that don't exist in D:\books anymore."""
+    deleted_local = 0
+    deleted_nas = 0
+    failed = 0
+
+    # Get actual books in D:\books\pdf-images
+    actual_books = set(d.name for d in books_path.iterdir() if d.is_dir())
+
+    # Check local storage
+    local_root = Path(LOCAL_FEATURES_ROOT)
+    if local_root.exists():
+        for book_dir in local_root.iterdir():
+            if book_dir.is_dir() and book_dir.name not in actual_books:
+                try:
+                    shutil.rmtree(book_dir)
+                    deleted_local += 1
+                    print(f"  Deleted from local: {book_dir.name[:50]}")
+                except Exception as e:
+                    print(f"  Failed to delete from local {book_dir.name[:40]}: {e}")
+                    failed += 1
+
+    # Check NAS
+    nas_root = Path(NAS_FEATURES_ROOT)
+    if nas_root.exists():
+        for book_dir in nas_root.iterdir():
+            if book_dir.is_dir() and book_dir.name not in actual_books:
+                try:
+                    shutil.rmtree(book_dir)
+                    deleted_nas += 1
+                    print(f"  Deleted from NAS: {book_dir.name[:50]}")
+                except Exception as e:
+                    print(f"  Failed to delete from NAS {book_dir.name[:40]}: {e}")
+                    failed += 1
+
+    return {"deleted_local": deleted_local, "deleted_nas": deleted_nas, "failed": failed}
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Verify DISK feature coverage")
@@ -321,6 +359,23 @@ def main():
             print(f"Deleted: {result['deleted']}")
             if result['failed'] > 0:
                 print(f"Failed:  {result['failed']}")
+
+    # Check for orphaned book folders (renamed/deleted books)
+    print()
+    response = input("Check for orphaned book folders (renamed/deleted books)? (y/n): ").strip().lower()
+    if response == 'y':
+        print()
+        print("Scanning for orphaned book folders...")
+        result = cleanup_orphaned_books(books_path)
+
+        if result['deleted_local'] > 0 or result['deleted_nas'] > 0:
+            print()
+            print(f"Deleted {result['deleted_local']} folders from local storage")
+            print(f"Deleted {result['deleted_nas']} folders from NAS")
+            if result['failed'] > 0:
+                print(f"Failed: {result['failed']}")
+        else:
+            print("No orphaned book folders found.")
 
 
 if __name__ == "__main__":
