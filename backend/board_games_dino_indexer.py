@@ -1,19 +1,16 @@
 """
-Print Ads DINOv2 Indexer for DinoDeceptionLens
-Creates DINOv2 embeddings in OpenSearch for print advertisements.
+Board Games DINOv2 Indexer for DeceptionLens
+Creates DINOv2 embeddings in OpenSearch for board game images.
 Uses SQL Server to track image hashes and skip duplicates.
 
-This is a SEPARATE process from the CLIP indexer.
-Can be run independently - tracks its own hashes with suffix '_dino'.
-
 Usage:
-    python print_ads_dino_indexer.py --source "D:/PrintAds"
+    python board_games_dino_indexer.py --source "T:/archiverelated/board games"
 
     # Visual only (skip faces)
-    python print_ads_dino_indexer.py --source "D:/PrintAds" --visual-only
+    python board_games_dino_indexer.py --source "T:/archiverelated/board games" --visual-only
 
     # Faces only (skip visual)
-    python print_ads_dino_indexer.py --source "D:/PrintAds" --faces-only
+    python board_games_dino_indexer.py --source "T:/archiverelated/board games" --faces-only
 """
 import os
 import sys
@@ -34,8 +31,8 @@ CONNECTION_STRING = (
 # OpenSearch settings
 OPENSEARCH_HOST = "localhost"
 OPENSEARCH_PORT = 9200
-VISUAL_INDEX = "dinov2-print_ads"
-FACES_INDEX = "faces-print_ads"
+VISUAL_INDEX = "dinov2-board_games"
+FACES_INDEX = "faces-board_games"
 
 
 def get_file_hash(file_path: str) -> str:
@@ -154,7 +151,7 @@ def create_opensearch_indices(client):
 
 def index_dino_opensearch(
     source_path: str,
-    collection: str = "print_ads",
+    collection: str = "board_games",
     enable_visual: bool = True,
     enable_faces: bool = False,
     batch_size: int = 100,
@@ -162,14 +159,6 @@ def index_dino_opensearch(
 ):
     """
     Index images using DINOv2 into OpenSearch with duplicate detection.
-
-    Args:
-        source_path: Directory containing images
-        collection: Collection name for hash DB lookup
-        enable_visual: Index DINOv2 visual embeddings
-        enable_faces: Index face embeddings (slower)
-        batch_size: Batch size for OpenSearch bulk inserts
-        no_dedup: Skip SQL Server deduplication (index all images)
     """
     import torch
     import numpy as np
@@ -220,7 +209,6 @@ def index_dino_opensearch(
         try:
             from insightface.app import FaceAnalysis
             print("Loading InsightFace (buffalo_l / ArcFace)...")
-            # Use DirectML for AMD GPU, fallback to CPU
             providers = ['DmlExecutionProvider', 'CPUExecutionProvider']
             face_app = FaceAnalysis(name='buffalo_l', providers=providers)
             face_app.prepare(ctx_id=0, det_size=(640, 640))
@@ -239,8 +227,7 @@ def index_dino_opensearch(
         print("No images found!")
         return
 
-    # Filter out duplicates (already indexed in this collection for DINOv2)
-    # Use collection name with suffix to track DINOv2 separately from CLIP
+    # Filter out duplicates
     dino_collection = f"{collection}_dino"
 
     new_images = []
@@ -248,11 +235,10 @@ def index_dino_opensearch(
     skipped_errors = 0
 
     if no_dedup:
-        # No deduplication - index all images
         print("\nPreparing all images (no dedup)...")
         for path in all_image_paths:
             file_size = os.path.getsize(path)
-            new_images.append((path, None, file_size))  # No hash needed
+            new_images.append((path, None, file_size))
         print(f"  Images to index: {len(new_images):,}")
     else:
         print("\nChecking for duplicates...")
@@ -346,7 +332,7 @@ def index_dino_opensearch(
             except Exception:
                 pass
 
-        # Track hash for successfully indexed images (skip if no_dedup)
+        # Track hash for successfully indexed images
         if indexed_this_image and not no_dedup and file_hash:
             hashes_to_add.append((file_hash, file_path, dino_collection, file_size))
 
@@ -366,7 +352,7 @@ def index_dino_opensearch(
                 print(f"Face bulk insert error: {e}")
             face_actions = []
 
-        # Commit hashes to DB periodically (skip if no_dedup)
+        # Commit hashes to DB periodically
         if not no_dedup and len(hashes_to_add) >= batch_size:
             for h in hashes_to_add:
                 try:
@@ -391,7 +377,7 @@ def index_dino_opensearch(
         except Exception as e:
             print(f"Final face bulk insert error: {e}")
 
-    # Commit remaining hashes (skip if no_dedup)
+    # Commit remaining hashes
     if not no_dedup and hashes_to_add:
         for h in hashes_to_add:
             try:
@@ -414,7 +400,7 @@ def index_dino_opensearch(
     face_total = os_client.count(index=FACES_INDEX)["count"] if enable_faces else 0
 
     print(f"\n{'='*60}")
-    print(f"DINO INDEXING COMPLETE")
+    print(f"BOARD GAMES DINO INDEXING COMPLETE")
     print(f"{'='*60}")
     print(f"Visual embeddings added: {visual_count:,}")
     print(f"Face embeddings added: {face_count:,}")
@@ -425,32 +411,30 @@ def index_dino_opensearch(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Print Ads DINOv2 Indexer (OpenSearch)",
+        description="Board Games DINOv2 Indexer (OpenSearch)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     # Index visual only (recommended first)
-    python print_ads_dino_indexer.py --source "D:/PrintAds" --visual-only
+    python board_games_dino_indexer.py --source "T:/archiverelated/board games" --visual-only
 
     # Index faces only (run separately due to GPU memory)
-    python print_ads_dino_indexer.py --source "D:/PrintAds" --faces-only
+    python board_games_dino_indexer.py --source "T:/archiverelated/board games" --faces-only
 
-    # Index both (requires lots of GPU memory)
-    python print_ads_dino_indexer.py --source "D:/PrintAds"
+    # Index both
+    python board_games_dino_indexer.py --source "T:/archiverelated/board games"
 
-    # Skip SQL Server deduplication (no DB required)
-    python print_ads_dino_indexer.py --source "D:/PrintAds" --no-dedup
-
-Hashes are tracked separately from CLIP (uses collection_dino suffix).
+    # Skip SQL Server deduplication
+    python board_games_dino_indexer.py --source "T:/archiverelated/board games" --no-dedup
         """
     )
 
     parser.add_argument("--source", required=True, help="Source directory with images")
-    parser.add_argument("--collection", default="print_ads", help="Collection name (default: print_ads)")
+    parser.add_argument("--collection", default="board_games", help="Collection name (default: board_games)")
     parser.add_argument("--visual-only", action="store_true", help="Only index DINOv2 visual")
     parser.add_argument("--faces-only", action="store_true", help="Only index faces")
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size (default: 100)")
-    parser.add_argument("--no-dedup", action="store_true", help="Skip SQL Server deduplication (index all images)")
+    parser.add_argument("--no-dedup", action="store_true", help="Skip SQL Server deduplication")
 
     args = parser.parse_args()
 
