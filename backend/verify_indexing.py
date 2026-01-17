@@ -3,13 +3,16 @@
 Verify all images on NAS are indexed in OpenSearch.
 Scans source directory and reports any missing images.
 Can identify and delete duplicate images (same content, different path).
+Can index missing images after verification.
 """
 
 import os
+import gc
 import hashlib
 import argparse
 import pyodbc
-from opensearchpy import OpenSearch
+import numpy as np
+from opensearchpy import OpenSearch, helpers
 
 VISUAL_INDEX = "dinov2-board_games"
 FACES_INDEX = "faces-board_games"
@@ -97,8 +100,10 @@ def main():
     parser.add_argument("--show-missing", action="store_true", help="Show list of missing files")
     parser.add_argument("--find-duplicates", action="store_true", help="Check if missing files are content duplicates")
     parser.add_argument("--delete-duplicates", action="store_true", help="DELETE duplicate files (requires --find-duplicates)")
+    parser.add_argument("--index-missing", action="store_true", help="Index truly missing files after verification")
     parser.add_argument("--limit", type=int, default=100, help="Limit files shown (default 100)")
     parser.add_argument("--collection", default="board_games_dino", help="Collection name for SQL lookup")
+    parser.add_argument("--batch-size", type=int, default=50, help="Batch size for indexing (default 50)")
     args = parser.parse_args()
 
     if args.delete_duplicates and not args.find_duplicates:
@@ -256,6 +261,154 @@ def main():
                 print(f"Space freed: {total_dup_size / (1024**3):.2f} GB")
             else:
                 print("Deletion cancelled.")
+
+    # Index missing files if requested
+    files_to_index = []
+    if args.index_missing:
+        if args.find_duplicates and 'truly_missing' in dir():
+            files_to_index = truly_missing
+        elif len(missing_visual) > 0:
+            files_to_index = list(missing_visual)
+
+        if files_to_index:
+            print(f"\n{'='*60}")
+            print("INDEXING MISSING FILES")
+            print(f"{'='*60}")
+            print(f"Files to index: {len(files_to_index):,}")
+
+            # Lazy load heavy dependencies
+            import torch
+            import cv2
+            from PIL import Image
+            from transformers import AutoImageProcessor, AutoModel
+            from insightface.app import FaceAnalysis
+            from tqdm import tqdm
+
+            # Initialize models
+            print("\nLoading DINOv2 model...")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+            model = AutoModel.from_pretrained("facebook/dinov2-base").to(device)
+            model.eval()
+
+            print("Loading ArcFace model...")
+            face_app = FaceAnalysis(name="buffalo_l", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+            face_app.prepare(ctx_id=0 if torch.cuda.is_available() else -1, det_size=(640, 640))
+
+            # Connect to SQL for hash storage
+            if not conn:
+                conn = pyodbc.connect(SQL_CONNECTION)
+                cursor = conn.cursor()
+
+            visual_actions = []
+            face_actions = []
+            visual_count = 0
+            face_count = 0
+            errors = 0
+
+            for file_path in tqdm(files_to_index, desc="Indexing"):
+                folder_name = os.path.basename(os.path.dirname(file_path))
+
+                # Visual embedding
+                try:
+                    image = Image.open(file_path).convert("RGB")
+                    inputs = processor(images=image, return_tensors="pt").to(device)
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                    embedding = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
+
+                    visual_actions.append({
+                        "_op_type": "index",
+                        "_index": VISUAL_INDEX,
+                        "_id": file_path,
+                        "_source": {
+                            "embedding": embedding.tolist(),
+                            "path": file_path,
+                            "filename": os.path.basename(file_path),
+                            "folder": folder_name
+                        }
+                    })
+                    visual_count += 1
+
+                    # Save hash to SQL
+                    try:
+                        file_hash = get_file_hash(file_path)
+                        file_size = os.path.getsize(file_path)
+                        cursor.execute(
+                            """INSERT INTO ImageHashes (FileHash, FilePath, Collection, FileSize)
+                               VALUES (?, ?, ?, ?)""",
+                            (file_hash, file_path, args.collection, file_size)
+                        )
+                    except Exception:
+                        pass  # Hash may already exist
+
+                except Exception as e:
+                    errors += 1
+                    continue
+
+                # Face embeddings
+                try:
+                    img = cv2.imdecode(np.fromfile(file_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        faces = face_app.get(img)
+                        for i, face in enumerate(faces):
+                            face_actions.append({
+                                "_op_type": "index",
+                                "_index": FACES_INDEX,
+                                "_id": f"{file_path}_face_{i}",
+                                "_source": {
+                                    "embedding": face.embedding.tolist(),
+                                    "path": file_path,
+                                    "source_image": file_path,
+                                    "face_index": i,
+                                    "folder": folder_name
+                                }
+                            })
+                            face_count += 1
+                except Exception:
+                    pass
+
+                # Bulk insert
+                if len(visual_actions) >= args.batch_size:
+                    try:
+                        helpers.bulk(os_client, visual_actions, refresh=False)
+                    except Exception as e:
+                        print(f"Bulk insert error: {e}")
+                    visual_actions = []
+
+                if len(face_actions) >= args.batch_size:
+                    try:
+                        helpers.bulk(os_client, face_actions, refresh=False)
+                    except Exception as e:
+                        print(f"Face bulk insert error: {e}")
+                    face_actions = []
+
+                gc.collect()
+
+            # Insert remaining
+            if visual_actions:
+                try:
+                    helpers.bulk(os_client, visual_actions, refresh=False)
+                except Exception as e:
+                    print(f"Final bulk insert error: {e}")
+
+            if face_actions:
+                try:
+                    helpers.bulk(os_client, face_actions, refresh=False)
+                except Exception as e:
+                    print(f"Final face bulk insert error: {e}")
+
+            # Commit SQL and refresh indices
+            conn.commit()
+            os_client.indices.refresh(index=VISUAL_INDEX)
+            os_client.indices.refresh(index=FACES_INDEX)
+
+            print(f"\n{'='*60}")
+            print("INDEXING COMPLETE")
+            print(f"{'='*60}")
+            print(f"Visual embeddings added: {visual_count:,}")
+            print(f"Face embeddings added:   {face_count:,}")
+            print(f"Errors:                  {errors:,}")
 
     # Cleanup
     if conn:
