@@ -222,7 +222,9 @@ def main():
     for idx, book in enumerate(all_books):
         needs_fix = len(missing_books)
         fix_str = f" | {needs_fix} need fixing" if needs_fix > 0 else ""
-        print(f"\r  Scanning [{idx+1}/{len(all_books)}] {book[:45]:<45}{fix_str:<20}", end="", flush=True)
+        # Handle Unicode characters that can't be encoded in Windows console
+        safe_book = book[:45].encode('ascii', 'replace').decode('ascii')
+        print(f"\r  Scanning [{idx+1}/{len(all_books)}] {safe_book:<45}{fix_str:<20}", end="", flush=True)
 
         book_path = books_path / book
         images = count_images(book_path)

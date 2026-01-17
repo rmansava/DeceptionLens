@@ -68,6 +68,68 @@ def get_opensearch_client():
     return OpenSearch(hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}], http_compress=True, timeout=300)
 
 
+def rename_all_files_to_folder_name(folder_path, dry_run):
+    """Rename ALL files in folder to match the folder name (extracts page numbers).
+
+    Used when folder is renamed but file names don't contain the old folder name
+    (e.g., files named from PDF metadata).
+    """
+    import re
+    if not os.path.exists(folder_path):
+        return {"status": "skipped", "message": "Folder not found"}
+
+    folder_name = os.path.basename(folder_path)
+    folder_name_lower = folder_name.lower()
+    renamed_count = 0
+    already_correct = 0
+    errors = []
+
+    try:
+        files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'))]
+        total = len(files)
+
+        for i, fn in enumerate(files):
+            # Skip if already starts with folder name (case-insensitive)
+            if fn.lower().startswith(folder_name_lower):
+                already_correct += 1
+                continue
+
+            # Extract page number
+            match = re.search(r'-page(\d+)\.', fn, re.IGNORECASE)
+            if not match:
+                errors.append(f"No page number: {fn}")
+                continue
+
+            page_num = match.group(1)
+            ext = os.path.splitext(fn)[1]
+            new_fn = f"{folder_name}-page{page_num}{ext}"
+
+            old_fp = os.path.join(folder_path, fn)
+            new_fp = os.path.join(folder_path, new_fn)
+
+            if os.path.exists(new_fp):
+                errors.append(f"Target exists: {new_fn}")
+                continue
+
+            if dry_run:
+                renamed_count += 1
+            else:
+                try:
+                    os.rename(old_fp, new_fp)
+                    renamed_count += 1
+                except Exception as e:
+                    errors.append(str(e))
+
+            if (i + 1) % 50 == 0:
+                print(f"      Progress: {i+1}/{total} files...")
+
+        if errors:
+            return {"status": "partial", "renamed": renamed_count, "already_correct": already_correct, "errors": len(errors), "error_details": errors[:5]}
+        return {"status": "success" if not dry_run else "dry-run", "renamed": renamed_count, "already_correct": already_correct, "total": total}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 def rename_files_in_folder(folder_path, old_name, new_name, dry_run):
     if not os.path.exists(folder_path):
         return {"status": "skipped", "message": "Folder not found"}

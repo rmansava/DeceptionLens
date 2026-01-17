@@ -31,6 +31,7 @@ from rename_book import (
     get_opensearch_client,
     rename_folder_and_contents,
     rename_files_in_folder,
+    rename_all_files_to_folder_name,
     rename_text_file,
     update_opensearch_index,
     update_faiss_paths,
@@ -84,13 +85,25 @@ class BookFolderHandler(FileSystemEventHandler):
 
         errors = 0
 
-        # Step 0: Rename files inside the watched folder (folder already renamed, but files still have old name)
-        result = rename_files_in_folder(new_folder_path, old_name, new_name, dry_run=self.dry_run)
+        # Step 0: Rename ALL files inside the watched folder to match new folder name
+        # This handles both files with old name AND files with different names (from PDF metadata)
+        result = rename_all_files_to_folder_name(new_folder_path, dry_run=self.dry_run)
         status = result.get("status", "unknown")
         if status == "success":
-            self.logger.info(f"  [OK] pdf-images (local): {result.get('renamed')} files")
+            renamed = result.get('renamed', 0)
+            already_ok = result.get('already_correct', 0)
+            self.logger.info(f"  [OK] pdf-images (local): {renamed} renamed, {already_ok} already correct")
         elif status == "dry-run":
-            self.logger.info(f"  [DRY] pdf-images (local): would rename {result.get('renamed')} files")
+            renamed = result.get('renamed', 0)
+            already_ok = result.get('already_correct', 0)
+            self.logger.info(f"  [DRY] pdf-images (local): would rename {renamed}, {already_ok} already correct")
+        elif status == "partial":
+            renamed = result.get('renamed', 0)
+            errs = result.get('errors', 0)
+            self.logger.warning(f"  [!!] pdf-images (local): {renamed} renamed, {errs} errors")
+            if result.get('error_details'):
+                for err in result['error_details'][:3]:
+                    self.logger.warning(f"       {err}")
         elif status == "skipped":
             self.logger.debug(f"  [--] pdf-images (local): {result.get('message')}")
         else:

@@ -54,6 +54,57 @@ def check_hash_exists(cursor, file_hash: str, collection: str) -> str:
     return row[0] if row else None
 
 
+def load_existing_paths(cursor, collection: str) -> set:
+    """Load all existing file paths for a collection into a set (single query)."""
+    cursor.execute(
+        "SELECT FilePath FROM ImageHashes WHERE Collection = ?",
+        (collection,)
+    )
+    paths = set()
+    for row in cursor.fetchall():
+        paths.add(row[0])
+    return paths
+
+
+def load_opensearch_paths(os_client, index_name: str) -> set:
+    """Load all existing document IDs (file paths) from OpenSearch index."""
+    paths = set()
+
+    if not os_client.indices.exists(index=index_name):
+        return paths
+
+    # Use scroll API to get all document IDs
+    query = {"query": {"match_all": {}}, "_source": False}
+
+    try:
+        response = os_client.search(
+            index=index_name,
+            body=query,
+            scroll="2m",
+            size=10000
+        )
+
+        scroll_id = response.get("_scroll_id")
+        hits = response["hits"]["hits"]
+
+        while hits:
+            for hit in hits:
+                paths.add(hit["_id"])
+
+            response = os_client.scroll(scroll_id=scroll_id, scroll="2m")
+            scroll_id = response.get("_scroll_id")
+            hits = response["hits"]["hits"]
+
+        # Clear scroll
+        if scroll_id:
+            os_client.clear_scroll(scroll_id=scroll_id)
+
+    except Exception as e:
+        print(f"Warning: Could not load OpenSearch paths: {e}")
+
+    return paths
+
+
 def add_hash_to_db(cursor, file_hash: str, file_path: str, collection: str, file_size: int):
     """Add a new hash to the database."""
     cursor.execute(
@@ -241,25 +292,69 @@ def index_dino_opensearch(
             new_images.append((path, None, file_size))
         print(f"  Images to index: {len(new_images):,}")
     else:
-        print("\nChecking for duplicates...")
-        for path in tqdm(all_image_paths, desc="Hashing"):
-            try:
-                file_hash = get_file_hash(path)
-                existing = check_hash_exists(cursor, file_hash, dino_collection)
+        # Load existing paths from OpenSearch
+        print("\nLoading existing paths from OpenSearch...")
+        opensearch_paths = load_opensearch_paths(os_client, VISUAL_INDEX)
+        print(f"  Found {len(opensearch_paths):,} paths in OpenSearch")
 
-                if existing:
-                    skipped_duplicates += 1
-                else:
-                    file_size = os.path.getsize(path)
-                    new_images.append((path, file_hash, file_size))
-            except Exception:
-                skipped_errors += 1
-                continue
+        # Load existing paths from SQL Server (includes all hashed files)
+        print("Loading existing paths from SQL Server...")
+        sql_paths = load_existing_paths(cursor, dino_collection)
+        print(f"  Found {len(sql_paths):,} paths in SQL Server")
+
+        # Combine both for path-based skipping
+        existing_paths = opensearch_paths | sql_paths
+        print(f"  Total unique paths to skip: {len(existing_paths):,}")
+
+        # First pass: skip by path (no file read needed)
+        skipped_by_path = 0
+        paths_to_hash = []
+        for path in all_image_paths:
+            if path in existing_paths:
+                skipped_by_path += 1
+            else:
+                paths_to_hash.append(path)
+
+        print(f"  Skipped by path: {skipped_by_path:,}")
+        print(f"  New paths to check: {len(paths_to_hash):,}")
+
+        # Second pass: hash only NEW files for content dedup
+        if paths_to_hash:
+            print("\nHashing new files for content dedup...")
+            for path in tqdm(paths_to_hash, desc="Hashing new files"):
+                try:
+                    file_hash = get_file_hash(path)
+                    existing = check_hash_exists(cursor, file_hash, dino_collection)
+
+                    if existing:
+                        skipped_duplicates += 1
+                    else:
+                        file_size = os.path.getsize(path)
+                        new_images.append((path, file_hash, file_size))
+                except Exception:
+                    skipped_errors += 1
+                    continue
 
         print(f"\nDuplicate check complete:")
         print(f"  New images to index: {len(new_images):,}")
-        print(f"  Skipped (duplicates): {skipped_duplicates:,}")
+        print(f"  Skipped (already in OpenSearch): {skipped_by_path:,}")
+        print(f"  Skipped (same content): {skipped_duplicates:,}")
         print(f"  Skipped (errors): {skipped_errors:,}")
+
+        # Save hashes to SQL immediately after hashing (before indexing)
+        # This ensures interrupted indexing runs don't require re-hashing
+        if new_images:
+            print(f"\nSaving {len(new_images):,} hashes to SQL Server...")
+            saved_count = 0
+            for path, file_hash, file_size in new_images:
+                if file_hash:
+                    try:
+                        add_hash_to_db(cursor, file_hash, path, dino_collection, file_size)
+                        saved_count += 1
+                    except Exception:
+                        pass  # Hash may already exist
+            conn.commit()
+            print(f"  Saved {saved_count:,} hashes - safe to resume if indexing interrupted")
 
     if not new_images:
         print("No new images to index!")
@@ -273,11 +368,9 @@ def index_dino_opensearch(
     visual_count = 0
     face_count = 0
     errors = 0
-    hashes_to_add = []
 
     for file_path, file_hash, file_size in tqdm(new_images, desc="DINOv2 Indexing"):
         folder_name = os.path.basename(os.path.dirname(file_path))
-        indexed_this_image = False
 
         # Visual embedding
         if enable_visual and model:
@@ -304,7 +397,6 @@ def index_dino_opensearch(
                     }
                 })
                 visual_count += 1
-                indexed_this_image = True
             except Exception as e:
                 errors += 1
 
@@ -328,13 +420,8 @@ def index_dino_opensearch(
                             }
                         })
                         face_count += 1
-                        indexed_this_image = True
             except Exception:
                 pass
-
-        # Track hash for successfully indexed images
-        if indexed_this_image and not no_dedup and file_hash:
-            hashes_to_add.append((file_hash, file_path, dino_collection, file_size))
 
         # Bulk insert visual
         if len(visual_actions) >= batch_size:
@@ -352,16 +439,6 @@ def index_dino_opensearch(
                 print(f"Face bulk insert error: {e}")
             face_actions = []
 
-        # Commit hashes to DB periodically
-        if not no_dedup and len(hashes_to_add) >= batch_size:
-            for h in hashes_to_add:
-                try:
-                    add_hash_to_db(cursor, h[0], h[1], h[2], h[3])
-                except Exception:
-                    pass
-            conn.commit()
-            hashes_to_add = []
-
         gc.collect()
 
     # Insert remaining
@@ -376,15 +453,6 @@ def index_dino_opensearch(
             helpers.bulk(os_client, face_actions, refresh=False)
         except Exception as e:
             print(f"Final face bulk insert error: {e}")
-
-    # Commit remaining hashes
-    if not no_dedup and hashes_to_add:
-        for h in hashes_to_add:
-            try:
-                add_hash_to_db(cursor, h[0], h[1], h[2], h[3])
-            except Exception:
-                pass
-        conn.commit()
 
     # Refresh indices
     if enable_visual:

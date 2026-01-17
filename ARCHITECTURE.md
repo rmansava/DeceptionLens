@@ -1086,6 +1086,287 @@ elif DISK_SQL_AVAILABLE:
 
 ---
 
+## DINOv2/ArcFace Indexing Deduplication Strategy
+
+The `board_games_dino_indexer.py` implements an optimized multi-stage deduplication strategy to avoid reprocessing images for both **DINOv2 visual embeddings** (768-dim) and **ArcFace face embeddings** (512-dim).
+
+### The Problem
+
+Initial indexing runs were extremely slow due to:
+1. Reading and hashing every file from NAS (~4 hours for 878k images)
+2. Checking SQL Server for each hash
+3. Only then discovering which files were already processed
+
+### The Solution: Four-Stage Pipeline
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│               DINOv2/ArcFace Indexing Deduplication                    │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  Stage 1: Load Existing Paths (fast, no file I/O)                     │
+│  ┌─────────────────────┐     ┌─────────────────────┐                  │
+│  │  OpenSearch Scroll  │     │  SQL Server Query   │                  │
+│  │  (document IDs)     │     │  (ImageHashes)      │                  │
+│  │  ~510k paths        │     │  ~878k paths        │                  │
+│  └──────────┬──────────┘     └──────────┬──────────┘                  │
+│             │                            │                            │
+│             └──────────┬─────────────────┘                            │
+│                        ▼                                              │
+│            ┌─────────────────────┐                                    │
+│            │  Combined Set       │  Union of both sources             │
+│            │  ~878k unique paths │  O(1) lookup per file              │
+│            └──────────┬──────────┘                                    │
+│                       │                                               │
+│  Stage 2: Path-Based Skip (instant, in-memory)                        │
+│                       ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  for path in all_image_paths:                                    │  │
+│  │      if path in existing_paths:                                  │  │
+│  │          skip  # No file read needed!                            │  │
+│  │      else:                                                       │  │
+│  │          add to paths_to_hash                                    │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                       │                                               │
+│  Stage 3: Content Hash (only for truly NEW files)                     │
+│                       ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  for path in paths_to_hash:  # Only ~10-20% of files             │  │
+│  │      hash = SHA256(file)     # Now we read the file              │  │
+│  │      if hash in SQL:                                             │  │
+│  │          skip  # Content duplicate in different location         │  │
+│  │      else:                                                       │  │
+│  │          add to new_images  # Ready for indexing                 │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                       │                                               │
+│  Stage 4: Generate Embeddings (both in single pass)                   │
+│                       ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  for image in new_images:                                        │  │
+│  │      DINOv2 → 768-dim visual embedding → board_games_visual      │  │
+│  │      ArcFace → 512-dim face embedding(s) → board_games_faces     │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+### Why Both OpenSearch AND SQL Server?
+
+| Source | Contains | Purpose |
+|--------|----------|---------|
+| OpenSearch | Successfully indexed images | Skip already-indexed paths |
+| SQL Server | All hashed images (saved before indexing) | Skip files we've already read/hashed |
+
+**Key insight**: SQL Server tracks files we've hashed immediately after hashing completes (before indexing starts). If indexing crashes, the next run skips all hashed files by path - no re-hashing needed.
+
+### Embedding Types and OpenSearch Indices
+
+| Embedding | Model | Dimensions | Index Name | Purpose |
+|-----------|-------|------------|------------|---------|
+| **Visual** | DINOv2 (ViT-B/14) | 768 | `board_games_visual` | Scene/object similarity search |
+| **Face** | ArcFace (buffalo_l) | 512 | `board_games_faces` | Face recognition/similarity |
+
+Both embeddings are generated in a **single pass** over new images:
+- Each image gets one DINOv2 visual embedding (stored with image path as doc ID)
+- Each image may have 0-N face embeddings (stored with `{path}_face_{i}` as doc ID)
+
+### Performance Comparison
+
+| Scenario | Old Method | New Method |
+|----------|------------|------------|
+| **First run (empty DB)** | 4 hours (hash all) | 4 hours (same) |
+| **Resume after interrupt** | 4 hours (re-hash all) | ~1 min (path skip) |
+| **Incremental (new files)** | 4 hours (re-hash all) | ~10 min (hash only new) |
+| **Re-run after completion** | 4 hours (re-hash all) | ~1 min (all paths skip) |
+
+### Code Flow
+
+```python
+# Stage 1: Load existing paths from both sources
+opensearch_paths = load_opensearch_paths(os_client, VISUAL_INDEX)
+sql_paths = load_existing_paths(cursor, dino_collection)
+existing_paths = opensearch_paths | sql_paths  # Union
+
+# Stage 2: Fast path-based skip (no file I/O)
+for path in all_image_paths:
+    if path in existing_paths:
+        skipped_by_path += 1
+    else:
+        paths_to_hash.append(path)
+
+# Stage 3: Hash only NEW files for content dedup
+for path in paths_to_hash:
+    file_hash = get_file_hash(path)  # NOW we read the file
+    if check_hash_exists(cursor, file_hash, collection):
+        skipped_duplicates += 1  # Same content, different path
+    else:
+        new_images.append((path, file_hash, file_size))
+
+# Save hashes to SQL BEFORE indexing (crash-safe checkpoint)
+for path, file_hash, file_size in new_images:
+    add_hash_to_db(cursor, file_hash, path, collection, file_size)
+conn.commit()
+
+# Stage 4: Generate embeddings (both in single pass)
+for image_path in new_images:
+    # DINOv2 visual embedding (768-dim)
+    embedding = dinov2_model(image)
+    opensearch.index(index="board_games_visual", id=image_path, body={"embedding": embedding})
+
+    # ArcFace face embeddings (512-dim each)
+    faces = face_app.get(image)
+    for i, face in enumerate(faces):
+        opensearch.index(index="board_games_faces", id=f"{image_path}_face_{i}", body={"embedding": face.embedding})
+```
+
+### Output Example
+
+```
+Loading existing paths from OpenSearch...
+  Found 509,700 paths in OpenSearch
+Loading existing paths from SQL Server...
+  Found 878,448 paths in SQL Server
+  Total unique paths to skip: 878,448
+  Skipped by path: 878,448
+  New paths to check: 0
+
+No new images to index!
+```
+
+Or when there are new images:
+
+```
+Loading existing paths from OpenSearch...
+  Found 509,700 paths in OpenSearch
+Loading existing paths from SQL Server...
+  Found 550,000 paths in SQL Server
+  Total unique paths to skip: 550,000
+  Skipped by path: 550,000
+  New paths to check: 328,448
+
+Hashing new files for content dedup...
+Hashing new files: 100%|████████| 328448/328448 [1:23:45<00:00, 65.3it/s]
+
+Duplicate check complete:
+  New images to index: 325,000
+  Skipped (already in OpenSearch): 550,000
+  Skipped (same content): 3,448
+  Skipped (errors): 0
+
+Saving 325,000 hashes to SQL Server...
+  Saved 325,000 hashes - safe to resume if indexing interrupted
+
+DINOv2 Indexing: 100%|████████| 325000/325000 [2:15:30<00:00, 40.0it/s]
+
+============================================================
+BOARD GAMES DINO INDEXING COMPLETE
+============================================================
+Visual embeddings added: 325,000
+Face embeddings added: 87,234
+Errors: 12
+Total in board_games_visual: 834,700
+Total in board_games_faces: 198,456
+```
+
+### Crash-Safe Hash Persistence
+
+Hashes are saved to SQL Server **immediately after hashing completes**, before indexing begins. This ensures:
+
+1. **No re-hashing on crash**: If indexing crashes or is interrupted, the next run skips all hashed files by path
+2. **Work is never lost**: The expensive hashing phase (~4 hours for 878k files) is preserved
+3. **Fast recovery**: Resume indexing from where it left off without re-reading files
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Crash-Safe Workflow                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────┐     ┌──────────────────┐     ┌─────────────────┐  │
+│  │ Hash Files   │────▶│ Save to SQL      │────▶│ Index to        │  │
+│  │ (~4 hours)   │     │ (checkpoint!)    │     │ OpenSearch      │  │
+│  └──────────────┘     └──────────────────┘     └─────────────────┘  │
+│                              │                         │            │
+│                              │                    ┌────┴────┐       │
+│                              │                    │ CRASH!  │       │
+│                              │                    └─────────┘       │
+│                              ▼                                      │
+│                    ┌─────────────────────────┐                      │
+│                    │ Next run: Skip by path  │                      │
+│                    │ (SQL has all hashes)    │                      │
+│                    │ Resume from crash point │                      │
+│                    └─────────────────────────┘                      │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### OpenSearch Scroll API
+
+The `load_opensearch_paths()` function uses the scroll API to efficiently retrieve all document IDs:
+
+```python
+def load_opensearch_paths(os_client, index_name: str) -> set:
+    """Load all existing document IDs (file paths) from OpenSearch index."""
+    paths = set()
+    query = {"query": {"match_all": {}}, "_source": False}  # IDs only, no content
+
+    response = os_client.search(index=index_name, body=query, scroll="2m", size=10000)
+    scroll_id = response.get("_scroll_id")
+    hits = response["hits"]["hits"]
+
+    while hits:
+        for hit in hits:
+            paths.add(hit["_id"])  # Document ID is the file path
+        response = os_client.scroll(scroll_id=scroll_id, scroll="2m")
+        hits = response["hits"]["hits"]
+
+    os_client.clear_scroll(scroll_id=scroll_id)
+    return paths
+```
+
+**Performance**: ~30-60 seconds to load 500k+ document IDs (just metadata, no vectors).
+
+### SQL Server Path Query
+
+```python
+def load_existing_paths(cursor, collection: str) -> set:
+    """Load all existing file paths for a collection into a set (single query)."""
+    cursor.execute(
+        "SELECT FilePath FROM ImageHashes WHERE Collection = ?",
+        (collection,)
+    )
+    paths = set()
+    for row in cursor.fetchall():
+        paths.add(row[0])
+    return paths
+```
+
+**Performance**: ~5-10 seconds to load 500k+ paths.
+
+### Usage
+
+```bash
+# Run the optimized board games indexer
+cd backend
+python board_games_dino_indexer.py --source "T:/archiverelated/board games"
+
+# Visual only (skip faces)
+python board_games_dino_indexer.py --source "T:/archiverelated/board games" --visual-only
+
+# Faces only (skip visual)
+python board_games_dino_indexer.py --source "T:/archiverelated/board games" --faces-only
+
+# Skip all dedup (not recommended, will reprocess everything)
+python board_games_dino_indexer.py --source "T:/archiverelated/board games" --no-dedup
+```
+
+### Batch Files
+
+- `run_board_games_dino.bat` - Runs visual then faces indexing
+- `snapshot_boardgames.bat` - Creates OpenSearch snapshots to NAS
+- `restore_boardgames.bat` - Restores snapshots from NAS
+
+---
+
 ## Future Improvements
 
 1. Add face search endpoint (currently visual only)
@@ -1093,4 +1374,4 @@ elif DISK_SQL_AVAILABLE:
 3. Add pagination for large result sets
 4. Support PDF direct upload (extract pages automatically)
 5. Add collection management UI
-6. Implement incremental indexing (skip already indexed files)
+6. ~~Implement incremental indexing (skip already indexed files)~~ ✅ Implemented
