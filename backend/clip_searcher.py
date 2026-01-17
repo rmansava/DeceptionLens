@@ -22,6 +22,10 @@ COLLECTION_PATHS = {
     "print_ads": {
         "index": "D:/faiss/print_ads/index.faiss",
         "paths": "D:/faiss/print_ads/paths.json"
+    },
+    "board_games": {
+        "index": "D:/faiss/board_games/index.faiss",
+        "paths": "D:/faiss/board_games/paths.json"
     }
 }
 
