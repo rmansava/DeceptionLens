@@ -8,11 +8,26 @@ Can index missing images after verification.
 
 import os
 import gc
+import sys
 import hashlib
 import argparse
+import logging
+from datetime import datetime
 import pyodbc
 import numpy as np
 from opensearchpy import OpenSearch, helpers
+
+# Set up logging to both console and file
+LOG_FILE = os.path.join(os.path.dirname(__file__), "verify_indexing.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+log = logging.getLogger(__name__)
 
 VISUAL_INDEX = "dinov2-board_games"
 FACES_INDEX = "faces-board_games"
