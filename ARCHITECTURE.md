@@ -1364,6 +1364,189 @@ python board_games_dino_indexer.py --source "T:/archiverelated/board games" --no
 - `run_board_games_dino.bat` - Runs visual then faces indexing
 - `snapshot_boardgames.bat` - Creates OpenSearch snapshots to NAS
 - `restore_boardgames.bat` - Restores snapshots from NAS
+- `verify_board_games.bat` - Verifies indexing completeness, finds/deletes duplicates, indexes missing files
+
+---
+
+## Indexing Verification & Duplicate Detection
+
+The `verify_indexing.py` script provides post-indexing verification to ensure all NAS images are indexed and to identify/remove content duplicates.
+
+### The Problem
+
+After indexing 878k+ images, several issues can occur:
+1. **Missing files**: Some images may not be in OpenSearch (indexing errors, crashes, new files added)
+2. **Content duplicates**: Same image content exists at multiple paths (copies, backups, renamed files)
+3. **Wasted storage**: Duplicate files consume NAS space unnecessarily
+
+### The Solution: Three-Phase Verification
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│               Indexing Verification Pipeline                           │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  Phase 1: Path Comparison (fast, no file I/O)                         │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  NAS Scan              OpenSearch Scroll                        │  │
+│  │  ┌──────────────┐      ┌──────────────┐                         │  │
+│  │  │ 878,448      │      │ 877,100      │                         │  │
+│  │  │ image files  │      │ document IDs │                         │  │
+│  │  └──────┬───────┘      └──────┬───────┘                         │  │
+│  │         │                      │                                │  │
+│  │         └──────────┬───────────┘                                │  │
+│  │                    ▼                                            │  │
+│  │         ┌─────────────────────┐                                 │  │
+│  │         │ Set Difference      │                                 │  │
+│  │         │ NAS - OpenSearch    │                                 │  │
+│  │         │ = 1,348 missing     │                                 │  │
+│  │         └─────────────────────┘                                 │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                       │                                               │
+│  Phase 2: Content Hash Dedup (reads missing files only)               │
+│                       ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  for path in missing_files:  # Only 1,348 files, not 878k!      │  │
+│  │      hash = SHA256(file)                                        │  │
+│  │      original = SQL.lookup(hash, collection)                    │  │
+│  │                                                                 │  │
+│  │      if original exists and original != path:                   │  │
+│  │          → DUPLICATE (same content at different path)           │  │
+│  │      else:                                                      │  │
+│  │          → TRULY MISSING (needs indexing)                       │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                       │                                               │
+│                       ▼                                               │
+│         ┌─────────────────────────────────────────┐                   │
+│         │  Results:                               │                   │
+│         │  - 1,200 duplicates (delete optional)   │                   │
+│         │  - 148 truly missing (index these)      │                   │
+│         └─────────────────────────────────────────┘                   │
+│                       │                                               │
+│  Phase 3: Fix Issues (optional)                                       │
+│                       ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  --delete-duplicates:                                           │  │
+│  │      Confirm → Delete 1,200 duplicate files → Free X GB         │  │
+│  │                                                                 │  │
+│  │  --index-missing:                                               │  │
+│  │      Load DINOv2 + ArcFace → Index 148 files → Update indices   │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+### Why This Works
+
+| Phase | What It Checks | File I/O Required | Speed |
+|-------|---------------|-------------------|-------|
+| **Path comparison** | Is path in OpenSearch? | None (metadata only) | ~1 min for 878k |
+| **Content hash** | Is content a duplicate? | Only missing files | ~5 min for 1k files |
+| **Indexing** | Generate embeddings | Only truly missing | ~10 min for 100 files |
+
+**Key insight**: By comparing paths first (fast), we reduce the files needing content hashing from 878k to just ~1k. Then content hashing identifies duplicates vs truly missing files.
+
+### Duplicate Detection Logic
+
+```python
+# A file is a DUPLICATE if:
+# 1. It's not in OpenSearch (missing from index)
+# 2. Its SHA256 hash exists in SQL ImageHashes table
+# 3. The original path (from SQL) is different from this path
+
+def is_duplicate(path, cursor, collection):
+    file_hash = sha256(path)
+    original = SQL.get_path_for_hash(file_hash, collection)
+
+    if original and original != path:
+        return True, original  # Duplicate of 'original'
+    return False, None  # Truly missing, needs indexing
+```
+
+### Output Example
+
+```
+============================================
+Board Games Indexing Verification
+============================================
+Source: T:\archiverelated\board games
+
+Scanning T:\archiverelated\board games...
+  Found 878,448 images on NAS
+
+Loading paths from OpenSearch...
+  Found 877,100 in dinov2-board_games
+  Found 498,345 face embeddings from 312,000 images in faces-board_games
+
+============================================================
+RESULTS
+============================================================
+Total images on NAS:        878,448
+Total in visual index:      877,100
+Missing from visual index:  1,348
+Images with faces indexed:  312,000
+
+Visual coverage: 99.85%
+
+*** 1,348 IMAGES NOT IN OPENSEARCH ***
+
+============================================================
+DUPLICATE DETECTION
+============================================================
+Checking 1,348 missing files for content duplicates...
+Checking duplicates: 100%|████████| 1348/1348 [00:45<00:00, 30.0it/s]
+
+============================================================
+DUPLICATE ANALYSIS RESULTS
+============================================================
+Content duplicates found:   1,200
+Space used by duplicates:   2.34 GB
+Truly missing (not dupes):  148
+Errors (couldn't check):    0
+
+============================================================
+DELETING DUPLICATES
+============================================================
+Are you sure you want to DELETE 1,200 duplicate files? (yes/no): yes
+Deleting: 100%|████████| 1200/1200 [00:12<00:00, 100.0it/s]
+
+Deleted: 1,200 files
+Errors:  0 files
+Space freed: 2.34 GB
+
+============================================================
+INDEXING MISSING FILES
+============================================================
+Files to index: 148
+
+Loading DINOv2 model...
+Loading ArcFace model...
+Indexing: 100%|████████| 148/148 [02:30<00:00, 1.0it/s]
+
+============================================================
+INDEXING COMPLETE
+============================================================
+Visual embeddings added: 148
+Face embeddings added:   23
+Errors:                  0
+```
+
+### Usage
+
+```bash
+# Quick verification only (no file reads, just path comparison)
+verify_board_games.bat --quick
+
+# Find duplicates but don't delete or index
+verify_board_games.bat --find-duplicates
+
+# FULL FIX (default): Find duplicates, delete them, index missing
+verify_board_games.bat
+```
+
+### Logging
+
+All output is logged to `backend/verify_indexing.log` for review if the console window closes.
 
 ---
 
