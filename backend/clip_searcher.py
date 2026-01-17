@@ -20,8 +20,8 @@ COLLECTION_PATHS = {
         "paths": "D:/faiss/books/paths.json"
     },
     "print_ads": {
-        "index": "D:/faiss/print_ads/index.faiss",
-        "paths": "D:/faiss/print_ads/paths.json"
+        "index": "D:/faiss/printads/index.faiss",
+        "paths": "D:/faiss/printads/paths.json"
     },
     "board_games": {
         "index": "D:/faiss/board_games/index.faiss",
