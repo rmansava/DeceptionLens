@@ -11,8 +11,8 @@ import argparse
 import pyodbc
 from opensearchpy import OpenSearch
 
-VISUAL_INDEX = "board_games_visual"
-FACES_INDEX = "board_games_faces"
+VISUAL_INDEX = "dinov2-board_games"
+FACES_INDEX = "faces-board_games"
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
 
 # SQL Server connection
