@@ -38,6 +38,80 @@ An image finder using CLIP for text-to-image and visual similarity search, plus 
 2. **CLIP Visual Search** - Search by image using CLIP embeddings
 3. **DINOv2 Visual Search** - Search by image with optional geometric verification
 
+---
+
+## Index Locations by Collection
+
+### Summary Table
+
+| Collection | CLIP (FAISS) | DINOv2 (OpenSearch) | ArcFace (OpenSearch) | DISK (.npz) | Source |
+|------------|--------------|---------------------|----------------------|-------------|--------|
+| **books** | `D:/faiss/books/` | `dinov2-books` | `faces-books` | `T:/disk-features/books/` | `T:/archiverelated/books` |
+| **board_games** | `D:/faiss/board_games/` | `dinov2-board_games` | `faces-board_games` | `T:/disk-features/board_games/` | `T:/archiverelated/board games` |
+| **print_ads** | `D:/faiss/printads/` | `dinov2-print_ads` | `faces-print_ads` | `T:/disk-features/print_ads/` | `T:/archiverelated/print ads` |
+| **albums** | `D:/faiss/albums/` | - | - | - | - |
+
+### CLIP (FAISS) - Semantic Search
+Text-to-image and image-to-image semantic similarity using CLIP ViT-L/14 (768-dim).
+
+| Collection | Index Path | Paths JSON | Size |
+|------------|-----------|------------|------|
+| books | `D:/faiss/books/index.faiss` | `D:/faiss/books/paths.json` | ~15 GB |
+| board_games | `D:/faiss/board_games/index.faiss` | `D:/faiss/board_games/paths.json` | ~10 GB (est) |
+| print_ads | `D:/faiss/printads/index.faiss` | `D:/faiss/printads/paths.json` | ~2.7 GB |
+| albums | `D:/faiss/albums/index.faiss` | `D:/faiss/albums/paths.json` | ~2.3 GB |
+
+**NAS Backup:** `T:/faiss/` (mirror of D:/faiss/)
+
+### DINOv2 (OpenSearch) - Visual Similarity
+Fine-grained visual search using DINOv2 ViT-B/14 (768-dim).
+
+| Collection | Index Name | Documents | URL |
+|------------|-----------|-----------|-----|
+| books | `dinov2-books` | ~5M | `http://localhost:9200/dinov2-books` |
+| board_games | `dinov2-board_games` | ~877k | `http://localhost:9200/dinov2-board_games` |
+| print_ads | `dinov2-print_ads` | TBD | `http://localhost:9200/dinov2-print_ads` |
+
+### ArcFace (OpenSearch) - Face Search
+Face similarity search using ArcFace buffalo_l (512-dim).
+
+| Collection | Index Name | Documents | URL |
+|------------|-----------|-----------|-----|
+| books | `faces-books` | TBD | `http://localhost:9200/faces-books` |
+| board_games | `faces-board_games` | ~498k | `http://localhost:9200/faces-board_games` |
+| print_ads | `faces-print_ads` | TBD | `http://localhost:9200/faces-print_ads` |
+
+### DISK Features (File-Based) - Geometric Verification
+DISK keypoints + descriptors for LightGlue matching. Stored as `.npz` files per image.
+
+| Collection | Local Path | NAS Path |
+|------------|-----------|----------|
+| books | `D:/disk-features/books/` | `T:/disk-features/books/` |
+| board_games | `D:/disk-features/board_games/` | `T:/disk-features/board_games/` |
+| print_ads | `C:/disk-features/print_ads/` | `T:/disk-features/print_ads/` |
+
+### SQL Server - Hash Deduplication
+Image hashes for deduplication during indexing.
+
+| Table | Database | Purpose |
+|-------|----------|---------|
+| `ImageHashes` | `DeceptionLens` | SHA256 hashes, file paths, collection names |
+
+**Connection:** `localhost` with Windows Auth
+
+---
+
+## Web Application
+
+| Component | URL | Description |
+|-----------|-----|-------------|
+| **Blazor Frontend** | `http://localhost:5000` | Search UI |
+| **FastAPI Backend** | `http://localhost:8000` | REST API |
+| **OpenSearch** | `http://localhost:9200` | Vector database |
+| **OpenSearch Dashboards** | `http://localhost:5601` | Admin UI |
+
+---
+
 ## Directory Structure
 
 ```

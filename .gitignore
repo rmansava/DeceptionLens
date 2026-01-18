@@ -48,3 +48,4 @@ Thumbs.db
 # Model cache (large files)
 .cache/
 models/
+backend/*_progress*.txt

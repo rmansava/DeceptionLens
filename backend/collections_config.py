@@ -5,7 +5,7 @@ Defines paths and settings for different content categories (books, print_ads, e
 import os
 
 # Collection definitions
-# Each collection has both CLIP (FAISS) and DINOv2 (ChromaDB) indexes
+# Each collection has CLIP (FAISS), DINOv2 (OpenSearch), and DISK (file) indexes
 COLLECTIONS = {
     "books": {
         "name": "Books",
@@ -13,24 +13,42 @@ COLLECTIONS = {
         # CLIP FAISS index paths
         "clip_index": "D:/faiss/books/index.faiss",
         "clip_paths": "D:/faiss/books/paths.json",
-        # DINOv2 ChromaDB collection names
-        "dino_collection": "images",  # Creates images_visual, images_faces
-        "chroma_db_path": "./chroma_db",
-        # Source data (for indexing)
-        "source_path": None,  # Set when indexing
+        # OpenSearch index names
+        "opensearch_visual": "dinov2-books",
+        "opensearch_faces": "faces-books",
+        # DISK features path
+        "disk_features": "T:/disk-features/books",
+        # Source data
+        "source_path": "T:/archiverelated/books",
     },
     "print_ads": {
         "name": "Print Ads",
         "description": "Vintage print advertisements",
         # CLIP FAISS index paths
-        "clip_index": "D:/faiss/print_ads/index.faiss",
-        "clip_paths": "D:/faiss/print_ads/paths.json",
-        # DINOv2 ChromaDB collection names
-        "dino_collection": "print_ads",  # Creates print_ads_visual, print_ads_faces
-        "chroma_db_path": "./chroma_db",
-        # Source data (for indexing)
-        "source_path": None,  # Set when indexing
-    }
+        "clip_index": "D:/faiss/printads/index.faiss",
+        "clip_paths": "D:/faiss/printads/paths.json",
+        # OpenSearch index names
+        "opensearch_visual": "dinov2-print_ads",
+        "opensearch_faces": "faces-print_ads",
+        # DISK features path
+        "disk_features": "T:/disk-features/print_ads",
+        # Source data
+        "source_path": "T:/archiverelated/print ads",
+    },
+    "board_games": {
+        "name": "Board Games",
+        "description": "Board game scans and photos",
+        # CLIP FAISS index paths
+        "clip_index": "D:/faiss/board_games/index.faiss",
+        "clip_paths": "D:/faiss/board_games/paths.json",
+        # OpenSearch index names
+        "opensearch_visual": "dinov2-board_games",
+        "opensearch_faces": "faces-board_games",
+        # DISK features path
+        "disk_features": "T:/disk-features/board_games",
+        # Source data
+        "source_path": "T:/archiverelated/board games",
+    },
 }
 
 # Default collection
