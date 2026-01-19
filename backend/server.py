@@ -165,9 +165,16 @@ async def search_image(
 
     - **file**: Query image to search for
     - **top_k**: Number of results to return (1-500)
-    - **collection**: Collection name to search in
+    - **collection**: Collection name to search in (use CLIP search for "all" collections)
     - **verify**: Whether to perform geometric verification
     """
+    # DINOv2/OpenSearch doesn't support "all" - use CLIP search-all for that
+    if collection == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="DINOv2 search doesn't support 'all' collections. Use CLIP search for multi-collection search, or select a specific collection."
+        )
+
     start_time = time.time()
 
     # Use OpenSearch for specified collections (more robust)
@@ -466,8 +473,15 @@ async def search_faces(
 
     - **file**: Query image containing face(s)
     - **top_k**: Number of results to return (1-500)
-    - **collection**: Collection name to search in
+    - **collection**: Collection name to search in (select a specific collection)
     """
+    # Face search doesn't support "all" collections
+    if collection == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="Face search doesn't support 'all' collections. Please select a specific collection."
+        )
+
     start_time = time.time()
 
     # Use OpenSearch for specified collections
