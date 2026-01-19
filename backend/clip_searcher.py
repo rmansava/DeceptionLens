@@ -34,13 +34,15 @@ class ClipSearcher:
     """
     Searches using CLIP embeddings and FAISS index.
     Supports both visual (image) and text queries.
+    Supports memory-mapping for low-RAM operation with NAS storage.
     """
 
     def __init__(
         self,
         index_path: str = "D:/faiss/books/index.faiss",
         paths_path: str = "D:/faiss/books/paths.json",
-        model_name: str = "ViT-L/14"
+        model_name: str = "ViT-L/14",
+        use_mmap: bool = False
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"CLIP Searcher using device: {self.device}")
@@ -48,6 +50,7 @@ class ClipSearcher:
         self.index_path = index_path
         self.paths_path = paths_path
         self.model_name = model_name
+        self.use_mmap = use_mmap
 
         # Lazy load - don't load until first search
         self.model = None
@@ -67,9 +70,16 @@ class ClipSearcher:
             if not os.path.exists(self.index_path):
                 raise FileNotFoundError(f"FAISS index not found: {self.index_path}")
 
-            print(f"Loading FAISS index from {self.index_path}...")
-            self.index = faiss.read_index(self.index_path)
-            print(f"Index loaded: {self.index.ntotal:,} images")
+            if self.use_mmap:
+                # Memory-map the index - minimal RAM usage, good for NAS
+                print(f"Memory-mapping FAISS index from {self.index_path}...")
+                self.index = faiss.read_index(self.index_path, faiss.IO_FLAG_MMAP)
+                print(f"Index mmap'd: {self.index.ntotal:,} images (low RAM mode)")
+            else:
+                # Load fully into RAM - faster but uses more memory
+                print(f"Loading FAISS index from {self.index_path}...")
+                self.index = faiss.read_index(self.index_path)
+                print(f"Index loaded: {self.index.ntotal:,} images")
 
             with open(self.paths_path) as f:
                 self.image_paths = json.load(f)
@@ -353,3 +363,66 @@ def get_cached_clip_searcher(collection: str = "books") -> ClipSearcher:
     if collection not in _searcher_cache:
         _searcher_cache[collection] = get_clip_searcher(collection)
     return _searcher_cache[collection]
+
+
+def search_all_collections(
+    image_bytes: bytes = None,
+    image_path: str = None,
+    text_query: str = None,
+    top_k: int = 50,
+    use_mmap: bool = True
+) -> list:
+    """
+    Search across ALL available CLIP collections and merge results.
+
+    Args:
+        image_bytes: Image bytes for visual search
+        image_path: Image path for visual search
+        text_query: Text query for text search
+        top_k: Number of results per collection (final results sorted by score)
+        use_mmap: Use memory-mapped indices (recommended for NAS/low RAM)
+
+    Returns:
+        Merged list of results from all collections, sorted by score
+    """
+    all_results = []
+
+    # Get available collections
+    available = [c for c in list_clip_collections() if c["available"]]
+
+    if not available:
+        print("No CLIP collections available")
+        return []
+
+    print(f"Searching {len(available)} collections: {[c['name'] for c in available]}")
+
+    for coll_info in available:
+        coll_name = coll_info["name"]
+        try:
+            searcher = get_cached_clip_searcher(coll_name)
+
+            if image_bytes:
+                results = searcher.search_by_image_bytes(image_bytes, top_k=top_k)
+            elif image_path:
+                results = searcher.search_by_image(image_path, top_k=top_k)
+            elif text_query:
+                results = searcher.search_by_text(text_query, top_k=top_k)
+            else:
+                continue
+
+            # Tag results with collection name
+            for r in results:
+                r["collection"] = coll_name
+
+            all_results.extend(results)
+            print(f"  {coll_name}: {len(results)} results")
+
+        except Exception as e:
+            print(f"  {coll_name}: Error - {e}")
+            continue
+
+    # Sort by score (descending) and return top results
+    all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    print(f"Total: {len(all_results)} results from all collections")
+    return all_results[:top_k * len(available)]  # Return more results for multi-collection

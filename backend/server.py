@@ -673,6 +673,66 @@ async def clip_search_image(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/clip/search-all", response_model=List[SearchResult])
+async def clip_search_all_collections(
+    file: UploadFile = File(...),
+    top_k: int = Query(default=50, ge=1, le=500),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Search for similar images across ALL available CLIP collections.
+    Uses memory-mapping for minimal RAM usage.
+
+    - **file**: Query image to search for
+    - **top_k**: Number of results per collection (results merged and sorted by score)
+    """
+    start_time = time.time()
+
+    try:
+        from clip_searcher import search_all_collections
+        image_bytes = await file.read()
+        image_filename = file.filename
+
+        logger.info(f"CLIP search ALL collections with {len(image_bytes)} bytes")
+        matches = search_all_collections(
+            image_bytes=image_bytes,
+            top_k=top_k,
+            use_mmap=True  # Use memory-mapping for low RAM usage
+        )
+
+        results = []
+        for m in matches:
+            metadata = m.get('metadata', {})
+            metadata['collection'] = m.get('collection', 'unknown')
+            results.append(SearchResult(
+                path=m['path'],
+                score=m['score'],
+                verified_matches=m.get('verified_matches', 0),
+                metadata=metadata
+            ))
+
+        # Save to history in background
+        duration_ms = int((time.time() - start_time) * 1000)
+        history_results = [{'path': m['path'], 'score': m['score'], 'collection': m.get('collection')} for m in matches]
+        if background_tasks:
+            background_tasks.add_task(
+                save_search_to_history,
+                search_type="CLIP Visual (All Collections)",
+                results=history_results,
+                search_duration_ms=duration_ms,
+                query_image=image_bytes,
+                query_image_name=image_filename,
+                collection="all"
+            )
+
+        logger.info(f"CLIP search ALL: {len(results)} results in {duration_ms}ms")
+        return results
+
+    except Exception as e:
+        logger.error(f"CLIP search all collections failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class TextSearchRequestWithCollection(BaseModel):
     query: str
     top_k: int = 50
@@ -722,6 +782,64 @@ async def clip_text_search(request: TextSearchRequestWithCollection, background_
 
     except Exception as e:
         logger.error(f"CLIP text search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class TextSearchAllRequest(BaseModel):
+    query: str
+    top_k: int = 50
+
+
+@app.post("/clip/text-all", response_model=List[SearchResult])
+async def clip_text_search_all(request: TextSearchAllRequest, background_tasks: BackgroundTasks = None):
+    """
+    Search for images using a text query across ALL collections.
+    Uses memory-mapping for minimal RAM usage.
+
+    - **query**: Text description to search for
+    - **top_k**: Number of results per collection
+    """
+    start_time = time.time()
+
+    try:
+        from clip_searcher import search_all_collections
+
+        logger.info(f"CLIP text search ALL: '{request.query}'")
+        matches = search_all_collections(
+            text_query=request.query,
+            top_k=request.top_k,
+            use_mmap=True
+        )
+
+        results = []
+        for m in matches:
+            metadata = m.get('metadata', {})
+            metadata['collection'] = m.get('collection', 'unknown')
+            results.append(SearchResult(
+                path=m['path'],
+                score=m['score'],
+                verified_matches=m.get('verified_matches', 0),
+                metadata=metadata
+            ))
+
+        # Save to history
+        duration_ms = int((time.time() - start_time) * 1000)
+        history_results = [{'path': m['path'], 'score': m['score'], 'collection': m.get('collection')} for m in matches]
+        if background_tasks:
+            background_tasks.add_task(
+                save_search_to_history,
+                search_type="Text (All Collections)",
+                results=history_results,
+                search_duration_ms=duration_ms,
+                query_text=request.query,
+                collection="all"
+            )
+
+        logger.info(f"CLIP text search ALL: {len(results)} results in {duration_ms}ms")
+        return results
+
+    except Exception as e:
+        logger.error(f"CLIP text search all failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
