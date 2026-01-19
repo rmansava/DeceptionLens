@@ -945,6 +945,15 @@
     {
         if (dinoSelectedFile == null || dinoFileBytes == null || dinoFileBytes.Length == 0) return;
 
+        // DINOv2 doesn't support "all" collections
+        if (selectedCollection == "all")
+        {
+            errorMessage = "DINOv2 search doesn't support 'All Collections'. Please select a specific collection, or use CLIP search for multi-collection search.";
+            hasSearched = true;
+            StateHasChanged();
+            return;
+        }
+
         isSearching = true;
         hasSearched = true;
         errorMessage = null;
@@ -1005,6 +1014,15 @@
     private async Task PerformFaceSearch()
     {
         if (faceSelectedFile == null || faceFileBytes == null || faceFileBytes.Length == 0) return;
+
+        // Face search doesn't support "all" collections
+        if (selectedCollection == "all")
+        {
+            errorMessage = "Face search doesn't support 'All Collections'. Please select a specific collection.";
+            hasSearched = true;
+            StateHasChanged();
+            return;
+        }
 
         isSearching = true;
         hasSearched = true;

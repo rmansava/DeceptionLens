@@ -437,11 +437,12 @@ def get_image(path: str = Query(..., description="Absolute path to the image")):
 
 @app.get("/collections")
 def list_collections():
-    """List all available collections (OpenSearch-based)."""
+    """List all available collections."""
     try:
-        # Return the OpenSearch collections
+        # Return all collections from config
+        from collections_config import COLLECTIONS
         return {
-            "collections": list(OPENSEARCH_VISUAL_COLLECTIONS)
+            "collections": list(COLLECTIONS.keys())
         }
     except Exception as e:
         logger.error(f"Failed to list collections: {e}")
