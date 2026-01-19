@@ -17,7 +17,7 @@
                 <select @bind="selectedCollection" class="form-select">
                     @foreach (var col in collections)
                     {
-                        <option value="@col">@col</option>
+                        <option value="@col">@(col == "all" ? "All Collections" : col)</option>
                     }
                 </select>
             </div>
@@ -813,8 +813,10 @@
 
                 if (baseNames.Any())
                 {
-                    collections = baseNames;
-                    selectedCollection = collections.First();
+                    // Add "all" option at the beginning for searching all collections
+                    collections = new List<string> { "all" };
+                    collections.AddRange(baseNames);
+                    selectedCollection = "all"; // Default to searching all
                 }
             }
         }
@@ -863,12 +865,14 @@
         isSearching = true;
         hasSearched = true;
         errorMessage = null;
-        lastSearchType = $"Text: \"{textQuery}\"";
+        lastSearchType = selectedCollection == "all"
+            ? $"Text (All): \"{textQuery}\""
+            : $"Text: \"{textQuery}\"";
         StateHasChanged();
 
         try
         {
-            results = await SearchService.ClipTextSearchAsync(textQuery, topK);
+            results = await SearchService.ClipTextSearchAsync(textQuery, topK, selectedCollection);
         }
         catch (Exception ex)
         {
@@ -916,13 +920,13 @@
         isSearching = true;
         hasSearched = true;
         errorMessage = null;
-        lastSearchType = "CLIP Visual";
+        lastSearchType = selectedCollection == "all" ? "CLIP Visual (All)" : "CLIP Visual";
         StateHasChanged();
 
         try
         {
             using var ms = new MemoryStream(clipFileBytes);
-            results = await SearchService.ClipImageSearchAsync(ms, clipSelectedFile.Name, topK);
+            results = await SearchService.ClipImageSearchAsync(ms, clipSelectedFile.Name, topK, selectedCollection);
         }
         catch (Exception ex)
         {

@@ -114,22 +114,45 @@ public class SearchService : ISearchService
         return $"{_apiBaseUrl}/image?path={Uri.EscapeDataString(path)}";
     }
 
-    public async Task<List<SearchResult>> ClipTextSearchAsync(string query, int topK = 50)
+    public async Task<List<SearchResult>> ClipTextSearchAsync(string query, int topK = 50, string collection = "books")
     {
         try
         {
-            var url = $"/clip/text?query={Uri.EscapeDataString(query)}&top_k={topK}";
+            if (collection == "all")
+            {
+                // Search all collections via POST endpoint
+                var url = "/clip/text-all";
+                _logger.LogInformation("CLIP text search ALL: {Query}, topK: {TopK}", query, topK);
 
-            _logger.LogInformation("CLIP text search: {Query}, topK: {TopK}", query, topK);
+                var requestBody = new { query = query, top_k = topK };
+                var jsonContent = new StringContent(
+                    JsonSerializer.Serialize(requestBody),
+                    System.Text.Encoding.UTF8,
+                    "application/json");
 
-            var response = await _httpClient.GetAsync(url);
-            response.EnsureSuccessStatusCode();
+                var response = await _httpClient.PostAsync(url, jsonContent);
+                response.EnsureSuccessStatusCode();
 
-            var json = await response.Content.ReadAsStringAsync();
-            var results = JsonSerializer.Deserialize<List<SearchResult>>(json) ?? new List<SearchResult>();
+                var json = await response.Content.ReadAsStringAsync();
+                var results = JsonSerializer.Deserialize<List<SearchResult>>(json) ?? new List<SearchResult>();
 
-            _logger.LogInformation("Found {Count} results", results.Count);
-            return results;
+                _logger.LogInformation("Found {Count} results from all collections", results.Count);
+                return results;
+            }
+            else
+            {
+                var url = $"/clip/text?query={Uri.EscapeDataString(query)}&top_k={topK}&collection={Uri.EscapeDataString(collection)}";
+                _logger.LogInformation("CLIP text search: {Query}, topK: {TopK}, collection: {Collection}", query, topK, collection);
+
+                var response = await _httpClient.GetAsync(url);
+                response.EnsureSuccessStatusCode();
+
+                var json = await response.Content.ReadAsStringAsync();
+                var results = JsonSerializer.Deserialize<List<SearchResult>>(json) ?? new List<SearchResult>();
+
+                _logger.LogInformation("Found {Count} results", results.Count);
+                return results;
+            }
         }
         catch (Exception ex)
         {
@@ -141,7 +164,8 @@ public class SearchService : ISearchService
     public async Task<List<SearchResult>> ClipImageSearchAsync(
         Stream imageStream,
         string fileName,
-        int topK = 50)
+        int topK = 50,
+        string collection = "books")
     {
         try
         {
@@ -150,9 +174,17 @@ public class SearchService : ISearchService
             streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
             content.Add(streamContent, "file", fileName);
 
-            var url = $"/clip/search?top_k={topK}";
-
-            _logger.LogInformation("CLIP image search: {FileName}, topK: {TopK}", fileName, topK);
+            string url;
+            if (collection == "all")
+            {
+                url = $"/clip/search-all?top_k={topK}";
+                _logger.LogInformation("CLIP image search ALL: {FileName}, topK: {TopK}", fileName, topK);
+            }
+            else
+            {
+                url = $"/clip/search?top_k={topK}&collection={Uri.EscapeDataString(collection)}";
+                _logger.LogInformation("CLIP image search: {FileName}, topK: {TopK}, collection: {Collection}", fileName, topK, collection);
+            }
 
             var response = await _httpClient.PostAsync(url, content);
             response.EnsureSuccessStatusCode();

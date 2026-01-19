@@ -10,9 +10,9 @@ public interface ISearchService
     Task<List<string>> GetCollectionsAsync();
     string GetImageUrl(string path);
 
-    // CLIP search methods
-    Task<List<SearchResult>> ClipTextSearchAsync(string query, int topK = 50);
-    Task<List<SearchResult>> ClipImageSearchAsync(Stream imageStream, string fileName, int topK = 50);
+    // CLIP search methods (collection = "all" searches all collections)
+    Task<List<SearchResult>> ClipTextSearchAsync(string query, int topK = 50, string collection = "books");
+    Task<List<SearchResult>> ClipImageSearchAsync(Stream imageStream, string fileName, int topK = 50, string collection = "books");
     Task<ClipStatsResponse?> GetClipStatsAsync();
 
     // Face search methods
