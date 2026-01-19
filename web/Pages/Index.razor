@@ -32,6 +32,7 @@
         <!-- DINOv2 Section -->
         <div class="panel-section">
             <h2 class="section-title">DINOv2 Search</h2>
+            <p class="search-warning">Fine-grained visual search. May take 30-60 seconds with verification.</p>
 
             <!-- Verify Checkbox -->
             <div class="form-group checkbox-group">
@@ -64,6 +65,10 @@
 
                 <InputFile OnChange="HandleDinoFileSelected" accept="image/*" class="file-input" />
             </div>
+            <button class="search-btn dino-search-btn" @onclick="PerformDinoImageSearch"
+                    disabled="@(dinoFileBytes == null || dinoFileBytes.Length == 0 || isSearching)">
+                Search with DINOv2
+            </button>
         </div>
 
         <!-- CLIP Section -->
@@ -112,6 +117,10 @@
 
                 <InputFile OnChange="HandleClipFileSelected" accept="image/*" class="file-input" />
             </div>
+            <button class="search-btn clip-search-btn" @onclick="PerformClipImageSearch"
+                    disabled="@(clipFileBytes == null || clipFileBytes.Length == 0 || isSearching)">
+                Search with CLIP
+            </button>
         </div>
 
         <!-- Face Search Section -->
@@ -242,7 +251,11 @@
         {
             <div class="loading-container">
                 <div class="spinner"></div>
-                <p>Searching...</p>
+                <p>@searchProgressMessage</p>
+                @if (lastSearchType == "DINOv2 Visual")
+                {
+                    <p class="search-progress-hint">This may take 30-60 seconds...</p>
+                }
             </div>
         }
         else if (!results.Any() && hasSearched)
@@ -376,6 +389,44 @@
     .search-btn:disabled {
         background: #9ca3af;
         cursor: not-allowed;
+    }
+
+    .dino-search-btn, .clip-search-btn {
+        width: 100%;
+        margin-top: 10px;
+        padding: 10px 16px;
+    }
+
+    .dino-search-btn {
+        background: linear-gradient(135deg, #8b5cf6, #6d28d9);
+    }
+
+    .dino-search-btn:hover:not(:disabled) {
+        background: linear-gradient(135deg, #7c3aed, #5b21b6);
+    }
+
+    .clip-search-btn {
+        background: linear-gradient(135deg, #3b82f6, #2563eb);
+    }
+
+    .clip-search-btn:hover:not(:disabled) {
+        background: linear-gradient(135deg, #2563eb, #1d4ed8);
+    }
+
+    .search-warning {
+        font-size: 0.75rem;
+        color: #f59e0b;
+        margin: 4px 0 8px 0;
+        padding: 4px 8px;
+        background: rgba(245, 158, 11, 0.1);
+        border-radius: 4px;
+        border-left: 2px solid #f59e0b;
+    }
+
+    .search-progress-hint {
+        font-size: 0.85rem;
+        color: #9ca3af;
+        margin-top: 8px;
     }
 
     .divider-text {
@@ -764,6 +815,7 @@
     private StatsResponse? stats;
     private ClipStatsResponse? clipStats;
     private string? errorMessage;
+    private string searchProgressMessage = "Searching...";
     private bool isSearching = false;
     private bool hasSearched = false;
     private bool isDragging = false;
@@ -868,6 +920,9 @@
         lastSearchType = selectedCollection == "all"
             ? $"Text (All): \"{textQuery}\""
             : $"Text: \"{textQuery}\"";
+        searchProgressMessage = selectedCollection == "all"
+            ? "Searching all collections with CLIP..."
+            : "Searching with CLIP...";
         StateHasChanged();
 
         try
@@ -896,8 +951,8 @@
         clipFileBytes = ms.ToArray();
 
         clipPreviewUrl = $"data:{clipSelectedFile.ContentType};base64,{Convert.ToBase64String(clipFileBytes)}";
-
-        await PerformClipImageSearch();
+        StateHasChanged();
+        // Don't auto-search - wait for user to click Search button
     }
 
     private async Task HandleDinoFileSelected(InputFileChangeEventArgs e)
@@ -909,8 +964,8 @@
         dinoFileBytes = ms.ToArray();
 
         dinoPreviewUrl = $"data:{dinoSelectedFile.ContentType};base64,{Convert.ToBase64String(dinoFileBytes)}";
-
-        await PerformDinoImageSearch();
+        StateHasChanged();
+        // Don't auto-search - wait for user to click Search button
     }
 
     private async Task PerformClipImageSearch()
@@ -921,6 +976,9 @@
         hasSearched = true;
         errorMessage = null;
         lastSearchType = selectedCollection == "all" ? "CLIP Visual (All)" : "CLIP Visual";
+        searchProgressMessage = selectedCollection == "all"
+            ? "Searching all collections with CLIP..."
+            : "Searching with CLIP...";
         StateHasChanged();
 
         try
@@ -958,6 +1016,9 @@
         hasSearched = true;
         errorMessage = null;
         lastSearchType = "DINOv2 Visual";
+        searchProgressMessage = verify
+            ? "Searching with DINOv2 + geometric verification..."
+            : "Searching with DINOv2...";
         StateHasChanged();
 
         try
