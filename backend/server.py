@@ -13,8 +13,12 @@ import logging
 import time
 from typing import List, Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -42,8 +46,20 @@ CLIP_PATHS_PATH = os.environ.get("CLIP_PATHS_PATH", "D:/faiss/books/paths.json")
 UPLOAD_DIR = "temp_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Collections that use OpenSearch for visual search (more robust than ChromaDB)
-OPENSEARCH_VISUAL_COLLECTIONS = {"books"}
+# Global progress tracking for long-running searches
+search_progress = {
+    "stage": "idle",  # idle, searching, loading_cache, verifying, complete
+    "message": "",
+    "current": 0,
+    "total": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "rate": 0.0,
+    "eta_seconds": 0
+}
+
+# Collections that use OpenSearch for visual search
+OPENSEARCH_VISUAL_COLLECTIONS = {"books", "print_ads", "board_games"}
 
 
 def get_searcher():
@@ -115,38 +131,63 @@ class HealthResponse(BaseModel):
     status: str
     searcher_loaded: bool
     db_path: str
+    lightglue_ready: bool = False
+    disk_cache_ready: bool = False
+
+
+class SearchProgressResponse(BaseModel):
+    stage: str
+    message: str
+    current: int
+    total: int
+    cache_hits: int
+    cache_misses: int
+    rate: float
+    eta_seconds: int
 
 
 @app.get("/health", response_model=HealthResponse)
 def health_check():
     """Check if the API is healthy."""
+    lightglue_ready = False
+    disk_cache_ready = False
+    if searcher is not None:
+        lightglue_ready = searcher.extractor is not None and searcher.matcher is not None
+        disk_cache_ready = searcher.disk_file_cache is not None or searcher.disk_cache is not None
     return HealthResponse(
         status="ok",
         searcher_loaded=searcher is not None,
-        db_path=DB_PATH
+        db_path=DB_PATH,
+        lightglue_ready=lightglue_ready,
+        disk_cache_ready=disk_cache_ready
     )
+
+
+@app.get("/search/progress", response_model=SearchProgressResponse)
+def get_search_progress():
+    """Get current search progress for long-running verification."""
+    return SearchProgressResponse(**search_progress)
 
 
 @app.get("/stats", response_model=StatsResponse)
 def get_stats(collection: str = "books"):
     """Get statistics for a collection."""
     try:
+        # "all" doesn't have stats - just return zeros
+        if collection == "all":
+            return StatsResponse(visual_count=0, face_count=0)
+
         if collection in OPENSEARCH_VISUAL_COLLECTIONS:
             # Use OpenSearch for stats
             os_searcher = get_opensearch_visual_searcher()
-            counts = os_searcher.get_counts()
+            counts = os_searcher.get_counts(collection)
             return StatsResponse(
                 visual_count=counts.get("visual", 0),
                 face_count=counts.get("faces", 0)
             )
         else:
-            # Fallback to ChromaDB
-            s = get_searcher()
-            stats = s.get_collection_stats(collection)
-            return StatsResponse(
-                visual_count=stats["visual_count"],
-                face_count=stats["face_count"]
-            )
+            # Return zeros for unknown collections
+            return StatsResponse(visual_count=0, face_count=0)
     except Exception as e:
         logger.error(f"Failed to get stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -195,31 +236,62 @@ async def search_image(
 
         logger.info(f"Searching with query: {temp_path} (OpenSearch: {use_opensearch})")
 
+        # Progress callback for updating global state
+        def update_progress(stage, message, current, total, cache_hits, cache_misses, rate, eta):
+            global search_progress
+            search_progress = {
+                "stage": stage,
+                "message": message,
+                "current": current,
+                "total": total,
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "rate": round(rate, 1),
+                "eta_seconds": eta
+            }
+
         if use_opensearch:
             # Use OpenSearch for visual search
             os_searcher = get_opensearch_visual_searcher()
             if verify:
+                # Reset progress
+                update_progress("searching", f"Searching {collection} with DINOv2...", 0, 0, 0, 0, 0, 0)
+
                 # When verifying, fetch MANY more candidates from OpenSearch
                 # Crops have low global similarity but high keypoint matches
                 # Need large pool for LightGlue to find the right page
                 fetch_k = 5000
-                matches = os_searcher.search(temp_path, top_k=fetch_k)
+                matches = os_searcher.search(temp_path, top_k=fetch_k, collection=collection)
+
+                update_progress("searching", f"Found {len(matches)} candidates", len(matches), len(matches), 0, 0, 0, 0)
 
                 # Debug: Show where encyclopedia of monsters page210 appears in initial ranking
                 for idx, m in enumerate(matches):
-                    if 'encyclopedia' in m['path'].lower() and 'page210' in m['path'].lower():
-                        logger.info(f"DEBUG: encyclopedia page210 found at initial rank {idx+1} with score {m['score']:.4f}")
+                    if 'monsters' in m['path'].lower() and 'page210' in m['path'].lower():
+                        logger.info(f"DEBUG: encyclopedia of monsters page210 found at initial rank {idx+1} with score {m['score']:.4f}")
                         logger.info(f"DEBUG: path = {m['path']}")
+                        break  # Only show the first match
 
-                # Use DinoSearcher's geometric verification
+                # Show progress during model loading (can take a while on first search)
+                update_progress("loading_models", "Loading DINOv2 + DISK + LightGlue models...", 0, len(matches), 0, 0, 0, 0)
+
+                # Use DinoSearcher's geometric verification with progress callback
+                # require_verification=True ensures search fails if LightGlue is not available
                 dino_searcher = get_searcher()
-                matches = dino_searcher._verify_matches(temp_path, matches)
+                matches = dino_searcher._verify_matches(
+                    temp_path, matches,
+                    progress_callback=update_progress,
+                    require_verification=True  # Fail loudly if verification not available
+                )
                 matches.sort(key=lambda x: (x['verified_matches'], x['score']), reverse=True)
                 matches = matches[:top_k]
+
+                # Reset progress to idle
+                update_progress("idle", "", 0, 0, 0, 0, 0, 0)
             else:
-                matches = os_searcher.search(temp_path, top_k=top_k)
+                matches = os_searcher.search(temp_path, top_k=top_k, collection=collection)
         else:
-            # Use ChromaDB for visual search
+            # Collection not in OpenSearch - return error
             s = get_searcher()
             if s is None:
                 raise HTTPException(status_code=503, detail="Searcher not initialized")
@@ -350,10 +422,10 @@ async def deep_search_image(
         clip_results = cs.search_by_image(temp_path, top_k=retrieval_k)
         logger.info(f"  CLIP: got {len(clip_results)} results")
 
-        # 2. DINOv2/OpenSearch retrieval
+        # 2. DINOv2/OpenSearch retrieval (uses books collection by default)
         logger.info(f"  DINOv2: fetching {retrieval_k} candidates...")
         os_searcher = get_opensearch_visual_searcher()
-        dino_results = os_searcher.search(temp_path, top_k=retrieval_k)
+        dino_results = os_searcher.search(temp_path, top_k=retrieval_k, collection="books")
         logger.info(f"  DINOv2: got {len(dino_results)} results")
 
         # 3. Merge results (union by path)
@@ -495,7 +567,7 @@ async def search_faces(
 
         if use_opensearch:
             os_searcher = get_opensearch_visual_searcher()
-            matches = os_searcher.search_faces_by_bytes(image_bytes, top_k=top_k)
+            matches = os_searcher.search_faces_by_bytes(image_bytes, top_k=top_k, collection=collection)
         else:
             s = get_searcher()
             if s is None:
@@ -659,9 +731,11 @@ async def clip_search_image(
 
         results = []
         for m in matches:
+            # Use combined_score if available (reranked), otherwise use CLIP score
+            score = m.get('combined_score', m['score'])
             results.append(SearchResult(
                 path=m['path'],
-                score=m['score'],
+                score=score,
                 verified_matches=m.get('keypoint_matches', m.get('verified_matches', 0)),
                 metadata=m.get('metadata', {})
             ))
@@ -902,6 +976,111 @@ async def clip_text_search_get(
 
     except Exception as e:
         logger.error(f"CLIP text search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== DISK Search Endpoints ==============
+
+@app.post("/disk/search", response_model=List[SearchResult])
+async def disk_search_image(
+    file: UploadFile = File(...),
+    top_k: int = Query(default=50, ge=1, le=500),
+    k: int = Query(default=5, ge=1, le=20, description="Nearest neighbors per keypoint"),
+    threshold: float = Query(default=0.7, ge=0.0, le=1.0, description="Minimum similarity for voting"),
+    live_tracking: bool = Query(default=True, description="Enable live progress tracking"),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Search for source pages using DISK keypoint matching with live progress.
+
+    Best for finding the source of cropped images. Shows live progress as
+    chunks are searched with top 100 results updating in real-time.
+
+    - **file**: Query image (cropped image to find source of)
+    - **top_k**: Number of results to return (1-500)
+    - **k**: Nearest neighbors per keypoint for voting
+    - **threshold**: Minimum similarity score to count as vote
+    - **live_tracking**: Enable live progress updates (default: true)
+    """
+    start_time = time.time()
+    search_id = None
+
+    try:
+        from disk_searcher import search_disk, search_chunks, extract_disk_features
+        from db_helper import create_search_session, update_search_progress, complete_search_session
+        from glob import glob
+
+        image_bytes = await file.read()
+        image_filename = file.filename
+
+        logger.info(f"DISK search: {len(image_bytes)} bytes, top_k={top_k}, live_tracking={live_tracking}")
+
+        # Create search session for live tracking
+        if live_tracking:
+            # Count total chunks for progress tracking
+            chunk_files = sorted(glob(os.path.join("T:/faiss/disk_retrieval/chunks", "chunk_*.faiss")))
+            total_chunks = len(chunk_files)
+
+            search_id = create_search_session(
+                search_type="DISK Keypoint",
+                query_image=image_bytes,
+                query_image_name=image_filename,
+                collection="books",
+                total_chunks=total_chunks
+            )
+            logger.info(f"Created search session #{search_id} with {total_chunks} chunks")
+
+            # Progress callback for live updates
+            def progress_callback(current_chunk, total_chunks, top_results, elapsed_ms):
+                try:
+                    update_search_progress(search_id, current_chunk, total_chunks, top_results, elapsed_ms)
+                except Exception as e:
+                    logger.error(f"Failed to update search progress: {e}")
+
+            # Run search with live tracking
+            matches = search_disk(
+                image_bytes,
+                top_k=top_k,
+                k=k,
+                threshold=threshold,
+                progress_callback=progress_callback
+            )
+        else:
+            # Run search without tracking
+            matches = search_disk(image_bytes, top_k=top_k, k=k, threshold=threshold)
+
+        results = []
+        for m in matches:
+            results.append(SearchResult(
+                path=m['path'],
+                score=m['score'],
+                verified_matches=m['votes'],
+                metadata={'votes': m['votes']}
+            ))
+
+        # Complete search session
+        duration_ms = int((time.time() - start_time) * 1000)
+        if live_tracking and search_id:
+            complete_search_session(search_id, duration_ms)
+        elif not live_tracking and background_tasks:
+            # Save to history in background (legacy mode)
+            history_results = [{'path': m['path'], 'score': m['score'], 'votes': m['votes']} for m in matches]
+            background_tasks.add_task(
+                save_search_to_history,
+                search_type="DISK Keypoint",
+                results=history_results,
+                search_duration_ms=duration_ms,
+                query_image=image_bytes,
+                query_image_name=image_filename
+            )
+
+        logger.info(f"DISK search completed in {duration_ms}ms, found {len(results)} results")
+        return results
+
+    except Exception as e:
+        logger.error(f"DISK search failed: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
