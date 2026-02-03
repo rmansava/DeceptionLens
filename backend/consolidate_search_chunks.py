@@ -487,6 +487,14 @@ def main():
             save_state(chunk_num + 1, processed_books)
             print(f"    State saved: {len(processed_books):,} books processed")
 
+            # Update the books file if we're using one (remove processed books)
+            if args.books_file:
+                remaining_in_file = [b for b in book_dirs if b not in processed_books]
+                with open(args.books_file, 'w', encoding='utf-8') as f:
+                    for book in sorted(remaining_in_file):
+                        f.write(f"{book}\n")
+                print(f"    Book list updated: {len(remaining_in_file):,} books remaining")
+
             # Reset for next chunk
             del current_vectors
             gc.collect()
@@ -539,6 +547,14 @@ def main():
         processed_books.update(books_in_current_chunk)
         save_state(chunk_num + 1, processed_books)
         print(f"    State saved: {len(processed_books):,} books processed")
+
+        # Update the books file if we're using one (remove processed books)
+        if args.books_file:
+            remaining_in_file = [b for b in book_dirs if b not in processed_books]
+            with open(args.books_file, 'w', encoding='utf-8') as f:
+                for book in sorted(remaining_in_file):
+                    f.write(f"{book}\n")
+            print(f"    Book list updated: {len(remaining_in_file):,} books remaining")
 
     # Cleanup
     clear_local_buffer()
