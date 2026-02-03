@@ -505,10 +505,13 @@ def main():
             remaining = remaining_books - books_processed
             eta = remaining / rate / 60 if rate > 0 else 0
 
-            # Show total progress including previously processed books
-            overall_done = len(processed_books) + books_processed
+            # Show batch progress and total progress separately
+            batch_done = books_processed
+            batch_total = remaining_books
+            total_done = len(processed_books) + books_processed
 
-            print(f"    Progress: {overall_done:,}/{total_books:,} books | "
+            print(f"    Progress: Batch {batch_done:,}/{batch_total:,} | "
+                  f"Total {total_done:,} books | "
                   f"{total_vectors:,} vectors | "
                   f"Chunk {chunk_num} | "
                   f"Buffer: {status['ready']} ready | "
