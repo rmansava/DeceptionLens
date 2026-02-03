@@ -31,6 +31,135 @@ def get_connection() -> pyodbc.Connection:
     return pyodbc.connect(get_connection_string())
 
 
+def create_search_session(
+    search_type: str,
+    query_image: Optional[bytes] = None,
+    query_image_name: Optional[str] = None,
+    query_text: Optional[str] = None,
+    collection: Optional[str] = None,
+    total_chunks: Optional[int] = None
+) -> int:
+    """
+    Create a new search session (for live tracking).
+
+    Returns the search ID that can be updated as search progresses.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            INSERT INTO ImageSearchHistory (
+                SearchType, QueryText, QueryImage, QueryImageName,
+                ResultCount, SearchDurationMs, Collection, Status, CurrentProgress, TotalChunks
+            )
+            OUTPUT INSERTED.Id
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            search_type,
+            query_text,
+            query_image,
+            query_image_name,
+            0,  # Will be updated as we search
+            None,  # Duration not known yet
+            collection,
+            'in_progress',
+            'Starting...',
+            total_chunks
+        ))
+
+        row = cursor.fetchone()
+        search_id = row[0]
+        conn.commit()
+        logger.info(f"Created search session #{search_id}")
+        return search_id
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to create search session: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def update_search_progress(
+    search_id: int,
+    current_chunk: int,
+    total_chunks: int,
+    top_results: List[Dict[str, Any]],
+    elapsed_ms: Optional[int] = None
+):
+    """Update search progress with current top results."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        # Update search history
+        progress_text = f"Searching chunk {current_chunk}/{total_chunks}"
+        cursor.execute("""
+            UPDATE ImageSearchHistory
+            SET CurrentProgress = ?,
+                ResultCount = ?,
+                SearchDurationMs = ?
+            WHERE Id = ?
+        """, (progress_text, len(top_results), elapsed_ms, search_id))
+
+        # Delete old results and insert new ones
+        cursor.execute("DELETE FROM ImageSearchResults WHERE SearchHistoryId = ?", (search_id,))
+
+        for rank, result in enumerate(top_results[:100], 1):  # Top 100
+            cursor.execute("""
+                INSERT INTO ImageSearchResults (
+                    SearchHistoryId, Rank, ImagePath, Score,
+                    VerifiedMatches, KeypointMatches, TemplateScore, CombinedScore
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                search_id,
+                rank,
+                result.get('path', ''),
+                result.get('score', 0.0),
+                result.get('verified_matches', result.get('votes', None)),
+                result.get('keypoint_matches', None),
+                result.get('template_score', None),
+                result.get('combined_score', None)
+            ))
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to update search progress: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def complete_search_session(search_id: int, duration_ms: int):
+    """Mark search as completed."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            UPDATE ImageSearchHistory
+            SET Status = 'completed',
+                CurrentProgress = 'Complete',
+                SearchDurationMs = ?
+            WHERE Id = ?
+        """, (duration_ms, search_id))
+        conn.commit()
+        logger.info(f"Completed search session #{search_id}")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to complete search session: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
 def save_search_history(
     search_type: str,
     query_image: Optional[bytes] = None,
