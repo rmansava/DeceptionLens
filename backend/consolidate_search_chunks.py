@@ -346,6 +346,7 @@ def main():
     parser = argparse.ArgumentParser(description='Consolidate per-book FAISS indexes into chunks')
     parser.add_argument('--books-file', type=str, help='File containing list of books to process (one per line)')
     args = parser.parse_args()
+    using_books_file = args.books_file is not None
 
     # Get all book indexes from NAS (or from file if specified)
     if args.books_file:
@@ -505,17 +506,25 @@ def main():
             remaining = remaining_books - books_processed
             eta = remaining / rate / 60 if rate > 0 else 0
 
-            # Show batch progress and total progress separately
-            batch_done = books_processed
-            batch_total = remaining_books
-            total_done = len(processed_books) + books_processed
-
-            print(f"    Progress: Batch {batch_done:,}/{batch_total:,} | "
-                  f"Total {total_done:,} books | "
-                  f"{total_vectors:,} vectors | "
-                  f"Chunk {chunk_num} | "
-                  f"Buffer: {status['ready']} ready | "
-                  f"ETA: {eta:.0f}m")
+            # Show progress - simple when using books file, detailed otherwise
+            if using_books_file:
+                # Just show progress through the book list
+                print(f"    Progress: {books_processed:,}/{remaining_books:,} books | "
+                      f"{total_vectors:,} vectors | "
+                      f"Chunk {chunk_num} | "
+                      f"Buffer: {status['ready']} ready | "
+                      f"ETA: {eta:.0f}m")
+            else:
+                # Show batch and total when scanning all books
+                batch_done = books_processed
+                batch_total = remaining_books
+                total_done = len(processed_books) + books_processed
+                print(f"    Progress: Batch {batch_done:,}/{batch_total:,} | "
+                      f"Total {total_done:,} books | "
+                      f"{total_vectors:,} vectors | "
+                      f"Chunk {chunk_num} | "
+                      f"Buffer: {status['ready']} ready | "
+                      f"ETA: {eta:.0f}m")
             last_status_time = time.time()
 
     # Stop background copying
