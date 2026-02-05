@@ -136,10 +136,17 @@ def is_blank_page(img_gray: np.ndarray, threshold: int = 30) -> bool:
 
 
 def load_image_gray(path: str) -> Optional[np.ndarray]:
-    """Load image as grayscale, return None if failed."""
+    """Load image as grayscale, return None if failed.
+
+    Uses imdecode instead of imread to handle non-ASCII paths on Windows.
+    cv2.imread fails with special characters like smart quotes (U+2019).
+    """
     try:
         normalized = normalize_path(path)
-        img = cv2.imread(normalized)
+        # Use imdecode to handle non-ASCII paths
+        with open(normalized, 'rb') as f:
+            data = f.read()
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return None
         return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)

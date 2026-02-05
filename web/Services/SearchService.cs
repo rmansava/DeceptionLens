@@ -252,6 +252,38 @@ public class SearchService : ISearchService
         }
     }
 
+    public async Task<List<SearchResult>> DiskSearchAsync(
+        Stream imageStream,
+        string fileName,
+        int topK = 50)
+    {
+        try
+        {
+            using var content = new MultipartFormDataContent();
+            using var streamContent = new StreamContent(imageStream);
+            streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+            content.Add(streamContent, "file", fileName);
+
+            var url = $"/disk/search?top_k={topK}";
+
+            _logger.LogInformation("DISK search: {FileName}, topK: {TopK}", fileName, topK);
+
+            var response = await _httpClient.PostAsync(url, content);
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            var results = JsonSerializer.Deserialize<List<SearchResult>>(json) ?? new List<SearchResult>();
+
+            _logger.LogInformation("DISK search found {Count} results", results.Count);
+            return results;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "DISK search failed");
+            throw;
+        }
+    }
+
     public async Task<byte[]?> GetVisualizationAsync(
         Stream queryImageStream,
         string fileName,
@@ -312,6 +344,23 @@ public class SearchService : ISearchService
         {
             _logger.LogError(ex, "Deep search failed");
             throw;
+        }
+    }
+
+    public async Task<SearchProgressResponse?> GetSearchProgressAsync()
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync("/search/progress");
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<SearchProgressResponse>(json);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get search progress");
+            return null;
         }
     }
 

@@ -43,14 +43,40 @@
 - **Output**: `D:/faiss/disk_retrieval/unprocessed_books.txt` (2,213 books)
 - **Coverage**: 69.4% indexed (4,735 / 6,820 books)
 
+### 8. Compact ID Conversion (paths.json → compact IDs)
+- **Problem**: 606 paths.json files = 3.3 TB (same path string repeated per keypoint, ~11,206x redundancy)
+- **Solution**: Convert to int32 numpy arrays + global path_lookup.json
+- **Result**: 3.3 TB → ~95 GB (35x smaller), loads in 0.1s vs multi-GB JSON from NAS
+- **Script**: `convert_paths_to_ids.py` + `run_convert_paths.bat`
+- **Output**: `D:/faiss/disk_retrieval/chunk_ids/chunk_XXX_ids.npy` + `path_lookup.json`
+- **Time**: 12.3 hours for 605 chunks, 2,886,439 unique paths
+
+### 9. Re-tested DISK Search with Compact IDs (2026-02-05)
+- **Test Image**: `temp_uploads/ec4a14d7-9d4f-4c32-bdbe-72b9e3f0b058.jpg` (T-Rex dinosaur crop)
+- **Target**: Encyclopedia of Monsters, page 206
+- **Chunks searched**: 140, 141, 142, 143, 144
+- **Result**: **FOUND with 145 votes!** (top result, same as original test)
+- **Chunk containing the book**: 142 (44,502,894 vectors)
+- **path_lookup.json**: loaded once in 1.5s (441 MB, 2.9M paths), cached for subsequent chunks
+- **Per-chunk ID load**: 0.1s (vs minutes for NAS paths.json before)
+- **Time**: 18.1 minutes for 5 chunks (mostly NAS→SSD copy, not path loading)
+- **Backward compatible**: `load_chunk_paths()` tries IDs first, falls back to NAS paths.json
+
+### 10. Search Queue System
+- **Script**: `disk_queue.py` - ensures only 1 DISK search runs at a time
+- **Integration**: FastAPI lifespan in `server.py`, `/disk/queue` status endpoint
+- **Purpose**: Prevents GPU OOM and SSD overflow from concurrent searches
+
 ## Current Index Stats
 
-**Chunk Index:**
-- Total chunks: 441
-- Indexed books: 4,735
-- Total vectors: ~19.6 billion (441 chunks × ~44.5M avg)
-- Index size: ~9.7 TB (441 chunks × ~22GB avg)
-- Unprocessed books: 2,213 (31%)
+**Chunk Index (Books):**
+- Total chunks: 606
+- Indexed books: ~4,735+
+- Total keypoints: 23,599,882,172 (~23.6 billion)
+- Index size: ~13 TB (606 chunks × ~22GB avg)
+- Compact IDs: ~95 GB on local SSD (D:/faiss/disk_retrieval/chunk_ids/)
+- Unique paths: 2,886,439
+- path_lookup.json: 441 MB
 
 **Book-to-Chunks Mapping:**
 - File: `D:/faiss/disk_retrieval/book_to_chunks.json`
@@ -116,7 +142,8 @@ python disk_searcher.py "D:\trivpics\2023-5.jpg" "100,150,200"
 ## File Locations
 
 **Scripts:**
-- `disk_searcher.py` - Main DISK search (command-line)
+- `disk_searcher.py` - Main DISK search (command-line, no history saving)
+- `test_disk_api.py` - DISK search via API (saves to search history + live tracking)
 - `find_unprocessed_books.py` - Find books to index
 - `build_chunk_index.py` - Build book↔chunk mapping
 
@@ -146,14 +173,29 @@ python disk_searcher.py "D:\trivpics\2023-5.jpg" "100,150,200"
 
 ## Usage Examples
 
-### Search Specific Chunks
-```python
-# Search only chunks containing a specific book
-python -c "import json; data = json.load(open('D:/faiss/disk_retrieval/book_to_chunks.json')); print(','.join(data['Encyclopedia Of Monsters, The (ISBN 0816023034)']))"
-# Output: 142
-
-python disk_searcher.py "D:\trivpics\2023-5.jpg" 142
+### Search via CLI (no history)
+```bash
+# Search specific chunks from command line (results printed, NOT saved to DB)
+python disk_searcher.py "D:\trivpics\2023-5.jpg" 140,141,142,143,144
 ```
+
+### Search via API (saves to history + live tracking)
+```bash
+# Uses test_disk_api.py - hits /disk/search endpoint, saves results to search history
+python test_disk_api.py
+
+# Or use curl directly with chunk_ids parameter:
+curl -X POST "http://localhost:8000/disk/search?top_k=10&chunk_ids=140,141,142,143,144&live_tracking=true" \
+  -F "file=@D:\trivpics\2023-5.jpg"
+```
+
+**API endpoint**: `POST /disk/search`
+- `chunk_ids` (optional): Comma-separated chunk numbers, e.g. `140,141,142,143,144`
+- `top_k`: Number of results (default 50)
+- `k`: Nearest neighbors per keypoint (default 5)
+- `threshold`: Minimum similarity for voting (default 0.7)
+- `live_tracking`: Enable live progress in DB (default true)
+- Without `chunk_ids`, searches ALL 606 chunks (~8 days at current network speed)
 
 ### Find Which Chunks Contain a Book
 ```python
@@ -163,14 +205,13 @@ with open('D:/faiss/disk_retrieval/book_to_chunks.json') as f:
 
 chunks = book_to_chunks.get('Encyclopedia Of Monsters, The (ISBN 0816023034)', [])
 print(f"Book is in chunks: {chunks}")
+# Output: [142]
 ```
 
-### Monitor Search Progress (Future)
-```python
-# In web UI - will show:
-# "Searching chunk 142/441 (32%) - ETA: 3.2 hours"
-# Top 100 results updating live as chunks are searched
-```
+### Test Images
+- **T-Rex dinosaur crop**: `D:\trivpics\2023-5.jpg` or `temp_uploads/ec4a14d7-9d4f-4c32-bdbe-72b9e3f0b058.jpg`
+  - Target: Encyclopedia of Monsters, page 206
+  - Expected: 145 votes (top result), found in chunk 142
 
 ## Success Metrics
 

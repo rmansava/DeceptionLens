@@ -12,6 +12,7 @@ import uuid
 import logging
 import time
 from typing import List, Optional
+from contextlib import asynccontextmanager
 
 # Configure logging with timestamps
 logging.basicConfig(
@@ -21,10 +22,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: startup and shutdown events."""
+    # Startup: Initialize DISK search queue
+    from disk_queue import initialize_disk_queue
+    logger.info("Initializing DISK search queue...")
+    await initialize_disk_queue()
+    logger.info("DISK search queue initialized")
+
+    yield
+
+    # Shutdown: Stop the queue
+    from disk_queue import get_disk_queue
+    queue = get_disk_queue()
+    await queue.stop()
+    logger.info("DISK search queue stopped")
+
+
 app = FastAPI(
     title="Deception Lens API",
     description="Visual similarity search using CLIP and DINOv2",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Enable CORS for Blazor frontend
@@ -988,6 +1009,7 @@ async def disk_search_image(
     k: int = Query(default=5, ge=1, le=20, description="Nearest neighbors per keypoint"),
     threshold: float = Query(default=0.7, ge=0.0, le=1.0, description="Minimum similarity for voting"),
     live_tracking: bool = Query(default=True, description="Enable live progress tracking"),
+    chunk_ids: str = Query(default=None, description="Comma-separated chunk IDs for testing (e.g. '141,142,143')"),
     background_tasks: BackgroundTasks = None
 ):
     """
@@ -996,30 +1018,45 @@ async def disk_search_image(
     Best for finding the source of cropped images. Shows live progress as
     chunks are searched with top 100 results updating in real-time.
 
+    IMPORTANT: Uses a queue to ensure only one search runs at a time.
+    Other requests will wait in queue to prevent GPU/memory issues.
+
     - **file**: Query image (cropped image to find source of)
     - **top_k**: Number of results to return (1-500)
     - **k**: Nearest neighbors per keypoint for voting
     - **threshold**: Minimum similarity score to count as vote
     - **live_tracking**: Enable live progress updates (default: true)
+    - **chunk_ids**: Comma-separated chunk IDs for testing (e.g. '141,142,143')
     """
     start_time = time.time()
     search_id = None
 
     try:
-        from disk_searcher import search_disk, search_chunks, extract_disk_features
-        from db_helper import create_search_session, update_search_progress, complete_search_session
+        from disk_searcher import search_disk
+        from db_helper import create_search_session, update_search_progress, complete_search_session, add_search_note
+        from disk_queue import get_disk_queue
         from glob import glob
+        import asyncio
 
         image_bytes = await file.read()
         image_filename = file.filename
 
-        logger.info(f"DISK search: {len(image_bytes)} bytes, top_k={top_k}, live_tracking={live_tracking}")
+        # Parse chunk_ids if provided
+        specific_chunks = None
+        if chunk_ids:
+            specific_chunks = [int(x.strip()) for x in chunk_ids.split(',')]
+            logger.info(f"DISK search: {len(image_bytes)} bytes, top_k={top_k}, chunks={specific_chunks}, live_tracking={live_tracking}")
+        else:
+            logger.info(f"DISK search: {len(image_bytes)} bytes, top_k={top_k}, live_tracking={live_tracking}")
 
         # Create search session for live tracking
         if live_tracking:
             # Count total chunks for progress tracking
-            chunk_files = sorted(glob(os.path.join("T:/faiss/disk_retrieval/chunks", "chunk_*.faiss")))
-            total_chunks = len(chunk_files)
+            if specific_chunks:
+                total_chunks = len(specific_chunks)
+            else:
+                chunk_files = sorted(glob(os.path.join("T:/faiss/disk_retrieval/chunks", "chunk_*.faiss")))
+                total_chunks = len(chunk_files)
 
             search_id = create_search_session(
                 search_type="DISK Keypoint",
@@ -1030,25 +1067,67 @@ async def disk_search_image(
             )
             logger.info(f"Created search session #{search_id} with {total_chunks} chunks")
 
-            # Progress callback for live updates
-            def progress_callback(current_chunk, total_chunks, top_results, elapsed_ms):
+        # Progress callback for live updates
+        def progress_callback(current_chunk, total_chunks, top_results, elapsed_ms):
+            if live_tracking and search_id:
                 try:
                     update_search_progress(search_id, current_chunk, total_chunks, top_results, elapsed_ms)
                 except Exception as e:
                     logger.error(f"Failed to update search progress: {e}")
 
-            # Run search with live tracking
-            matches = search_disk(
+        # Define the search function to be executed
+        def run_search(image_bytes, top_k, k, threshold, specific_chunks, progress_callback):
+            return search_disk(
                 image_bytes,
                 top_k=top_k,
                 k=k,
                 threshold=threshold,
+                specific_chunks=specific_chunks,
                 progress_callback=progress_callback
             )
-        else:
-            # Run search without tracking
-            matches = search_disk(image_bytes, top_k=top_k, k=k, threshold=threshold)
 
+        # Add to queue
+        queue = get_disk_queue()
+        position = await queue.add_search(
+            search_id=search_id if search_id else 0,
+            image_bytes=image_bytes,
+            top_k=top_k,
+            k=k,
+            threshold=threshold,
+            specific_chunks=specific_chunks,
+            progress_callback=progress_callback,
+            search_function=run_search
+        )
+
+        if position > 1 and live_tracking and search_id:
+            # Update search note to show queue position
+            add_search_note(search_id, f"Waiting in queue (position: {position})")
+            logger.info(f"Search #{search_id} added to queue at position {position}")
+
+        # Poll for completion
+        logger.info(f"Waiting for search #{search_id} to complete...")
+        while True:
+            await asyncio.sleep(1)  # Check every second
+
+            status = await queue.get_status(search_id if search_id else 0)
+            if status:
+                if status['status'] == 'completed':
+                    matches = status['result']
+                    logger.info(f"Search #{search_id} completed from queue")
+                    break
+                elif status['status'] == 'failed':
+                    error_msg = status.get('error', 'Unknown error')
+                    logger.error(f"Search #{search_id} failed in queue: {error_msg}")
+                    raise HTTPException(status_code=500, detail=error_msg)
+                elif status['status'] == 'queued' and live_tracking and search_id:
+                    # Update queue position in notes
+                    queue_pos = status.get('position', 0)
+                    add_search_note(search_id, f"Waiting in queue (position: {queue_pos})")
+                elif status['status'] == 'running' and live_tracking and search_id:
+                    # Clear queue note once running
+                    add_search_note(search_id, "")
+
+        # Process results
         results = []
         for m in matches:
             results.append(SearchResult(
@@ -1081,6 +1160,28 @@ async def disk_search_image(
         logger.error(f"DISK search failed: {e}")
         import traceback
         traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/disk/queue")
+async def get_disk_queue_info():
+    """
+    Get information about the DISK search queue.
+
+    Returns:
+    - queue_length: Number of searches waiting
+    - current_search_id: ID of currently running search (null if none)
+    - completed_count: Number of completed searches in cache
+    """
+    try:
+        from disk_queue import get_disk_queue
+
+        queue = get_disk_queue()
+        info = await queue.get_queue_info()
+
+        return info
+    except Exception as e:
+        logger.error(f"Failed to get queue info: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

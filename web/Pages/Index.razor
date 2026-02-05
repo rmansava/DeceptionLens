@@ -29,18 +29,12 @@
             </div>
         </div>
 
-        <!-- DINOv2 Section -->
+        <!-- Keypoint Search Section (Exact Crop Matching) -->
         <div class="panel-section">
-            <h2 class="section-title">DINOv2 Search</h2>
-            <p class="search-warning">Fine-grained visual search. May take 30-60 seconds with verification.</p>
+            <h2 class="section-title">Keypoint Search</h2>
+            <p class="search-info">Find the source of cropped images.</p>
 
-            <!-- Verify Checkbox -->
-            <div class="form-group checkbox-group">
-                <input type="checkbox" @bind="verify" id="verifyCheck" />
-                <label for="verifyCheck">Geometric Verification</label>
-            </div>
-
-            <!-- DINOv2 Visual Search -->
+            <!-- Keypoint Visual Search -->
             <div class="upload-area @(isDragging ? "dragging" : "")"
                  @ondragenter="HandleDragEnter"
                  @ondragleave="HandleDragLeave"
@@ -48,10 +42,10 @@
                  @ondrop="HandleDrop"
                  @ondrop:preventDefault>
 
-                @if (dinoPreviewUrl != null)
+                @if (diskPreviewUrl != null)
                 {
-                    <img src="@dinoPreviewUrl" alt="DINOv2 Query" class="preview-image" />
-                    <button class="clear-btn" @onclick="ClearDinoQuery">Clear</button>
+                    <img src="@diskPreviewUrl" alt="Keypoint Query" class="preview-image" />
+                    <button class="clear-btn" @onclick="ClearDiskQuery">Clear</button>
                 }
                 else
                 {
@@ -59,21 +53,22 @@
                         <svg class="upload-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                         </svg>
-                        <p>Drop image here</p>
+                        <p>Drop cropped image here</p>
                     </div>
                 }
 
-                <InputFile OnChange="HandleDinoFileSelected" accept="image/*" class="file-input" />
+                <InputFile OnChange="HandleDiskFileSelected" accept="image/*" class="file-input" />
             </div>
-            <button class="search-btn dino-search-btn" @onclick="PerformDinoImageSearch"
-                    disabled="@(dinoFileBytes == null || dinoFileBytes.Length == 0 || isSearching)">
-                Search with DINOv2
+            <button class="search-btn disk-search-btn" @onclick="PerformDiskImageSearch"
+                    disabled="@(diskFileBytes == null || diskFileBytes.Length == 0 || isSearching)">
+                Find Source Page
             </button>
         </div>
 
         <!-- CLIP Section -->
         <div class="panel-section">
             <h2 class="section-title">CLIP Search</h2>
+            <p class="search-info">Semantic lookup by text or image. Finds visually or conceptually similar content.</p>
 
             <!-- CLIP Text Search -->
             <div class="form-group">
@@ -126,6 +121,7 @@
         <!-- Face Search Section -->
         <div class="panel-section">
             <h2 class="section-title">Face Search</h2>
+            <p class="search-info">Find matching faces using ArcFace recognition. Upload a photo with a face to find similar faces.</p>
 
             <div class="upload-area @(isDragging ? "dragging" : "")"
                  @ondragenter="HandleDragEnter"
@@ -251,10 +247,29 @@
         {
             <div class="loading-container">
                 <div class="spinner"></div>
-                <p>@searchProgressMessage</p>
-                @if (lastSearchType == "DINOv2 Visual")
+                <p class="progress-main">@searchProgressMessage</p>
+                @if (lastSearchType == "DINOv2 Visual" && currentProgress != null)
                 {
-                    <p class="search-progress-hint">This may take 30-60 seconds...</p>
+                    <div class="progress-details">
+                        @if (currentProgress.Total > 0)
+                        {
+                            <div class="progress-bar-container">
+                                <div class="progress-bar" style="width: @(Math.Min(100, (currentProgress.Current * 100.0 / currentProgress.Total)))%"></div>
+                            </div>
+                        }
+                        @if (currentProgress.CacheHits > 0 || currentProgress.CacheMisses > 0)
+                        {
+                            <p class="progress-cache">Cache: @currentProgress.CacheHits hits, @currentProgress.CacheMisses misses</p>
+                        }
+                        @if (currentProgress.Rate > 0)
+                        {
+                            <p class="progress-rate">@currentProgress.Rate.ToString("F1")/s • ETA: @FormatEta(currentProgress.EtaSeconds)</p>
+                        }
+                    </div>
+                }
+                else if (lastSearchType == "DINOv2 Visual")
+                {
+                    <p class="search-progress-hint">This may take a long time...</p>
                 }
             </div>
         }
@@ -413,6 +428,17 @@
         background: linear-gradient(135deg, #2563eb, #1d4ed8);
     }
 
+    .disk-search-btn {
+        width: 100%;
+        margin-top: 10px;
+        padding: 10px 16px;
+        background: linear-gradient(135deg, #f59e0b, #d97706);
+    }
+
+    .disk-search-btn:hover:not(:disabled) {
+        background: linear-gradient(135deg, #d97706, #b45309);
+    }
+
     .search-warning {
         font-size: 0.75rem;
         color: #f59e0b;
@@ -427,6 +453,45 @@
         font-size: 0.85rem;
         color: #9ca3af;
         margin-top: 8px;
+    }
+
+    .progress-main {
+        font-size: 1rem;
+        color: #e5e7eb;
+        margin-bottom: 8px;
+    }
+
+    .progress-details {
+        margin-top: 12px;
+        padding: 12px;
+        background: rgba(55, 65, 81, 0.5);
+        border-radius: 8px;
+        min-width: 280px;
+    }
+
+    .progress-bar-container {
+        height: 6px;
+        background: #374151;
+        border-radius: 3px;
+        overflow: hidden;
+        margin-bottom: 10px;
+    }
+
+    .progress-bar {
+        height: 100%;
+        background: linear-gradient(90deg, #3b82f6, #60a5fa);
+        border-radius: 3px;
+        transition: width 0.3s ease;
+    }
+
+    .progress-cache, .progress-rate {
+        font-size: 0.8rem;
+        color: #9ca3af;
+        margin: 4px 0;
+    }
+
+    .progress-cache {
+        color: #f59e0b;
     }
 
     .divider-text {
@@ -816,6 +881,7 @@
     private ClipStatsResponse? clipStats;
     private string? errorMessage;
     private string searchProgressMessage = "Searching...";
+    private SearchProgressResponse? currentProgress;
     private bool isSearching = false;
     private bool hasSearched = false;
     private bool isDragging = false;
@@ -834,6 +900,11 @@
     private string? facePreviewUrl;
     private IBrowserFile? faceSelectedFile;
     private byte[]? faceFileBytes;
+
+    // DISK file state
+    private string? diskPreviewUrl;
+    private IBrowserFile? diskSelectedFile;
+    private byte[]? diskFileBytes;
 
     // History state
     private bool showHistoryPanel = false;
@@ -1021,6 +1092,14 @@
             : "Searching with DINOv2...";
         StateHasChanged();
 
+        // Start progress polling if verification is enabled
+        CancellationTokenSource? progressCts = null;
+        if (verify)
+        {
+            progressCts = new CancellationTokenSource();
+            _ = PollSearchProgressAsync(progressCts.Token);
+        }
+
         try
         {
             using var ms = new MemoryStream(dinoFileBytes);
@@ -1040,6 +1119,10 @@
         }
         finally
         {
+            // Stop progress polling
+            progressCts?.Cancel();
+            progressCts?.Dispose();
+
             isSearching = false;
             StateHasChanged();
         }
@@ -1057,6 +1140,59 @@
         dinoSelectedFile = null;
         dinoFileBytes = null;
         dinoPreviewUrl = null;
+    }
+
+    private async Task PollSearchProgressAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(500, cancellationToken); // Poll every 500ms
+
+                var progress = await SearchService.GetSearchProgressAsync();
+                if (progress != null && progress.Stage != "idle")
+                {
+                    currentProgress = progress;
+
+                    // Build progress message based on stage
+                    if (progress.Stage == "searching")
+                    {
+                        searchProgressMessage = progress.Message;
+                    }
+                    else if (progress.Stage == "loading_models")
+                    {
+                        searchProgressMessage = "Loading DISK + LightGlue models...";
+                    }
+                    else if (progress.Stage == "loading_cache")
+                    {
+                        searchProgressMessage = $"Loading cached features ({progress.CacheHits} cached, {progress.CacheMisses} to compute)...";
+                    }
+                    else if (progress.Stage == "verifying")
+                    {
+                        searchProgressMessage = $"Verifying {progress.Current}/{progress.Total} with LightGlue...";
+                    }
+                    else if (progress.Stage == "complete")
+                    {
+                        searchProgressMessage = progress.Message;
+                    }
+
+                    await InvokeAsync(StateHasChanged);
+                }
+                else
+                {
+                    currentProgress = null;
+                }
+            }
+        }
+        catch (TaskCanceledException)
+        {
+            // Expected when search completes
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Progress polling error");
+        }
     }
 
     private async Task HandleFaceFileSelected(InputFileChangeEventArgs e)
@@ -1124,6 +1260,64 @@
         faceSelectedFile = null;
         faceFileBytes = null;
         facePreviewUrl = null;
+    }
+
+    // DISK search handlers
+    private async Task HandleDiskFileSelected(InputFileChangeEventArgs e)
+    {
+        diskSelectedFile = e.File;
+
+        using var ms = new MemoryStream();
+        await diskSelectedFile.OpenReadStream(maxAllowedSize: 100 * 1024 * 1024).CopyToAsync(ms);
+        diskFileBytes = ms.ToArray();
+
+        diskPreviewUrl = $"data:{diskSelectedFile.ContentType};base64,{Convert.ToBase64String(diskFileBytes)}";
+        StateHasChanged();
+    }
+
+    private async Task PerformDiskImageSearch()
+    {
+        if (diskSelectedFile == null || diskFileBytes == null || diskFileBytes.Length == 0) return;
+
+        isSearching = true;
+        hasSearched = true;
+        errorMessage = null;
+        lastSearchType = "Keypoint";
+        searchProgressMessage = "Extracting keypoints and searching...";
+        StateHasChanged();
+
+        try
+        {
+            using var ms = new MemoryStream(diskFileBytes);
+            results = await SearchService.DiskSearchAsync(
+                ms,
+                diskSelectedFile.Name,
+                topK
+            );
+
+            if (results.Count == 0)
+            {
+                errorMessage = "No keypoint matches found";
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "DISK search failed");
+            errorMessage = $"DISK search failed: {ex.Message}";
+            results = new List<SearchResult>();
+        }
+        finally
+        {
+            isSearching = false;
+            StateHasChanged();
+        }
+    }
+
+    private void ClearDiskQuery()
+    {
+        diskSelectedFile = null;
+        diskFileBytes = null;
+        diskPreviewUrl = null;
     }
 
     private void HandleDragEnter() => isDragging = true;
@@ -1217,6 +1411,14 @@
         {
             await LoadHistoryEntries();
         }
+    }
+
+    private string FormatEta(int seconds)
+    {
+        if (seconds <= 0) return "calculating...";
+        if (seconds < 60) return $"{seconds}s";
+        if (seconds < 3600) return $"{seconds / 60}m {seconds % 60}s";
+        return $"{seconds / 3600}h {(seconds % 3600) / 60}m";
     }
 
     private async Task LoadHistoryEntries()

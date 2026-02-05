@@ -10,6 +10,11 @@ import numpy as np
 import cv2
 import os
 import time
+from datetime import datetime
+
+def tprint(msg):
+    """Print with timestamp."""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # Try importing Kornia for geometric verification (optional)
 try:
@@ -20,7 +25,7 @@ except ImportError:
     KF = None
     K = None
     KORNIA_AVAILABLE = False
-    print("Kornia not installed. Geometric verification will be disabled.")
+    tprint("Kornia not installed. Geometric verification will be disabled.")
 
 # Try importing DISK feature cache - SQL Server (optional)
 try:
@@ -42,7 +47,7 @@ except ImportError:
 
 DISK_CACHE_AVAILABLE = DISK_SQL_AVAILABLE or DISK_FILE_AVAILABLE
 if not DISK_CACHE_AVAILABLE:
-    print("DISK cache not available. Geometric verification will be slower.")
+    tprint("DISK cache not available. Geometric verification will be slower.")
 
 # Try importing InsightFace for face search (optional)
 try:
@@ -51,7 +56,7 @@ try:
 except ImportError:
     FaceAnalysis = None
     INSIGHTFACE_AVAILABLE = False
-    print("InsightFace not installed. Face search will be disabled.")
+    tprint("InsightFace not installed. Face search will be disabled.")
 
 
 def normalize_path(path: str) -> str:
@@ -91,26 +96,22 @@ class DinoSearcher:
     def __init__(self, db_path: str = None):
         # db_path kept for backwards compatibility but ignored
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Searcher using device: {self.device}")
+        tprint(f"Searcher using device: {self.device}")
 
-        # Initialize DINOv2
-        print("Loading DINOv2 model for search...")
-        self.processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base')
-        self.model = AutoModel.from_pretrained('facebook/dinov2-base').to(self.device)
-        self.model.eval()
-        print("DINOv2 loaded.")
+        # NOTE: DINOv2 removed - OpenSearch already has the embeddings
+        # This class now only handles geometric verification with DISK + LightGlue
 
-        # Initialize LightGlue for geometric verification (optional)
+        # Initialize DISK + LightGlue for geometric verification
         self.extractor = None
         self.matcher = None
         if KORNIA_AVAILABLE:
-            print("Loading DISK + LightGlue for geometric verification...")
+            tprint("Loading DISK + LightGlue for geometric verification...")
             try:
                 self.extractor = KF.DISK.from_pretrained('depth').to(self.device).eval()
                 self.matcher = KF.LightGlue(features='disk').to(self.device).eval()
-                print("DISK + LightGlue loaded.")
+                tprint("DISK + LightGlue loaded.")
             except Exception as e:
-                print(f"Failed to load DISK/LightGlue: {e}")
+                tprint(f"Failed to load DISK/LightGlue: {e}")
 
         # Initialize InsightFace for face search (optional, lazy-loaded)
         self.face_app = None
@@ -123,54 +124,27 @@ class DinoSearcher:
         # Try file-based cache first (preferred for NAS storage)
         if DISK_FILE_AVAILABLE:
             try:
-                # Production: T:\disk-features\books (NAS)
+                # DISK features stored on NAS, source images on D: drive
                 self.disk_file_cache = DiskFeatureFileStore(
                     category="books",
                     features_root=r"T:\disk-features",
-                    source_image_root=r"T:\archiverelated\books"
+                    source_image_root=r"D:\books\pdf-images"
                 )
-                print("DISK feature cache connected (file-based, NAS).")
+                tprint("DISK feature cache connected (file-based, NAS).")
             except Exception as e:
-                print(f"File-based DISK cache unavailable: {e}")
+                tprint(f"File-based DISK cache unavailable: {e}")
                 self.disk_file_cache = None
 
         # Try SQL Server cache as fallback
         if DISK_SQL_AVAILABLE and self.disk_file_cache is None:
             try:
                 self.disk_cache = DiskFeatureStore()
-                print("DISK feature cache connected (SQL Server).")
+                tprint("DISK feature cache connected (SQL Server).")
             except Exception as e:
-                print(f"SQL DISK cache unavailable: {e}")
+                tprint(f"SQL DISK cache unavailable: {e}")
                 self.disk_cache = None
 
-    def get_embedding(self, image_path: str) -> np.ndarray:
-        """Generate DINOv2 embedding for a query image."""
-        try:
-            image = Image.open(image_path).convert("RGB")
-            inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()[0]
-            return embedding
-        except Exception as e:
-            print(f"Error getting embedding for {image_path}: {e}")
-            return None
-
-    def get_embedding_from_bytes(self, image_bytes: bytes) -> np.ndarray:
-        """Generate DINOv2 embedding from image bytes."""
-        try:
-            from io import BytesIO
-            image = Image.open(BytesIO(image_bytes)).convert("RGB")
-            inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()[0]
-            return embedding
-        except Exception as e:
-            print(f"Error getting embedding from bytes: {e}")
-            return None
-
-    # NOTE: search() and search_by_bytes() removed - use OpenSearchSearcher instead
+    # NOTE: get_embedding methods removed - use OpenSearchSearcher instead
     # This class is now only used for geometric verification via _verify_matches()
 
     def _load_face_app(self):
@@ -179,22 +153,22 @@ class DinoSearcher:
             return self.face_app is not None
 
         if not INSIGHTFACE_AVAILABLE:
-            print("InsightFace not available for face search")
+            tprint("InsightFace not available for face search")
             self.face_app_loaded = True
             return False
 
         try:
-            print("Loading InsightFace for face search...")
+            tprint("Loading InsightFace for face search...")
             self.face_app = FaceAnalysis(
                 name='buffalo_l',
                 providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
             )
             self.face_app.prepare(ctx_id=0, det_size=(640, 640))
-            print("InsightFace loaded.")
+            tprint("InsightFace loaded.")
             self.face_app_loaded = True
             return True
         except Exception as e:
-            print(f"Failed to load InsightFace: {e}")
+            tprint(f"Failed to load InsightFace: {e}")
             self.face_app_loaded = True
             return False
 
@@ -216,7 +190,7 @@ class DinoSearcher:
             embeddings = [face.embedding for face in faces]
             return embeddings
         except Exception as e:
-            print(f"Error extracting faces from {image_path}: {e}")
+            tprint(f"Error extracting faces from {image_path}: {e}")
             return []
 
     def get_face_embedding_from_bytes(self, image_bytes: bytes) -> list:
@@ -234,7 +208,7 @@ class DinoSearcher:
             embeddings = [face.embedding for face in faces]
             return embeddings
         except Exception as e:
-            print(f"Error extracting faces from bytes: {e}")
+            tprint(f"Error extracting faces from bytes: {e}")
             return []
 
     # NOTE: search_faces() and search_faces_by_bytes() removed - use OpenSearchSearcher instead
@@ -272,21 +246,40 @@ class DinoSearcher:
         img = K.image_to_tensor(img, False).float() / 255.0
         return img.to(self.device)
 
-    def _verify_matches(self, query_path: str, matches: list) -> list:
+    def _verify_matches(self, query_path: str, matches: list, progress_callback=None, require_verification: bool = True) -> list:
         """
         Perform geometric verification using DISK + LightGlue.
         Uses SQL-cached features when available for ~10x speedup.
+
+        Args:
+            query_path: Path to query image
+            matches: List of match dicts from initial search
+            progress_callback: Optional callback(stage, message, current, total, cache_hits, cache_misses, rate, eta)
+            require_verification: If True, raise an exception if verification components not available
         """
         if not self.extractor or not self.matcher:
+            if require_verification:
+                raise RuntimeError(
+                    "LightGlue verification requested but not available. "
+                    f"extractor={self.extractor is not None}, matcher={self.matcher is not None}. "
+                    "Check that kornia is installed and DISK/LightGlue loaded successfully."
+                )
+            tprint("WARNING: Skipping verification - DISK/LightGlue not available")
             return matches
 
         query_img = self._load_torch_image(query_path)
         if query_img is None:
+            if require_verification:
+                raise RuntimeError(f"Failed to load query image for verification: {query_path}")
+            tprint(f"WARNING: Failed to load query image: {query_path}")
             return matches
 
         total = len(matches)
-        print(f"Verifying {total} candidates...")
+        tprint(f"Verifying {total} candidates...")
         start_time = time.time()
+
+        if progress_callback:
+            progress_callback("searching", f"Found {total} candidates, preparing verification...", 0, total, 0, 0, 0, 0)
 
         # Extract query features
         with torch.no_grad():
@@ -303,6 +296,9 @@ class DinoSearcher:
         cache_misses = 0
         match_paths = [normalize_path(m['path']) for m in matches if os.path.exists(normalize_path(m.get('path', '')))]
 
+        if progress_callback:
+            progress_callback("loading_cache", f"Loading cached features for {len(match_paths)} images...", 0, total, 0, 0, 0, 0)
+
         if self.disk_file_cache:
             # Try file-based cache first (NAS)
             load_start = time.time()
@@ -310,7 +306,9 @@ class DinoSearcher:
             load_time = time.time() - load_start
             cache_hits = len(cached_features)
             cache_misses = len(match_paths) - cache_hits
-            print(f"  File cache: {cache_hits} hits, {cache_misses} misses (loaded in {load_time:.1f}s)")
+            tprint(f"  File cache: {cache_hits} hits, {cache_misses} misses (loaded in {load_time:.1f}s)")
+            if progress_callback:
+                progress_callback("loading_cache", f"Loaded {cache_hits} cached features ({cache_misses} to compute)", 0, total, cache_hits, cache_misses, 0, 0)
         elif self.disk_cache:
             # Fall back to SQL cache
             load_start = time.time()
@@ -318,16 +316,21 @@ class DinoSearcher:
             load_time = time.time() - load_start
             cache_hits = len(cached_features)
             cache_misses = len(match_paths) - cache_hits
-            print(f"  SQL cache: {cache_hits} hits, {cache_misses} misses (loaded in {load_time:.1f}s)")
+            tprint(f"  SQL cache: {cache_hits} hits, {cache_misses} misses (loaded in {load_time:.1f}s)")
+            if progress_callback:
+                progress_callback("loading_cache", f"Loaded {cache_hits} cached features ({cache_misses} to compute)", 0, total, cache_hits, cache_misses, 0, 0)
 
         # Verify each candidate
         verify_start = time.time()
         for i, match in enumerate(matches):
-            if i % 500 == 0 and i > 0:
+            if i % 100 == 0:  # Update more frequently
                 elapsed = time.time() - verify_start
-                rate = i / elapsed
-                eta = (total - i) / rate if rate > 0 else 0
-                print(f"  Verified {i}/{total} ({rate:.1f}/s, ETA: {eta:.0f}s)...")
+                rate = i / elapsed if elapsed > 0 else 0
+                eta = int((total - i) / rate) if rate > 0 else 0
+                if i > 0:
+                    tprint(f"  Verified {i}/{total} ({rate:.1f}/s, ETA: {eta}s)...")
+                if progress_callback:
+                    progress_callback("verifying", f"Verifying with LightGlue: {i}/{total}", i, total, cache_hits, cache_misses, rate, eta)
 
             try:
                 match_path = normalize_path(match['path'])
@@ -340,7 +343,7 @@ class DinoSearcher:
                     cached = cached_features[match_path]
                     feats1 = {
                         "keypoints": torch.from_numpy(cached.keypoints).unsqueeze(0).to(self.device),
-                        "descriptors": torch.from_numpy(cached.descriptors).T.unsqueeze(0).to(self.device),
+                        "descriptors": torch.from_numpy(cached.descriptors).unsqueeze(0).to(self.device),  # No transpose - already (N, 128)
                         "image_size": torch.tensor([cached.padded_size[1], cached.padded_size[0]]).view(1, 2).to(self.device)
                     }
                 else:
@@ -367,13 +370,17 @@ class DinoSearcher:
                     match['verified_matches'] = valid_matches
 
             except Exception as e:
-                print(f"Verification failed for {match.get('path', 'unknown')}: {e}")
+                tprint(f"Verification failed for {match.get('path', 'unknown')}: {e}")
                 match['verified_matches'] = 0
 
         total_time = time.time() - start_time
         verify_time = time.time() - verify_start
         rate = total / verify_time if verify_time > 0 else 0
-        print(f"Verification complete: {total} images in {total_time:.1f}s ({rate:.1f}/s)")
+        tprint(f"Verification complete: {total} images in {total_time:.1f}s ({rate:.1f}/s)")
+
+        if progress_callback:
+            progress_callback("complete", f"Verification complete: {total} images in {total_time:.1f}s", total, total, cache_hits, cache_misses, rate, 0)
+
         return matches
 
     def get_match_visualization(self, query_bytes: bytes, match_path: str) -> tuple:
@@ -470,7 +477,7 @@ class DinoSearcher:
                 return (valid_count, bbox)
 
         except Exception as e:
-            print(f"Visualization failed: {e}")
+            tprint(f"Visualization failed: {e}")
             return (0, None)
 
     def generate_visualization_image(self, query_bytes: bytes, match_path: str) -> bytes:

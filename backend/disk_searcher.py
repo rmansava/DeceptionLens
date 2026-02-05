@@ -29,10 +29,14 @@ logger = logging.getLogger(__name__)
 # Paths - NAS storage with local SSD buffer for fast searching
 NAS_CHUNKS_DIR = "T:/faiss/disk_retrieval/chunks"    # Source: chunks on NAS
 LOCAL_CHUNK_BUFFER = "D:/faiss/disk_retrieval/chunk_buffer"  # Buffer: copy here for fast reads
+CHUNK_IDS_DIR = "D:/faiss/disk_retrieval/chunk_ids"  # Compact IDs (converted from paths.json)
 BOOKS_DIR = "T:/faiss/disk_retrieval/books"  # Fallback if no chunks yet
 
 # Legacy path for backwards compatibility
 CHUNKS_DIR = NAS_CHUNKS_DIR
+
+# Global path lookup for compact ID format (loaded once)
+_id_to_path = None
 
 # DISK model (lazy loaded)
 _disk_model = None
@@ -48,6 +52,60 @@ def get_disk_model():
         _disk_model = KF.DISK.from_pretrained('depth').to(_device).eval()
         logger.info(f"DISK model loaded on {_device}")
     return _disk_model, _device
+
+
+def get_id_to_path():
+    """Load the global path lookup table (ID -> path string). Loaded once, cached."""
+    global _id_to_path
+    if _id_to_path is None:
+        lookup_file = os.path.join(CHUNK_IDS_DIR, "path_lookup.json")
+        if os.path.exists(lookup_file):
+            logger.info(f"Loading path lookup from {lookup_file}...")
+            load_start = time.time()
+            with open(lookup_file, 'r') as f:
+                _id_to_path = json.load(f)
+            logger.info(f"Loaded {len(_id_to_path):,} path mappings in {time.time()-load_start:.1f}s")
+        else:
+            logger.info("No path_lookup.json found - will use paths.json from NAS")
+            _id_to_path = []  # Empty = not available
+    return _id_to_path
+
+
+def load_chunk_paths(chunk_file):
+    """
+    Load path data for a chunk. Uses compact IDs if available, falls back to NAS paths.json.
+
+    Returns:
+        (paths_or_ids, id_to_path_or_None)
+        - If IDs available: (np.ndarray of int32 IDs, list of path strings)
+        - If fallback: (list of path strings, None)
+    """
+    chunk_name = os.path.basename(chunk_file).replace('.faiss', '')
+    ids_file = os.path.join(CHUNK_IDS_DIR, f"{chunk_name}_ids.npy")
+
+    if os.path.exists(ids_file):
+        # Fast path: load compact ID array from local SSD
+        load_start = time.time()
+        ids = np.load(ids_file)
+        id_to_path = get_id_to_path()
+        logger.info(f"  Loaded {chunk_name}_ids.npy ({len(ids):,} entries) in {time.time()-load_start:.1f}s")
+        return ids, id_to_path
+    else:
+        # Slow path: read full paths.json from NAS
+        nas_paths_file = os.path.join(NAS_CHUNKS_DIR, f"{chunk_name}_paths.json")
+        load_start = time.time()
+        with open(nas_paths_file, 'r') as f:
+            paths = json.load(f)
+        logger.info(f"  Loaded {chunk_name}_paths.json from NAS ({len(paths):,} entries) in {time.time()-load_start:.1f}s")
+        return paths, None
+
+
+def resolve_path(paths_or_ids, id_to_path, idx):
+    """Resolve a FAISS index to a file path string."""
+    if id_to_path is not None and len(id_to_path) > 0:
+        return id_to_path[paths_or_ids[idx]]
+    else:
+        return paths_or_ids[idx]
 
 
 def extract_disk_features(image_bytes: bytes) -> np.ndarray:
@@ -157,14 +215,16 @@ def _copy_chunk_worker(copy_queue: Queue, chunk_files: list, start_idx: int, buf
         if not same_size:
             logger.info(f"  Background: Copying chunk {i+1} ({chunk_name})...")
             copy_start = time.time()
+
+            # Only copy the FAISS index file (paths file read directly from NAS)
             shutil.copy2(nas_chunk_file, local_chunk_file)
-            shutil.copy2(nas_paths_file, local_paths_file)
+
             copy_time = time.time() - copy_start
             chunk_size_gb = os.path.getsize(local_chunk_file) / (1024**3)
             logger.info(f"  Background: Copied {chunk_size_gb:.1f}GB in {copy_time:.1f}s")
 
-        # Signal that this chunk is ready
-        copy_queue.put((i, local_chunk_file, local_paths_file))
+        # Signal that this chunk is ready (use NAS paths file directly)
+        copy_queue.put((i, local_chunk_file, nas_paths_file))
 
 
 def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_files: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, search_id: int = None, progress_callback=None):
@@ -218,8 +278,10 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_files: li
         logger.info(f"  Searching {chunk_name}...")
         load_start = time.time()
         index = faiss.read_index(local_chunk_file, faiss.IO_FLAG_MMAP)
-        with open(local_paths_file, 'r') as f:
-            paths = json.load(f)
+
+        # Load paths (compact IDs from local SSD, or paths.json from NAS as fallback)
+        paths_or_ids, id_to_path = load_chunk_paths(chunk_files[chunk_idx])
+
         load_time = time.time() - load_start
         logger.info(f"  Loaded in {load_time:.1f}s (mmap)")
 
@@ -234,15 +296,14 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_files: li
             for j in range(k):
                 idx = indices[i][j]
                 if idx >= 0 and distances[i][j] >= threshold:
-                    all_votes[paths[idx]] += 1
+                    all_votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
 
         # Free memory
-        del index, paths
+        del index, paths_or_ids
 
-        # Delete this chunk to make room
+        # Delete this chunk to make room (paths file is on NAS, not copied)
         try:
             os.remove(local_chunk_file)
-            os.remove(local_paths_file)
             logger.info(f"  Deleted {chunk_name} from buffer")
         except Exception as e:
             logger.warning(f"  Failed to delete {chunk_name}: {e}")
@@ -299,12 +360,11 @@ def _search_chunks_streaming(query_descriptors: np.ndarray, chunk_files: list, k
             logger.warning(f"Missing paths file for {chunk_name}")
             continue
 
-        # Copy chunk from NAS to local SSD (skip if already cached)
+        # Copy FAISS index to local SSD (paths file read directly from NAS)
         local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
-        local_paths_file = os.path.join(LOCAL_CHUNK_BUFFER, paths_name)
 
-        # Check if files already exist and have same size (skip copy)
-        chunk_exists = os.path.exists(local_chunk_file) and os.path.exists(local_paths_file)
+        # Check if index already cached
+        chunk_exists = os.path.exists(local_chunk_file)
         same_size = chunk_exists and os.path.getsize(local_chunk_file) == os.path.getsize(nas_chunk_file)
 
         if same_size:
@@ -313,8 +373,10 @@ def _search_chunks_streaming(query_descriptors: np.ndarray, chunk_files: list, k
         else:
             logger.info(f"[{chunk_idx + 1}/{total_chunks}] Copying {chunk_name} to local SSD...")
             copy_start = time.time()
+
+            # Only copy FAISS index (paths file read directly from NAS - no corruption)
             shutil.copy2(nas_chunk_file, local_chunk_file)
-            shutil.copy2(nas_paths_file, local_paths_file)
+
             copy_time = time.time() - copy_start
             chunk_size_gb = os.path.getsize(local_chunk_file) / (1024**3)
             logger.info(f"  Copied {chunk_size_gb:.1f}GB in {copy_time:.1f}s ({chunk_size_gb/copy_time:.1f} GB/s)")
@@ -325,8 +387,8 @@ def _search_chunks_streaming(query_descriptors: np.ndarray, chunk_files: list, k
 
         # Use memory-mapped loading for fast access to large indexes
         index = faiss.read_index(local_chunk_file, faiss.IO_FLAG_MMAP)
-        with open(local_paths_file, 'r') as f:
-            paths = json.load(f)
+        # Load paths (compact IDs from local SSD, or paths.json from NAS as fallback)
+        paths_or_ids, id_to_path = load_chunk_paths(nas_chunk_file)
 
         load_time = time.time() - load_start
         logger.info(f"  Loaded in {load_time:.1f}s (mmap)")
@@ -342,10 +404,10 @@ def _search_chunks_streaming(query_descriptors: np.ndarray, chunk_files: list, k
             for j in range(k):
                 idx = indices[i][j]
                 if idx >= 0 and distances[i][j] >= threshold:
-                    all_votes[paths[idx]] += 1
+                    all_votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
 
         # Free memory and delete local copy
-        del index, paths
+        del index, paths_or_ids
 
         try:
             os.remove(local_chunk_file)
@@ -371,18 +433,11 @@ def _search_chunks_mode(query_descriptors: np.ndarray, chunk_files: list, k: int
     all_votes = Counter()
 
     for chunk_file in chunk_files:
-        paths_file = chunk_file.replace('.faiss', '_paths.json')
-
-        if not os.path.exists(paths_file):
-            logger.warning(f"Missing paths file for {chunk_file}")
-            continue
-
         logger.info(f"Searching {os.path.basename(chunk_file)}...")
 
         # Load chunk with memory mapping
         index = faiss.read_index(chunk_file, faiss.IO_FLAG_MMAP)
-        with open(paths_file, 'r') as f:
-            paths = json.load(f)
+        paths_or_ids, id_to_path = load_chunk_paths(chunk_file)
 
         # Search
         distances, indices = index.search(query_descriptors, k)
@@ -392,10 +447,10 @@ def _search_chunks_mode(query_descriptors: np.ndarray, chunk_files: list, k: int
             for j in range(k):
                 idx = indices[i][j]
                 if idx >= 0 and distances[i][j] >= threshold:
-                    all_votes[paths[idx]] += 1
+                    all_votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
 
         # Free memory
-        del index
+        del index, paths_or_ids
 
     return all_votes.most_common(top_n)
 
@@ -439,7 +494,7 @@ def _search_books_mode(query_descriptors: np.ndarray, k: int, threshold: float, 
     return all_votes.most_common(top_n)
 
 
-def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: float = 0.7, specific_chunks: list = None):
+def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: float = 0.7, specific_chunks: list = None, progress_callback=None):
     """
     Main entry point for DISK search.
 
@@ -449,6 +504,7 @@ def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: floa
         k: Nearest neighbors per keypoint
         threshold: Minimum similarity for voting
         specific_chunks: Optional list of chunk numbers to search (e.g., [142])
+        progress_callback: Optional callback for live progress updates
 
     Returns:
         List of dicts with 'path', 'votes', 'score' keys
@@ -462,7 +518,7 @@ def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: floa
         return []
 
     # Search
-    results = search_chunks(descriptors, k=k, threshold=threshold, top_n=top_k, specific_chunks=specific_chunks)
+    results = search_chunks(descriptors, k=k, threshold=threshold, top_n=top_k, specific_chunks=specific_chunks, progress_callback=progress_callback)
 
     # Format results
     formatted = []

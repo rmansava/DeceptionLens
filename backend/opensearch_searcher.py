@@ -130,36 +130,51 @@ class OpenSearchSearcher:
             print(f"Error extracting faces from bytes: {e}")
             return []
 
-    def search(self, query_path: str, top_k: int = 50) -> list:
+    def _get_visual_index(self, collection: str = None) -> str:
+        """Get the visual index name for a collection."""
+        if collection:
+            return f"dinov2-{collection}"
+        return self.visual_index
+
+    def _get_faces_index(self, collection: str = None) -> str:
+        """Get the faces index name for a collection."""
+        if collection:
+            return f"faces-{collection}"
+        return self.faces_index
+
+    def search(self, query_path: str, top_k: int = 50, collection: str = None) -> list:
         """Search for similar images by path (visual search)."""
         embedding = self.get_visual_embedding(query_path)
         if embedding is None:
             return []
-        return self._search_visual(embedding, top_k)
+        return self._search_visual(embedding, top_k, collection)
 
-    def search_by_bytes(self, image_bytes: bytes, top_k: int = 50) -> list:
+    def search_by_bytes(self, image_bytes: bytes, top_k: int = 50, collection: str = None) -> list:
         """Search for similar images using image bytes (visual search)."""
         embedding = self.get_visual_embedding_from_bytes(image_bytes)
         if embedding is None:
             return []
-        return self._search_visual(embedding, top_k)
+        return self._search_visual(embedding, top_k, collection)
 
-    def _search_visual(self, embedding: np.ndarray, top_k: int) -> list:
+    def _search_visual(self, embedding: np.ndarray, top_k: int, collection: str = None) -> list:
         """Internal visual search using pre-computed embedding."""
+        index_name = self._get_visual_index(collection)
+        # OpenSearch has max k=10000 for k-NN and max_result_window=10000 for size
+        capped_k = min(top_k, 10000)
         query = {
-            "size": top_k,
+            "size": capped_k,
             "query": {
                 "knn": {
                     "embedding": {
                         "vector": embedding.tolist(),
-                        "k": top_k
+                        "k": capped_k
                     }
                 }
             }
         }
 
         try:
-            response = self.client.search(index=self.visual_index, body=query)
+            response = self.client.search(index=index_name, body=query)
             results = []
             for hit in response["hits"]["hits"]:
                 results.append({
@@ -177,7 +192,7 @@ class OpenSearchSearcher:
             print(f"OpenSearch visual search error: {e}")
             return []
 
-    def search_faces_by_bytes(self, image_bytes: bytes, top_k: int = 50) -> list:
+    def search_faces_by_bytes(self, image_bytes: bytes, top_k: int = 50, collection: str = None) -> list:
         """Search for similar faces using image bytes."""
         embeddings = self.get_face_embedding_from_bytes(image_bytes)
         if not embeddings:
@@ -185,24 +200,27 @@ class OpenSearchSearcher:
             return []
 
         # Use first detected face
-        return self._search_faces(embeddings[0], top_k)
+        return self._search_faces(embeddings[0], top_k, collection)
 
-    def _search_faces(self, embedding: np.ndarray, top_k: int) -> list:
+    def _search_faces(self, embedding: np.ndarray, top_k: int, collection: str = None) -> list:
         """Internal face search using pre-computed embedding."""
+        index_name = self._get_faces_index(collection)
+        # OpenSearch has max k=10000 for k-NN and max_result_window=10000 for size
+        capped_k = min(top_k, 10000)
         query = {
-            "size": top_k,
+            "size": capped_k,
             "query": {
                 "knn": {
                     "embedding": {
                         "vector": embedding.tolist(),
-                        "k": top_k
+                        "k": capped_k
                     }
                 }
             }
         }
 
         try:
-            response = self.client.search(index=self.faces_index, body=query)
+            response = self.client.search(index=index_name, body=query)
             results = []
             for hit in response["hits"]["hits"]:
                 results.append({
@@ -222,15 +240,17 @@ class OpenSearchSearcher:
             print(f"OpenSearch face search error: {e}")
             return []
 
-    def get_counts(self) -> dict:
+    def get_counts(self, collection: str = None) -> dict:
         """Get document counts for both indices."""
         counts = {"visual": 0, "faces": 0}
+        visual_index = self._get_visual_index(collection)
+        faces_index = self._get_faces_index(collection)
         try:
-            counts["visual"] = self.client.count(index=self.visual_index)["count"]
+            counts["visual"] = self.client.count(index=visual_index)["count"]
         except:
             pass
         try:
-            counts["faces"] = self.client.count(index=self.faces_index)["count"]
+            counts["faces"] = self.client.count(index=faces_index)["count"]
         except:
             pass
         return counts

@@ -22,6 +22,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DEFAULT_FEATURES_ROOT = r"T:\disk-features"
 
 
+def long_path(path) -> str:
+    """Convert path to Windows long path format (\\?\) to support paths > 260 chars."""
+    path_str = str(path)
+    if len(path_str) > 240 and not path_str.startswith("\\\\?\\"):
+        return "\\\\?\\" + os.path.abspath(path_str)
+    return path_str
+
+
 @dataclass
 class DiskFeatureData:
     """Container for DISK features."""
@@ -190,12 +198,14 @@ class DiskFeatureFileStore:
             DiskFeatureData or None if not found
         """
         feature_path = self._get_feature_path(image_path, book_name)
+        feature_path_str = long_path(feature_path)
 
-        if not feature_path.exists():
+        if not os.path.exists(feature_path_str):
             return None
 
         try:
-            data = np.load(feature_path)
+            # Use long_path() to support Windows paths > 260 chars
+            data = np.load(feature_path_str)
             return DiskFeatureData(
                 keypoints=data['keypoints'].astype(np.float32),
                 descriptors=data['descriptors'].astype(np.float32),

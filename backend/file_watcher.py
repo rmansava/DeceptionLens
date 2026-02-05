@@ -1,13 +1,19 @@
 r"""
 File watcher for D:\books\pdf-images directory.
 
-Automatically syncs book folder renames to all other locations:
-- T:\archiverelated\books\pdf-images
+Handles three types of events:
+1. RENAME (within pdf-images): Syncs rename to all locations
+2. CATEGORY MOVE (to different D:\books subfolder): Moves in NAS, updates paths
+3. DELETE (moved outside D:\books): Removes from all locations
+
+Syncs to:
+- T:\archiverelated\books\pdf-images (and other categories)
 - T:\archive\books\pdf-tesseract-text
-- T:\disk-features\books
+- D:\disk-features\books, T:\disk-features\books
 - T:\archive\books\pdf-full-file-text (text files)
 - OpenSearch indexes (dinov2-books, faces-books)
 - FAISS paths.json
+- Disk progress files
 
 Usage:
     python file_watcher.py              # Run watcher
@@ -19,6 +25,8 @@ import logging
 import os
 import sys
 import time
+import threading
+import queue
 from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
@@ -44,7 +52,12 @@ from rename_book import (
 )
 
 WATCH_PATH = r"D:\books\pdf-images"
+BOOKS_ROOT = r"D:\books"
 LOG_FILE = r"D:\books\pdf-images-watcher.log"
+
+# NAS mappings for category moves
+# Maps local D:\books\{category} to NAS T:\archiverelated\books\{category}
+NAS_PDF_IMAGES_ROOT = r"T:\archiverelated\books"
 
 # Other locations to sync (exclude the watch path itself)
 SYNC_LOCATIONS = [loc for loc in FOLDER_LOCATIONS if loc != WATCH_PATH]
@@ -58,7 +71,64 @@ class BookFolderHandler(FileSystemEventHandler):
         self.dry_run = dry_run
         self.opensearch_client = None
         self._connect_opensearch()
+
+        # Event queue for tracking pending operations
+        self.event_queue = queue.Queue()
+        self.total_queued = 0
+        self.processed = 0
+        self.queue_lock = threading.Lock()
+
+        # Start worker thread
+        self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
+        self.worker_thread.start()
+
         super().__init__()
+
+    def _process_queue(self):
+        """Worker thread to process queued events."""
+        while True:
+            try:
+                event_type, args = self.event_queue.get()
+
+                with self.queue_lock:
+                    self.processed += 1
+                    remaining = self.total_queued - self.processed
+                    progress = f"[{self.processed}/{self.total_queued}]"
+                    if remaining > 0:
+                        progress += f" ({remaining} queued)"
+
+                if event_type == "rename":
+                    old_name, new_name, new_folder_path = args
+                    self.logger.info(f"{progress} [RENAMED BOOK] {old_name} -> {new_name}")
+                    self._sync_rename(old_name, new_name, new_folder_path)
+                elif event_type == "delete":
+                    book_name, reason = args
+                    self.logger.info(f"{progress} [DELETED BOOK] {book_name}{reason}")
+                    self._sync_delete(book_name)
+                elif event_type == "move":
+                    book_name, old_category, new_category = args
+                    self.logger.info(f"{progress} [MOVED BOOK] {book_name} -> {new_category}/")
+                    self._sync_category_move(book_name, old_category, new_category)
+
+                self.event_queue.task_done()
+
+                # Reset counters when queue is empty
+                with self.queue_lock:
+                    if self.event_queue.empty():
+                        self.total_queued = 0
+                        self.processed = 0
+
+            except Exception as e:
+                self.logger.error(f"Queue processing error: {e}")
+
+    def _queue_event(self, event_type: str, args: tuple):
+        """Add an event to the queue."""
+        with self.queue_lock:
+            self.total_queued += 1
+            queued = self.total_queued - self.processed
+            if queued > 1:
+                self.logger.info(f"Queued: {queued} events pending")
+        self.event_queue.put((event_type, args))
 
     def _connect_opensearch(self):
         """Connect to OpenSearch."""
@@ -186,8 +256,37 @@ class BookFolderHandler(FileSystemEventHandler):
         else:
             self.logger.warning(f"Sync completed with {errors} error(s) for: {new_name}")
 
+    def _check_moved_to_other_category(self, book_name: str):
+        """Check if a book was moved to another category within D:\books."""
+        import time
+        time.sleep(0.5)  # Brief delay for file system to settle
+
+        old_category = os.path.basename(WATCH_PATH)  # pdf-images
+
+        # Check all subfolders of D:\books for this book
+        try:
+            for subfolder in os.listdir(BOOKS_ROOT):
+                if subfolder == old_category:
+                    continue  # Skip the source folder
+                subfolder_path = os.path.join(BOOKS_ROOT, subfolder)
+                if os.path.isdir(subfolder_path):
+                    book_path = os.path.join(subfolder_path, book_name)
+                    if os.path.exists(book_path):
+                        return subfolder  # Found it in another category
+        except Exception:
+            pass
+        return None
+
     def _sync_delete(self, book_name: str):
         """Delete a book from all locations."""
+        # First check if this was actually a move to another category (cut/paste)
+        new_category = self._check_moved_to_other_category(book_name)
+        if new_category:
+            old_category = os.path.basename(WATCH_PATH)
+            self.logger.info(f"Detected category move (cut/paste): {book_name} -> {new_category}/")
+            self._sync_category_move(book_name, old_category, new_category)
+            return
+
         self.logger.info(f"{'[DRY RUN] ' if self.dry_run else ''}Syncing delete: {book_name}")
 
         errors = 0
@@ -266,6 +365,136 @@ class BookFolderHandler(FileSystemEventHandler):
         else:
             self.logger.warning(f"Delete completed with {errors} error(s) for: {book_name}")
 
+    def _sync_category_move(self, book_name: str, old_category: str, new_category: str):
+        """Move a book from one category to another in NAS locations."""
+        self.logger.info(f"{'[DRY RUN] ' if self.dry_run else ''}Syncing category move: {book_name}")
+        self.logger.info(f"  From: {old_category} -> To: {new_category}")
+
+        errors = 0
+        import shutil
+
+        # Move in NAS pdf-images location
+        old_nas_path = os.path.join(NAS_PDF_IMAGES_ROOT, old_category, book_name)
+        new_nas_path = os.path.join(NAS_PDF_IMAGES_ROOT, new_category, book_name)
+
+        if os.path.exists(old_nas_path):
+            if self.dry_run:
+                self.logger.info(f"  [DRY] NAS pdf-images: would move to {new_category}")
+            else:
+                try:
+                    os.makedirs(os.path.dirname(new_nas_path), exist_ok=True)
+                    shutil.move(old_nas_path, new_nas_path)
+                    self.logger.info(f"  [OK] NAS pdf-images: moved to {new_category}")
+                except Exception as e:
+                    errors += 1
+                    self.logger.error(f"  [ERR] NAS pdf-images: {e}")
+        else:
+            self.logger.debug(f"  [--] NAS pdf-images: not found in {old_category}")
+
+        # Move pdf-tesseract-text folder
+        tesseract_base = r"T:\archive\books\pdf-tesseract-text"
+        old_tesseract = os.path.join(tesseract_base, book_name)
+        # Note: tesseract doesn't have category subfolders, so we just leave it
+        # The path stays the same since it's organized by book name, not category
+
+        # Move disk-features folders (local and NAS)
+        for df_base in [r"D:\disk-features\books", r"T:\disk-features\books"]:
+            old_df = os.path.join(df_base, book_name)
+            if os.path.exists(old_df):
+                # disk-features doesn't have category subfolders either, just delete since
+                # it would need re-indexing for the new category anyway
+                if self.dry_run:
+                    self.logger.info(f"  [DRY] {os.path.basename(df_base)}: would delete (needs re-indexing)")
+                else:
+                    try:
+                        shutil.rmtree(old_df)
+                        self.logger.info(f"  [OK] {os.path.basename(df_base)}: deleted (needs re-indexing)")
+                    except Exception as e:
+                        errors += 1
+                        self.logger.error(f"  [ERR] {os.path.basename(df_base)}: {e}")
+
+        # Delete from disk progress files (book needs re-indexing for new category)
+        result = delete_from_disk_progress(book_name, dry_run=self.dry_run)
+        status = result.get("status", "unknown")
+        if status == "success":
+            self.logger.info(f"  [OK] disk progress: removed (needs re-indexing)")
+        elif status == "dry-run":
+            self.logger.info(f"  [DRY] disk progress: would remove")
+        elif status == "skipped":
+            self.logger.debug(f"  [--] disk progress: {result.get('message')}")
+
+        # Update OpenSearch paths (change category in path)
+        if self.opensearch_client:
+            old_path_prefix = f"T:/archiverelated/books/{old_category}/{book_name}"
+            new_path_prefix = f"T:/archiverelated/books/{new_category}/{book_name}"
+            for idx in OPENSEARCH_INDEXES:
+                try:
+                    # Search for documents with old path
+                    search_body = {
+                        "query": {"prefix": {"image_path": old_path_prefix}},
+                        "size": 10000
+                    }
+                    result = self.opensearch_client.search(index=idx, body=search_body)
+                    hits = result.get("hits", {}).get("hits", [])
+
+                    if hits:
+                        if self.dry_run:
+                            self.logger.info(f"  [DRY] {idx}: would update {len(hits)} docs")
+                        else:
+                            # Update each document
+                            for hit in hits:
+                                doc_id = hit["_id"]
+                                old_path = hit["_source"]["image_path"]
+                                new_path = old_path.replace(f"/{old_category}/", f"/{new_category}/")
+                                self.opensearch_client.update(
+                                    index=idx,
+                                    id=doc_id,
+                                    body={"doc": {"image_path": new_path}}
+                                )
+                            self.logger.info(f"  [OK] {idx}: {len(hits)} docs updated")
+                    else:
+                        self.logger.debug(f"  [--] {idx}: no docs found")
+                except Exception as e:
+                    errors += 1
+                    self.logger.error(f"  [ERR] {idx}: {e}")
+
+        # Update FAISS paths
+        for pf in FAISS_PATHS:
+            try:
+                if os.path.exists(pf):
+                    import json
+                    with open(pf, 'r', encoding='utf-8') as f:
+                        paths = json.load(f)
+
+                    old_prefix = f"T:/archiverelated/books/{old_category}/{book_name}"
+                    updated = 0
+                    new_paths = []
+                    for p in paths:
+                        if p.startswith(old_prefix):
+                            new_p = p.replace(f"/{old_category}/", f"/{new_category}/")
+                            new_paths.append(new_p)
+                            updated += 1
+                        else:
+                            new_paths.append(p)
+
+                    if updated > 0:
+                        if self.dry_run:
+                            self.logger.info(f"  [DRY] FAISS: would update {updated} paths")
+                        else:
+                            with open(pf, 'w', encoding='utf-8') as f:
+                                json.dump(new_paths, f)
+                            self.logger.info(f"  [OK] FAISS: {updated} paths updated")
+                    else:
+                        self.logger.debug(f"  [--] FAISS: no matching paths")
+            except Exception as e:
+                errors += 1
+                self.logger.error(f"  [ERR] FAISS: {e}")
+
+        if errors == 0:
+            self.logger.info(f"Category move complete for: {book_name}")
+        else:
+            self.logger.warning(f"Category move completed with {errors} error(s) for: {book_name}")
+
     def on_created(self, event: FileSystemEvent):
         """Handle file/folder creation - ignored."""
         pass
@@ -275,8 +504,7 @@ class BookFolderHandler(FileSystemEventHandler):
         # Check if it's a direct child of the watch path
         if self._is_book_folder_event(event.src_path):
             book_name = os.path.basename(event.src_path)
-            self.logger.info(f"[DELETED BOOK] {book_name}")
-            self._sync_delete(book_name)
+            self._queue_event("delete", (book_name, ""))
 
     def on_moved(self, event: FileSystemEvent):
         """Handle file/folder rename/move."""
@@ -284,14 +512,23 @@ class BookFolderHandler(FileSystemEventHandler):
             old_name = os.path.basename(event.src_path)
             new_folder_path = event.dest_path
 
-            # Check if moved outside watched directory (e.g., to Recycle Bin)
-            if not new_folder_path.startswith(WATCH_PATH):
-                self.logger.info(f"[DELETED BOOK] {old_name} (moved to Recycle Bin)")
-                self._sync_delete(old_name)
-            else:
+            # Check if moved within same directory (rename)
+            if new_folder_path.startswith(WATCH_PATH):
                 new_name = os.path.basename(event.dest_path)
-                self.logger.info(f"[RENAMED BOOK] {old_name} -> {new_name}")
-                self._sync_rename(old_name, new_name, new_folder_path)
+                self._queue_event("rename", (old_name, new_name, new_folder_path))
+
+            # Check if moved to a different category within D:\books
+            elif new_folder_path.startswith(BOOKS_ROOT):
+                # Extract the new category (subfolder name)
+                rel_path = os.path.relpath(new_folder_path, BOOKS_ROOT)
+                new_category = rel_path.split(os.sep)[0]
+                old_category = os.path.basename(WATCH_PATH)  # pdf-images
+                book_name = os.path.basename(new_folder_path)
+                self._queue_event("move", (book_name, old_category, new_category))
+
+            # Moved completely outside D:\books (Recycle Bin, etc.)
+            else:
+                self._queue_event("delete", (old_name, " (moved outside books folder)"))
 
     def on_modified(self, event: FileSystemEvent):
         """Handle file modification - ignored for books."""
