@@ -1,233 +1,200 @@
 # DISK Search - Status & Implementation
 
-## What We Accomplished Today
+## Architecture
 
-### 1. Fixed DISK Searcher
-- **Problem**: Script used outdated `torch.hub.load()` that doesn't work with DISK
-- **Solution**: Updated to use Kornia's DISK implementation (`KF.DISK.from_pretrained('depth')`)
-- **Result**: DISK model loads correctly on CUDA
+### Chunk Format (10 GB target, GPU FAISS compatible)
+- FAISS `IndexFlatIP(128)` chunks, ~19.5M vectors each (~10 GB)
+- Sized to fit in 16 GB VRAM (4070 Ti Super) with headroom for DISK model + scratch
+- Compact IDs: `chunk_XXX_ids.npy` (int32) + `path_lookup.json` (ID→path)
+- Both books and print ads use identical chunk + compact ID format
 
-### 2. Fixed FAISS Memory-Mapped Loading
-- **Problem**: Loading 22GB indexes took 20+ minutes and often hung
-- **Solution**: Use `faiss.read_index(file, faiss.IO_FLAG_MMAP)` for instant loading
-- **Result**: Load time reduced from 20+ min to ~40 seconds
+### Storage Layout
 
-### 3. Added Chunk Caching
-- **Problem**: Re-copying same chunks wasted 25+ minutes each time
-- **Solution**: Check if chunk exists locally with same size, skip copy if cached
-- **Result**: Subsequent searches of same chunk are instant
+**Books:**
+- Per-book shards (source): `T:/faiss/disk_retrieval/books/` (4,238 books)
+- FAISS chunks (NAS): `T:/faiss/disk_retrieval/chunks/`
+- Compact IDs (local SSD): `D:/faiss/disk_retrieval/chunk_ids/`
 
-### 4. Successfully Tested DISK Search
-- **Test Image**: `D:\trivpics\2023-5.jpg` (dinosaur crop)
-- **Target**: Encyclopedia of Monsters, page 206
-- **Result**: **FOUND with 145 votes!** (top result)
-- **Chunk**: 142 (contains 15 encyclopedia books, 44.5M vectors)
-- **Time**: 27.1 minutes (25.7 min copy + 1.4 min search/load)
+**Print Ads:**
+- Source images (local copy): `C:\printads` (copied from NAS for GPU extraction)
+- Source images (NAS): `T:\archiverelated\print ads`
+- FAISS chunks (NAS): `S:\faiss\disk_retrieval\printads_chunks\`
+- Compact IDs (local SSD): `D:\faiss\disk_retrieval\printads_chunk_ids\`
 
-### 5. Implemented Rolling Buffer Strategy
-- **Concept**: Keep 5 chunks (~100GB) in buffer, copy next while searching current
-- **Benefits**: Parallelizes copy and search operations
-- **Location**: `_search_chunks_rolling_buffer()` in disk_searcher.py
+### Scripts
 
-### 6. Added Live Search Tracking
-- **Features**:
-  - Create search session when search starts
-  - Update progress after each chunk with top 100 results
-  - See aggregated votes grow as chunks are searched
-  - Track status: in_progress, completed, failed
-- **Database Migration**: `migrations/add_live_search_tracking.sql`
-- **Functions**: `create_search_session()`, `update_search_progress()`, `complete_search_session()`
+| Script | Purpose |
+|--------|---------|
+| `consolidate_search_chunks.py` | Re-chunk book shards → 10 GB chunks + compact IDs |
+| `build_printads_disk_chunks.py` | Extract DISK features from print ads → 10 GB chunks + compact IDs |
+| `disk_searcher.py` | Search chunks (CLI, no history) |
+| `test_disk_api.py` | Search via API (saves to history + live tracking) |
+| `disk_queue.py` | Queue system, 1 search at a time |
+| `convert_paths_to_ids.py` | One-time conversion of old paths.json → compact IDs |
 
-### 7. Created Unprocessed Books Finder
-- **Script**: `find_unprocessed_books.py`
-- **Output**: `D:/faiss/disk_retrieval/unprocessed_books.txt` (2,213 books)
-- **Coverage**: 69.4% indexed (4,735 / 6,820 books)
-
-### 8. Compact ID Conversion (paths.json → compact IDs)
-- **Problem**: 606 paths.json files = 3.3 TB (same path string repeated per keypoint, ~11,206x redundancy)
-- **Solution**: Convert to int32 numpy arrays + global path_lookup.json
-- **Result**: 3.3 TB → ~95 GB (35x smaller), loads in 0.1s vs multi-GB JSON from NAS
-- **Script**: `convert_paths_to_ids.py` + `run_convert_paths.bat`
-- **Output**: `D:/faiss/disk_retrieval/chunk_ids/chunk_XXX_ids.npy` + `path_lookup.json`
-- **Time**: 12.3 hours for 605 chunks, 2,886,439 unique paths
-
-### 9. Re-tested DISK Search with Compact IDs (2026-02-05)
-- **Test Image**: `temp_uploads/ec4a14d7-9d4f-4c32-bdbe-72b9e3f0b058.jpg` (T-Rex dinosaur crop)
-- **Target**: Encyclopedia of Monsters, page 206
-- **Chunks searched**: 140, 141, 142, 143, 144
-- **Result**: **FOUND with 145 votes!** (top result, same as original test)
-- **Chunk containing the book**: 142 (44,502,894 vectors)
-- **path_lookup.json**: loaded once in 1.5s (441 MB, 2.9M paths), cached for subsequent chunks
-- **Per-chunk ID load**: 0.1s (vs minutes for NAS paths.json before)
-- **Time**: 18.1 minutes for 5 chunks (mostly NAS→SSD copy, not path loading)
-- **Backward compatible**: `load_chunk_paths()` tries IDs first, falls back to NAS paths.json
-
-### 10. Search Queue System
-- **Script**: `disk_queue.py` - ensures only 1 DISK search runs at a time
-- **Integration**: FastAPI lifespan in `server.py`, `/disk/queue` status endpoint
-- **Purpose**: Prevents GPU OOM and SSD overflow from concurrent searches
+### Chunk Sizing Rationale
+- Vector: 128 dims × 4 bytes = 512 bytes
+- 19.5M vectors × 512 bytes = ~10 GB
+- Fits in 16 GB VRAM (4070 Ti Super) or 32 GB (5090) with headroom
+- Print ads: variable keypoints per image, script flushes when vector count hits 19.5M
+- Books: accumulates per-book vectors, flushes when exceeding 19.5M
 
 ## Current Index Stats
 
-**Chunk Index (Books):**
-- Total chunks: 606
-- Indexed books: ~4,735+
-- Total keypoints: 23,599,882,172 (~23.6 billion)
-- Index size: ~13 TB (606 chunks × ~22GB avg)
-- Compact IDs: ~95 GB on local SSD (D:/faiss/disk_retrieval/chunk_ids/)
-- Unique paths: 2,886,439
-- path_lookup.json: 441 MB
+**Books (existing, will be re-chunked after 10 Gbps upgrade):**
+- 606 chunks (old 20 GB format, will become ~1,200 at 10 GB)
+- 23.6 billion keypoints, 2.9M unique pages
+- Compact IDs: 95 GB on local SSD
 
-**Book-to-Chunks Mapping:**
-- File: `D:/faiss/disk_retrieval/book_to_chunks.json`
-- File: `D:/faiss/disk_retrieval/chunk_to_books.json`
-- Created by: `build_chunk_index.py`
+**Print Ads (building now, 10 GB chunks from start):**
+- 1,221,287 images → ~940 chunks estimated
+- ~15,000 keypoints per image average
+- FAISS chunks → `S:\faiss\disk_retrieval\printads_chunks\`
 
-## Performance Analysis
+## Performance
 
-### Current Network (estimates ~14 MB/s):
-- Copy 22GB chunk: ~25 minutes
-- Load 22GB index (mmap): ~40 seconds
-- Search 44.5M vectors: ~38 seconds
-- **Total per chunk: ~27 minutes**
-- **Full 441 chunks: ~198 hours (8.3 days)**
+### Search Times (single image against all books + print ads)
 
-### With 10 Gigabit Network (~1 GB/s):
-- Copy 22GB chunk: ~22 seconds
-- Load + Search: ~78 seconds
-- **Total per chunk: ~100 seconds**
-- **Full 441 chunks: ~12.3 hours**
+| Scenario | Books | Print Ads | Total |
+|----------|-------|-----------|-------|
+| Current (CPU, 113 MB/s actual) | 36 hrs | 32 hrs | **~68 hrs** |
+| CPU, 113 MB/s (nothing else on NAS) | ~12 hrs | ~10 hrs | **~22 hrs** |
+| faiss-gpu (10 GB chunks) + 1 Gbps | 3 hrs | 2 hrs | **~5 hrs** (estimated) |
+| faiss-gpu (10 GB chunks) + 10 Gbps | 1 hr | 0.5 hr | **~1.5 hrs** |
+| faiss-gpu + 5090 + 10 Gbps | 15 min | 10 min | **~25 min** |
 
-### With Rolling Buffer (5 chunks ahead):
-- Copy and search happen in parallel
-- Estimated speedup: 2-3x (depends on network vs search time ratio)
-- **With 10GbE + Rolling Buffer: ~5-6 hours for full search**
+### Bottleneck Analysis
+- **Current**: Network copy dominates (NAS→SSD). 113 MB/s when NAS is idle, ~14 MB/s when build is running
+- **With faiss-gpu**: GPU search ~2-3s per 10 GB chunk vs 30-60s on CPU
+- **Hard floor**: GPU compute time. No network upgrade helps below ~1.5 hrs (4070 Ti) or ~25 min (5090)
 
-## Network Upgrade Impact
+### Network
+- Link: 1 Gbps, actual throughput: 113 MB/s (verified with chunk copy test)
+- 14 MB/s observed during builds = NAS I/O contention, not network limit
+- 10 Gbps upgrade planned
 
-**Current bottleneck:** Network copy (93% of search time)
+## Search Methods
 
-**10 Gigabit Ethernet Benefits:**
-- 70x faster copy speed (14 MB/s → 1 GB/s)
-- Full search: 198 hours → 12.3 hours
-- With rolling buffer: ~5-6 hours
-- Makes full-corpus DISK search practical!
-
-## Next Steps
-
-### Database Migration
-Run this SQL on your database before using live search:
+### CLI (no history)
 ```bash
-sqlcmd -S localhost -d ImageSearch -i migrations/add_live_search_tracking.sql
-```
-
-### Index Remaining Books
-```bash
-# Use the unprocessed books list with your consolidation script
-python consolidate_search_chunks.py --books-file D:/faiss/disk_retrieval/unprocessed_books.txt
-```
-
-### Test Rolling Buffer Search
-```bash
-python disk_searcher.py "D:\trivpics\2023-5.jpg"
-# Or specify chunks:
-python disk_searcher.py "D:\trivpics\2023-5.jpg" "100,150,200"
-```
-
-### Enable Live Search in Web UI
-1. Run database migration
-2. Update DISK search endpoint in server.py to use live tracking
-3. Frontend will show active searches with real-time progress
-
-## File Locations
-
-**Scripts:**
-- `disk_searcher.py` - Main DISK search (command-line, no history saving)
-- `test_disk_api.py` - DISK search via API (saves to search history + live tracking)
-- `find_unprocessed_books.py` - Find books to index
-- `build_chunk_index.py` - Build book↔chunk mapping
-
-**Data:**
-- `T:/faiss/disk_retrieval/chunks/` - 441 FAISS chunks (9.7TB)
-- `D:/faiss/disk_retrieval/chunk_buffer/` - Local SSD buffer (rolling)
-- `D:/faiss/disk_retrieval/book_to_chunks.json` - Book→chunks index
-- `D:/faiss/disk_retrieval/unprocessed_books.txt` - Books to index
-
-**Database:**
-- `migrations/add_live_search_tracking.sql` - Schema updates for live search
-
-## Key Code Changes
-
-**disk_searcher.py:**
-- Changed: `torch.hub.load()` → `KF.DISK.from_pretrained('depth')`
-- Changed: `faiss.read_index(file)` → `faiss.read_index(file, faiss.IO_FLAG_MMAP)`
-- Added: Chunk caching (skip copy if exists)
-- Added: `_search_chunks_rolling_buffer()` with 5-chunk buffer
-- Added: `search_id` and `progress_callback` parameters
-- Added: `specific_chunks` parameter for targeted search
-
-**db_helper.py:**
-- Added: `create_search_session()` - Start live search
-- Added: `update_search_progress()` - Update after each chunk
-- Added: `complete_search_session()` - Mark search complete
-
-## Usage Examples
-
-### Search via CLI (no history)
-```bash
-# Search specific chunks from command line (results printed, NOT saved to DB)
 python disk_searcher.py "D:\trivpics\2023-5.jpg" 140,141,142,143,144
 ```
 
-### Search via API (saves to history + live tracking)
+### API (saves to history + live tracking)
 ```bash
-# Uses test_disk_api.py - hits /disk/search endpoint, saves results to search history
-python test_disk_api.py
-
-# Or use curl directly with chunk_ids parameter:
 curl -X POST "http://localhost:8000/disk/search?top_k=10&chunk_ids=140,141,142,143,144&live_tracking=true" \
   -F "file=@D:\trivpics\2023-5.jpg"
 ```
 
 **API endpoint**: `POST /disk/search`
-- `chunk_ids` (optional): Comma-separated chunk numbers, e.g. `140,141,142,143,144`
+- `chunk_ids` (optional): Comma-separated chunk numbers
 - `top_k`: Number of results (default 50)
 - `k`: Nearest neighbors per keypoint (default 5)
 - `threshold`: Minimum similarity for voting (default 0.7)
 - `live_tracking`: Enable live progress in DB (default true)
-- Without `chunk_ids`, searches ALL 606 chunks (~8 days at current network speed)
 
-### Find Which Chunks Contain a Book
-```python
-import json
-with open('D:/faiss/disk_retrieval/book_to_chunks.json') as f:
-    book_to_chunks = json.load(f)
+### Web UI
+- DISK search panel on `https://localhost:5001`
+- Upload cropped image → "Find Source Page"
+- Searches all chunks by default (no chunk filter in UI yet)
 
-chunks = book_to_chunks.get('Encyclopedia Of Monsters, The (ISBN 0816023034)', [])
-print(f"Book is in chunks: {chunks}")
-# Output: [142]
-```
-
-### Test Images
-- **T-Rex dinosaur crop**: `D:\trivpics\2023-5.jpg` or `temp_uploads/ec4a14d7-9d4f-4c32-bdbe-72b9e3f0b058.jpg`
+## Test Images
+- **T-Rex dinosaur crop**: `D:\trivpics\2023-5.jpg`
   - Target: Encyclopedia of Monsters, page 206
   - Expected: 145 votes (top result), found in chunk 142
+  - Chunks to test: 140-144
 
-## Success Metrics
+## Build Scripts
 
-✅ DISK model loads successfully
-✅ Memory-mapped FAISS loading works
-✅ Test search found correct result (145 votes)
-✅ Rolling buffer strategy implemented
-✅ Live search tracking ready (needs DB migration)
-✅ Can identify 2,213 unprocessed books quickly
+### Print Ads (run now)
+```bash
+run_build_printads_chunks.bat
+```
+- Extracts DISK features on GPU, builds chunks by vector count (not fixed image count)
+- Flushes chunk when accumulator hits 19.5M vectors (~10 GB)
+- Resumable via `build_progress.json`
+
+### Books (run after 10 Gbps upgrade)
+```bash
+python consolidate_search_chunks.py
+```
+- Re-chunks existing per-book shards into 10 GB chunks with compact IDs
+- Same vector-count flush logic as print ads
+- Will replace current 606 × 20 GB chunks with ~1,200 × 10 GB chunks
+
+## GPU FAISS Notes
+- `faiss-gpu` (`pip install faiss-gpu-cu12`) required for GPU search
+- Cannot mmap on GPU - entire index must fit in VRAM
+- 10 GB chunks fit in 16 GB VRAM (4070 Ti Super) with ~4 GB headroom
+- 5090 (32 GB) could do ~24 GB chunks but 10 GB is the sweet spot (works on both)
+- GPU search: ~2-3s per 10 GB chunk vs 30-60s on CPU
+
+## Hardware Notes
+
+### Current System
+
+- iBUYPOWER: Ryzen 9 7950X, MSI X670E Tomahawk, 64 GB DDR5-4800
+- GPU: NVIDIA 4070 Ti Super (16 GB VRAM)
+- PSU: 1000W Corsair RM1000e (PCIe Gen 5 ready)
+- Storage: 4 TB Samsung 990 PRO NVMe, Lian Li Lancool 216 case
+- 5090 compatible (PSU/slot/case all support it) but $4K — not worth it
+
+### 5090 Assessment
+
+- 32 GB VRAM could do 24 GB chunks, but only saves ~10 min vs 10 GB chunks on 4070 Ti
+- The 4070 Ti Super + faiss-gpu + 10 Gbps gets 95% of the benefit at $0 extra cost
+- If 5090 prices drop, it's a plug-and-play upgrade (same 10 GB chunks work fine)
+
+### Strix Halo (ASUS ROG 395+, 128 GB RAM)
+
+- Only ~64 GB usable in Windows (iGPU reserves half)
+- Explored as CPU FAISS search node (10 chunks parallel in RAM)
+- Killed by 1 Gbps network — loading 10 GB per chunk from NAS takes longer than CPU search
+- Would need all chunks on local NVMe (~33 TB) to be useful, not practical
+- Conclusion: not worth the complexity for DISK search
+
+### Upgrade Path
+
+1. **Now**: faiss-gpu on 4070 Ti Super (free, ~5 hrs at 1 Gbps)
+2. **Soon**: 10 Gbps network upgrade (~1.5 hrs total search)
+3. **Maybe later**: 5090 if prices drop (~25 min total search)
+
+## Things to Consider
+
+### DINOv2 May Not Be Useful for Trivia Search
+
+- 47 GB across 3 collections in OpenSearch (books 10 GB, print_ads 22 GB, board_games 15 GB)
+- Tried using DINOv2 as a pre-filter for DISK — it filtered too aggressively and excluded correct results
+- For crop-based trivia search, DISK brute-force against everything is the right approach
+- DINOv2 overlaps with CLIP but has no text search capability
+- CLIP is strictly better for this use case (semantic understanding + text-to-image)
+- Keeping DINOv2 for now since 47 GB is negligible, but it's the weakest link in the stack
+
+### Pre-Filtering Doesn't Work for Crop Search
+
+- The trivia use case is always a small crop from a larger image
+- Pre-filters (DINOv2, CLIP) compare whole-image embeddings — a crop looks nothing like the full source page
+- DISK works because it matches local keypoints, not global image features
+- Brute-force DISK against all chunks is the correct strategy, not narrowing candidates first
+
+### Print Ads Not Yet Wired Into Searcher
+
+- `disk_searcher.py` and `server.py` only search book chunks
+- When print ads build finishes, need to add print ads chunks to the search path
+- Print ads chunks: `S:\faiss\disk_retrieval\printads_chunks\`
+- Print ads compact IDs: `D:\faiss\disk_retrieval\printads_chunk_ids\`
+
+### Book Chunk Paths Need Updating
+
+- Code still references `T:/faiss/disk_retrieval/chunks` for book chunks
+- Book chunks being moved to `S:/faiss/disk_retrieval/chunks` via robocopy
+- Update `disk_searcher.py`, `server.py`, and `consolidate_search_chunks.py` when ready
 
 ## Remaining Work
-
-- [ ] Run database migration
-- [ ] Update server.py DISK endpoint to use live tracking
-- [ ] Test rolling buffer with multiple chunks
-- [ ] Index remaining 2,213 books
-- [ ] Upgrade to 10 Gigabit network
-- [ ] Test full 441-chunk search
-- [ ] Frontend UI for viewing active searches
+- [ ] Finish print ads build (~6 days estimated)
+- [ ] Upgrade to 10 Gbps network
+- [ ] Install faiss-gpu and update disk_searcher.py
+- [ ] Re-chunk books to 10 GB with compact IDs
+- [ ] Run database migration for live tracking
+- [ ] Add chunk filter to web UI
+- [ ] Index remaining ~2,213 unprocessed books

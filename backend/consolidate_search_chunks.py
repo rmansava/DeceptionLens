@@ -34,12 +34,15 @@ LOCAL_BOOKS_BUFFER = "D:/faiss/disk_retrieval/books" # Buffer: copy books here f
 LOCAL_CHUNKS_DIR = "D:/faiss/disk_retrieval/chunks"  # Buffer: write chunks here first
 NAS_CHUNKS_DIR = "T:/faiss/disk_retrieval/chunks"    # Final: move chunks to NAS
 
+# Compact IDs output (stays on local SSD for fast reads during search)
+CHUNK_IDS_DIR = "D:/faiss/disk_retrieval/chunk_ids"
+
 # State file for instant resume (stored locally for speed)
 STATE_FILE = "D:/faiss/disk_retrieval/consolidation_state.json"
 
-# ~20GB chunks = ~40M vectors (128 dims * 4 bytes * 40M = 20.5GB)
-# Fits in 32GB RAM with room for paths.json and overhead
-MAX_VECTORS_PER_CHUNK = 40_000_000
+# ~10GB chunks = ~19.5M vectors (128 dims * 4 bytes = 512 bytes/vector)
+# 10GB target for GPU FAISS (fits in 16GB VRAM with headroom for DISK model + scratch)
+MAX_VECTORS_PER_CHUNK = 19_500_000
 
 # Buffer settings - target ~200GB on local SSD
 # Average book is ~2GB (index + paths), so ~100 books = 200GB
@@ -195,8 +198,8 @@ def copy_with_retry(src, dst, max_retries=3, delay=5):
     return False
 
 
-def save_chunk(chunk_num, vectors_list, paths_list):
-    """Save a chunk to local SSD, then copy to NAS (with retry)."""
+def save_chunk(chunk_num, vectors_list, ids_list, path_to_id):
+    """Save a chunk with compact IDs to local SSD, then copy FAISS to NAS."""
     print(f"  Saving chunk {chunk_num}...", end=" ", flush=True)
     t0 = time.time()
 
@@ -205,38 +208,41 @@ def save_chunk(chunk_num, vectors_list, paths_list):
     chunk_index = faiss.IndexFlatIP(128)
     chunk_index.add(all_vectors)
 
-    # Save to local first (fast)
+    # Save FAISS index to local first (fast), then copy to NAS
     os.makedirs(LOCAL_CHUNKS_DIR, exist_ok=True)
     local_index = os.path.join(LOCAL_CHUNKS_DIR, f"chunk_{chunk_num:03d}.faiss")
-    local_paths = os.path.join(LOCAL_CHUNKS_DIR, f"chunk_{chunk_num:03d}_paths.json")
-
     faiss.write_index(chunk_index, local_index)
-    with open(local_paths, 'w') as f:
-        json.dump(paths_list, f)
 
-    # Copy to NAS (with retry for network reliability)
     os.makedirs(NAS_CHUNKS_DIR, exist_ok=True)
     nas_index = os.path.join(NAS_CHUNKS_DIR, f"chunk_{chunk_num:03d}.faiss")
-    nas_paths = os.path.join(NAS_CHUNKS_DIR, f"chunk_{chunk_num:03d}_paths.json")
-
     copy_with_retry(local_index, nas_index)
-    copy_with_retry(local_paths, nas_paths)
 
-    # Delete local copies after successful NAS copy
     try:
         os.remove(local_index)
-        os.remove(local_paths)
     except Exception:
-        pass  # OK if cleanup fails
+        pass
+
+    # Save compact IDs (stays on local SSD)
+    os.makedirs(CHUNK_IDS_DIR, exist_ok=True)
+    ids_array = np.array(ids_list, dtype=np.int32)
+    ids_file = os.path.join(CHUNK_IDS_DIR, f"chunk_{chunk_num:03d}_ids.npy")
+    np.save(ids_file, ids_array)
+
+    # Save path_lookup.json
+    lookup = {v: k for k, v in path_to_id.items()}
+    lookup_list = [lookup[i] for i in range(len(lookup))]
+    lookup_file = os.path.join(CHUNK_IDS_DIR, "path_lookup.json")
+    with open(lookup_file, 'w') as f:
+        json.dump(lookup_list, f)
 
     # Get file sizes
     index_size = os.path.getsize(nas_index) / (1024**3)
-    paths_size = os.path.getsize(nas_paths) / (1024**3)
+    ids_size = os.path.getsize(ids_file) / (1024**2)
 
-    print(f"({time.time() - t0:.0f}s) - {index_size:.1f}GB index + {paths_size:.1f}GB paths")
+    print(f"({time.time() - t0:.0f}s) - {index_size:.1f}GB index + {ids_size:.0f}MB IDs")
 
     # Cleanup
-    del all_vectors, chunk_index
+    del all_vectors, chunk_index, ids_array
     gc.collect()
 
 
@@ -400,13 +406,50 @@ def main():
     start_time = time.time()
     chunk_num = start_chunk  # Resume from where we left off
     current_vectors = []
-    current_paths = []
+    current_ids = []
     current_count = 0
     books_in_chunk = 0
     books_in_current_chunk = []  # Track book names for state file
     books_processed = 0
     total_vectors = 0
     last_status_time = time.time()
+
+    # Compact ID tracking
+    path_to_id = {}
+    next_id = 0
+
+    def flush_chunk():
+        """Save current chunk and reset accumulators."""
+        nonlocal current_vectors, current_ids, current_count, books_in_chunk
+        nonlocal books_in_current_chunk, chunk_num
+
+        print(f"  Chunk {chunk_num}: {current_count:,} vectors from {books_in_chunk} books")
+        save_chunk(chunk_num, current_vectors, current_ids, path_to_id)
+
+        # Update state file with processed books
+        processed_books.update(books_in_current_chunk)
+        save_state(chunk_num + 1, processed_books)
+        print(f"    State saved: {len(processed_books):,} books processed, "
+              f"{len(path_to_id):,} unique paths")
+
+        # Update the books file if we're using one
+        if args.books_file:
+            remaining_in_file = [b for b in book_dirs if b not in processed_books]
+            with open(args.books_file, 'w', encoding='utf-8') as f:
+                for b in sorted(remaining_in_file):
+                    f.write(f"{b}\n")
+            print(f"    Book list updated: {len(remaining_in_file):,} books remaining")
+
+        # Reset for next chunk
+        del current_vectors
+        gc.collect()
+
+        current_vectors = []
+        current_ids = []
+        current_count = 0
+        books_in_chunk = 0
+        books_in_current_chunk = []
+        chunk_num += 1
 
     # Process books as they become ready
     while buffer.has_more():
@@ -439,30 +482,20 @@ def main():
             del index
 
             # Check if adding this book would exceed chunk limit
-            # If so, save current chunk first (if it has content)
             if current_count > 0 and current_count + book_vector_count > MAX_VECTORS_PER_CHUNK:
-                print(f"  Chunk {chunk_num}: {current_count:,} vectors from {books_in_chunk} books")
-                save_chunk(chunk_num, current_vectors, current_paths)
+                flush_chunk()
 
-                # Update state file with processed books
-                processed_books.update(books_in_current_chunk)
-                save_state(chunk_num + 1, processed_books)
-                print(f"    State saved: {len(processed_books):,} books processed")
-
-                # Reset for next chunk
-                del current_vectors
-                gc.collect()
-
-                current_vectors = []
-                current_paths = []
-                current_count = 0
-                books_in_chunk = 0
-                books_in_current_chunk = []
-                chunk_num += 1
+            # Convert paths to compact IDs for this book's vectors
+            book_ids = []
+            for path in paths:
+                if path not in path_to_id:
+                    path_to_id[path] = next_id
+                    next_id += 1
+                book_ids.append(path_to_id[path])
 
             # Now add this book to the (possibly new) chunk
             current_vectors.append(vectors)
-            current_paths.extend(paths)
+            current_ids.extend(book_ids)
             current_count += book_vector_count
             books_in_chunk += 1
             books_in_current_chunk.append(book)
@@ -479,32 +512,7 @@ def main():
 
         # Check if chunk is full (for books that exceed limit on their own)
         if current_count >= MAX_VECTORS_PER_CHUNK:
-            print(f"  Chunk {chunk_num}: {current_count:,} vectors from {books_in_chunk} books")
-            save_chunk(chunk_num, current_vectors, current_paths)
-
-            # Update state file with processed books
-            processed_books.update(books_in_current_chunk)
-            save_state(chunk_num + 1, processed_books)
-            print(f"    State saved: {len(processed_books):,} books processed")
-
-            # Update the books file if we're using one (remove processed books)
-            if args.books_file:
-                remaining_in_file = [b for b in book_dirs if b not in processed_books]
-                with open(args.books_file, 'w', encoding='utf-8') as f:
-                    for book in sorted(remaining_in_file):
-                        f.write(f"{book}\n")
-                print(f"    Book list updated: {len(remaining_in_file):,} books remaining")
-
-            # Reset for next chunk
-            del current_vectors
-            gc.collect()
-
-            current_vectors = []
-            current_paths = []
-            current_count = 0
-            books_in_chunk = 0
-            books_in_current_chunk = []
-            chunk_num += 1
+            flush_chunk()
 
         # Progress update every 30 seconds
         if time.time() - last_status_time > 30:
@@ -541,19 +549,17 @@ def main():
     # Save final chunk
     if current_vectors:
         print(f"  Chunk {chunk_num}: {current_count:,} vectors from {books_in_chunk} books (final)")
-        save_chunk(chunk_num, current_vectors, current_paths)
+        save_chunk(chunk_num, current_vectors, current_ids, path_to_id)
 
-        # Update state file with final chunk's books
         processed_books.update(books_in_current_chunk)
         save_state(chunk_num + 1, processed_books)
         print(f"    State saved: {len(processed_books):,} books processed")
 
-        # Update the books file if we're using one (remove processed books)
         if args.books_file:
             remaining_in_file = [b for b in book_dirs if b not in processed_books]
             with open(args.books_file, 'w', encoding='utf-8') as f:
-                for book in sorted(remaining_in_file):
-                    f.write(f"{book}\n")
+                for b in sorted(remaining_in_file):
+                    f.write(f"{b}\n")
             print(f"    Book list updated: {len(remaining_in_file):,} books remaining")
 
     # Cleanup
@@ -562,20 +568,24 @@ def main():
     # Summary
     elapsed = time.time() - start_time
     status = buffer.get_status()
+    chunks_created = chunk_num - start_chunk + (1 if current_vectors else 0)
 
     print()
     print("=" * 70)
     print("  COMPLETE!")
     print("=" * 70)
-    print(f"  Total chunks:  {chunk_num}")
-    print(f"  Total books:   {books_processed:,}")
-    print(f"  Total vectors: {total_vectors:,}")
-    print(f"  Time:          {elapsed/60:.1f} min ({elapsed/3600:.1f} hours)")
-    print(f"  Throughput:    {books_processed/(elapsed/60):.1f} books/min")
+    print(f"  Total chunks:    {chunk_num}")
+    print(f"  Total books:     {books_processed:,}")
+    print(f"  Total vectors:   {total_vectors:,}")
+    print(f"  Unique paths:    {len(path_to_id):,}")
+    print(f"  Avg chunk size:  ~{total_vectors * 512 / max(chunks_created, 1) / (1024**3):.1f} GB")
+    print(f"  Time:            {elapsed/60:.1f} min ({elapsed/3600:.1f} hours)")
+    print(f"  Throughput:      {books_processed/(elapsed/60):.1f} books/min")
     if status['errors']:
-        print(f"  Copy errors:   {status['errors']}")
+        print(f"  Copy errors:     {status['errors']}")
     print()
-    print(f"  Output: {NAS_CHUNKS_DIR}")
+    print(f"  FAISS chunks:    {NAS_CHUNKS_DIR}")
+    print(f"  Compact IDs:     {CHUNK_IDS_DIR}")
     print()
 
 

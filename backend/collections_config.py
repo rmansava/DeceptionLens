@@ -18,6 +18,9 @@ COLLECTIONS = {
         "opensearch_faces": "faces-books",
         # DISK features path
         "disk_features": "T:/disk-features/books",
+        # DISK search chunks
+        "disk_chunks_dir": "S:/faiss/disk_retrieval/chunks",
+        "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/chunk_ids",
         # Source data
         "source_path": "T:/archiverelated/books",
     },
@@ -32,6 +35,9 @@ COLLECTIONS = {
         "opensearch_faces": "faces-print_ads",
         # DISK features path
         "disk_features": "T:/disk-features/print_ads",
+        # DISK search chunks
+        "disk_chunks_dir": "S:/faiss/disk_retrieval/printads_chunks",
+        "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/printads_chunk_ids",
         # Source data
         "source_path": "T:/archiverelated/print ads",
     },
@@ -46,8 +52,29 @@ COLLECTIONS = {
         "opensearch_faces": "faces-board_games",
         # DISK features path
         "disk_features": "T:/disk-features/board_games",
+        # DISK search chunks
+        "disk_chunks_dir": "S:/faiss/disk_retrieval/boardgames_chunks",
+        "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/boardgames_chunk_ids",
         # Source data
         "source_path": "T:/archiverelated/board games",
+    },
+    "albums": {
+        "name": "Albums",
+        "description": "Album art",
+        # DISK search chunks
+        "disk_chunks_dir": "S:/faiss/disk_retrieval/albums_chunks",
+        "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/albums_chunk_ids",
+        # Source data
+        "source_path": "T:/albums",
+    },
+    "comics": {
+        "name": "Comics",
+        "description": "Comic book pages",
+        # DISK search chunks
+        "disk_chunks_dir": "S:/faiss/disk_retrieval/comics_chunks",
+        "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/comics_chunk_ids",
+        # Source data
+        "source_path": "T:/comics",
     },
 }
 
@@ -60,6 +87,25 @@ def get_collection_config(collection_name: str) -> dict:
     if collection_name not in COLLECTIONS:
         raise ValueError(f"Unknown collection: {collection_name}. Available: {list(COLLECTIONS.keys())}")
     return COLLECTIONS[collection_name]
+
+
+def get_disk_collections(categories: list = None) -> dict:
+    """Get DISK chunk paths for selected categories (or all if None).
+
+    Returns dict of category -> {'chunks_dir': ..., 'ids_dir': ...}
+    Only includes categories that have disk_chunks_dir configured.
+    """
+    result = {}
+    for name, config in COLLECTIONS.items():
+        if "disk_chunks_dir" not in config:
+            continue
+        if categories is not None and name not in categories:
+            continue
+        result[name] = {
+            "chunks_dir": config["disk_chunks_dir"],
+            "ids_dir": config["disk_chunk_ids_dir"],
+        }
+    return result
 
 
 def list_collections() -> list:

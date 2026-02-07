@@ -1,8 +1,9 @@
 """
 DISK Keypoint Search - finds source pages for cropped images.
 
-Uses consolidated FAISS chunks for fast searching across ~7000 books.
-Each query keypoint votes for the source image it matches.
+Uses consolidated FAISS chunks for fast searching across multiple collections
+(books, print_ads, board_games, albums, comics). Each query keypoint votes
+for the source image it matches.
 
 Streaming search mode: Copies chunks from NAS to local SSD for fast searching,
 then deletes local copy before moving to next chunk. This handles 13TB+ indexes
@@ -24,19 +25,15 @@ import kornia as K
 from threading import Thread
 from queue import Queue, Empty
 
+from collections_config import get_disk_collections
+
 logger = logging.getLogger(__name__)
 
-# Paths - NAS storage with local SSD buffer for fast searching
-NAS_CHUNKS_DIR = "T:/faiss/disk_retrieval/chunks"    # Source: chunks on NAS
-LOCAL_CHUNK_BUFFER = "D:/faiss/disk_retrieval/chunk_buffer"  # Buffer: copy here for fast reads
-CHUNK_IDS_DIR = "D:/faiss/disk_retrieval/chunk_ids"  # Compact IDs (converted from paths.json)
-BOOKS_DIR = "T:/faiss/disk_retrieval/books"  # Fallback if no chunks yet
+# Local SSD buffer for streaming chunks during search (shared across all categories)
+LOCAL_CHUNK_BUFFER = "D:/faiss/disk_retrieval/chunk_buffer"
 
-# Legacy path for backwards compatibility
-CHUNKS_DIR = NAS_CHUNKS_DIR
-
-# Global path lookup for compact ID format (loaded once)
-_id_to_path = None
+# Cached path lookups per category IDs dir
+_id_to_path_cache = {}
 
 # DISK model (lazy loaded)
 _disk_model = None
@@ -54,26 +51,30 @@ def get_disk_model():
     return _disk_model, _device
 
 
-def get_id_to_path():
-    """Load the global path lookup table (ID -> path string). Loaded once, cached."""
-    global _id_to_path
-    if _id_to_path is None:
-        lookup_file = os.path.join(CHUNK_IDS_DIR, "path_lookup.json")
+def get_id_to_path(chunk_ids_dir):
+    """Load path lookup table for a category. Cached per IDs directory."""
+    global _id_to_path_cache
+    if chunk_ids_dir not in _id_to_path_cache:
+        lookup_file = os.path.join(chunk_ids_dir, "path_lookup.json")
         if os.path.exists(lookup_file):
             logger.info(f"Loading path lookup from {lookup_file}...")
             load_start = time.time()
             with open(lookup_file, 'r') as f:
-                _id_to_path = json.load(f)
-            logger.info(f"Loaded {len(_id_to_path):,} path mappings in {time.time()-load_start:.1f}s")
+                _id_to_path_cache[chunk_ids_dir] = json.load(f)
+            logger.info(f"Loaded {len(_id_to_path_cache[chunk_ids_dir]):,} path mappings in {time.time()-load_start:.1f}s")
         else:
-            logger.info("No path_lookup.json found - will use paths.json from NAS")
-            _id_to_path = []  # Empty = not available
-    return _id_to_path
+            logger.info(f"No path_lookup.json found in {chunk_ids_dir}")
+            _id_to_path_cache[chunk_ids_dir] = []
+    return _id_to_path_cache[chunk_ids_dir]
 
 
-def load_chunk_paths(chunk_file):
+def load_chunk_paths(chunk_file, chunk_ids_dir):
     """
     Load path data for a chunk. Uses compact IDs if available, falls back to NAS paths.json.
+
+    Args:
+        chunk_file: Path to the .faiss chunk file
+        chunk_ids_dir: Directory containing compact IDs for this category
 
     Returns:
         (paths_or_ids, id_to_path_or_None)
@@ -81,23 +82,28 @@ def load_chunk_paths(chunk_file):
         - If fallback: (list of path strings, None)
     """
     chunk_name = os.path.basename(chunk_file).replace('.faiss', '')
-    ids_file = os.path.join(CHUNK_IDS_DIR, f"{chunk_name}_ids.npy")
+    ids_file = os.path.join(chunk_ids_dir, f"{chunk_name}_ids.npy")
 
     if os.path.exists(ids_file):
         # Fast path: load compact ID array from local SSD
         load_start = time.time()
         ids = np.load(ids_file)
-        id_to_path = get_id_to_path()
+        id_to_path = get_id_to_path(chunk_ids_dir)
         logger.info(f"  Loaded {chunk_name}_ids.npy ({len(ids):,} entries) in {time.time()-load_start:.1f}s")
         return ids, id_to_path
     else:
-        # Slow path: read full paths.json from NAS
-        nas_paths_file = os.path.join(NAS_CHUNKS_DIR, f"{chunk_name}_paths.json")
-        load_start = time.time()
-        with open(nas_paths_file, 'r') as f:
-            paths = json.load(f)
-        logger.info(f"  Loaded {chunk_name}_paths.json from NAS ({len(paths):,} entries) in {time.time()-load_start:.1f}s")
-        return paths, None
+        # Slow path: read full paths.json from NAS (same dir as chunk)
+        chunks_dir = os.path.dirname(chunk_file)
+        nas_paths_file = os.path.join(chunks_dir, f"{chunk_name}_paths.json")
+        if os.path.exists(nas_paths_file):
+            load_start = time.time()
+            with open(nas_paths_file, 'r') as f:
+                paths = json.load(f)
+            logger.info(f"  Loaded {chunk_name}_paths.json from NAS ({len(paths):,} entries) in {time.time()-load_start:.1f}s")
+            return paths, None
+        else:
+            logger.warning(f"  No IDs or paths file found for {chunk_name}")
+            return [], None
 
 
 def resolve_path(paths_or_ids, id_to_path, idx):
@@ -151,12 +157,39 @@ def extract_disk_features(image_bytes: bytes) -> np.ndarray:
     return descriptors.astype('float32')
 
 
-def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 0.7, top_n: int = 50, specific_chunks: list = None, search_id: int = None, progress_callback=None):
+def _collect_chunks(categories=None):
+    """
+    Collect all chunk files across selected categories.
+
+    Returns list of (chunk_file, chunk_ids_dir) tuples sorted by filename,
+    and a dict of category -> chunk_count for progress tracking.
+    """
+    disk_collections = get_disk_collections(categories)
+
+    all_chunks = []
+    category_counts = {}
+
+    for cat_name, cat_config in disk_collections.items():
+        chunks_dir = cat_config["chunks_dir"]
+        ids_dir = cat_config["ids_dir"]
+
+        chunk_files = sorted(glob(os.path.join(chunks_dir, "chunk_*.faiss")))
+        category_counts[cat_name] = len(chunk_files)
+
+        for cf in chunk_files:
+            all_chunks.append((cf, ids_dir))
+
+        if chunk_files:
+            logger.info(f"  {cat_name}: {len(chunk_files)} chunks from {chunks_dir}")
+        else:
+            logger.info(f"  {cat_name}: no chunks found in {chunks_dir}")
+
+    return all_chunks, category_counts
+
+
+def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 0.7, top_n: int = 50, specific_chunks: list = None, categories: list = None, search_id: int = None, progress_callback=None):
     """
     Search consolidated chunks for matching images using streaming mode.
-
-    Streaming mode copies each chunk from NAS to local SSD before searching,
-    then deletes the local copy. This handles indexes larger than local storage.
 
     Args:
         query_descriptors: Normalized DISK descriptors from query image
@@ -164,6 +197,7 @@ def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 
         threshold: Minimum similarity score to count as vote
         top_n: Number of top results to return
         specific_chunks: Optional list of chunk numbers to search (e.g., [142, 200])
+        categories: Optional list of categories to search (None = all)
         search_id: Optional search session ID for live tracking
         progress_callback: Optional callback for progress updates
 
@@ -174,71 +208,68 @@ def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 
         logger.warning("No keypoints extracted from query image")
         return []
 
-    # Check for chunks on NAS first
-    chunk_files = sorted(glob(os.path.join(NAS_CHUNKS_DIR, "chunk_*.faiss")))
+    # Collect chunks from all selected categories
+    cat_label = ",".join(categories) if categories else "all"
+    logger.info(f"Collecting chunks for categories: {cat_label}")
+    all_chunks, category_counts = _collect_chunks(categories)
 
     # Filter to specific chunks if requested
     if specific_chunks:
         filtered = []
-        for chunk_file in chunk_files:
+        for chunk_file, ids_dir in all_chunks:
             chunk_name = os.path.basename(chunk_file)
             chunk_num = chunk_name.replace('chunk_', '').replace('.faiss', '')
             if chunk_num in specific_chunks or int(chunk_num) in specific_chunks:
-                filtered.append(chunk_file)
-        chunk_files = filtered
-        logger.info(f"Searching only chunks: {specific_chunks}")
+                filtered.append((chunk_file, ids_dir))
+        all_chunks = filtered
+        logger.info(f"Filtered to specific chunks: {specific_chunks}")
 
-    if chunk_files:
-        # Use rolling buffer for faster searching (parallel copy + search)
-        return _search_chunks_rolling_buffer(query_descriptors, chunk_files, k, threshold, top_n, buffer_size=5, search_id=search_id, progress_callback=progress_callback)
+    if all_chunks:
+        logger.info(f"Searching {len(all_chunks)} total chunks across {len(category_counts)} categories")
+        return _search_chunks_rolling_buffer(query_descriptors, all_chunks, k, threshold, top_n, buffer_size=5, search_id=search_id, progress_callback=progress_callback)
     else:
-        # Fallback to per-book search
-        logger.warning("No chunks found, falling back to per-book search (slower)")
-        return _search_books_mode(query_descriptors, k, threshold, top_n)
+        logger.warning("No chunks found for any selected category")
+        return []
 
 
-def _copy_chunk_worker(copy_queue: Queue, chunk_files: list, start_idx: int, buffer_size: int):
-    """Background worker to copy chunks ahead of time."""
-    for i in range(start_idx, min(start_idx + buffer_size, len(chunk_files))):
-        nas_chunk_file = chunk_files[i]
-        nas_paths_file = nas_chunk_file.replace('.faiss', '_paths.json')
+def _copy_chunk_worker(copy_queue: Queue, chunk_list: list, start_idx: int, count: int):
+    """Background worker to copy chunks ahead of time.
+
+    Args:
+        chunk_list: List of (chunk_file, chunk_ids_dir) tuples
+    """
+    for i in range(start_idx, min(start_idx + count, len(chunk_list))):
+        nas_chunk_file, _ = chunk_list[i]
         chunk_name = os.path.basename(nas_chunk_file)
-        paths_name = os.path.basename(nas_paths_file)
-
         local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
-        local_paths_file = os.path.join(LOCAL_CHUNK_BUFFER, paths_name)
 
         # Check if already cached
-        chunk_exists = os.path.exists(local_chunk_file) and os.path.exists(local_paths_file)
+        chunk_exists = os.path.exists(local_chunk_file)
         same_size = chunk_exists and os.path.getsize(local_chunk_file) == os.path.getsize(nas_chunk_file)
 
         if not same_size:
             logger.info(f"  Background: Copying chunk {i+1} ({chunk_name})...")
             copy_start = time.time()
-
-            # Only copy the FAISS index file (paths file read directly from NAS)
             shutil.copy2(nas_chunk_file, local_chunk_file)
-
             copy_time = time.time() - copy_start
             chunk_size_gb = os.path.getsize(local_chunk_file) / (1024**3)
             logger.info(f"  Background: Copied {chunk_size_gb:.1f}GB in {copy_time:.1f}s")
 
-        # Signal that this chunk is ready (use NAS paths file directly)
-        copy_queue.put((i, local_chunk_file, nas_paths_file))
+        # Signal that this chunk is ready
+        copy_queue.put((i, local_chunk_file))
 
 
-def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_files: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, search_id: int = None, progress_callback=None):
+def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, search_id: int = None, progress_callback=None):
     """
     Search using rolling buffer: maintain 5 chunks in local buffer, copy next chunk while searching current.
 
-    This parallelizes copy and search operations for much faster throughput.
-
     Args:
+        chunk_list: List of (chunk_file, chunk_ids_dir) tuples
         search_id: Optional search session ID for live progress tracking
-        progress_callback: Optional callback(chunk_idx, total_chunks, top_results, elapsed_ms) for progress updates
+        progress_callback: Optional callback(chunk_idx, total_chunks, top_results, elapsed_ms)
     """
     all_votes = Counter()
-    total_chunks = len(chunk_files)
+    total_chunks = len(chunk_list)
 
     os.makedirs(LOCAL_CHUNK_BUFFER, exist_ok=True)
     search_start = time.time()
@@ -248,30 +279,27 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_files: li
     next_copy_idx = buffer_size
 
     logger.info(f"Starting rolling buffer search (buffer size: {buffer_size} chunks)")
-    copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_files, 0, buffer_size))
+    copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, 0, buffer_size))
     copy_thread.daemon = True
     copy_thread.start()
 
     for chunk_idx in range(total_chunks):
-        nas_chunk_file = chunk_files[chunk_idx]
+        nas_chunk_file, chunk_ids_dir = chunk_list[chunk_idx]
         chunk_name = os.path.basename(nas_chunk_file)
         local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
-        local_paths_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name.replace('.faiss', '_paths.json'))
 
-        # Wait for this chunk to be ready (if it's being copied)
+        # Wait for this chunk to be ready
         logger.info(f"[{chunk_idx + 1}/{total_chunks}] Waiting for {chunk_name}...")
         ready = False
         while not ready:
             try:
-                ready_idx, _, _ = copy_queue.get(timeout=1)
+                ready_idx, _ = copy_queue.get(timeout=1)
                 if ready_idx == chunk_idx:
                     ready = True
                 else:
-                    # Put it back for later
-                    copy_queue.put((ready_idx, _, _))
+                    copy_queue.put((ready_idx, _))
             except Empty:
-                # Check if file exists (might have been cached)
-                if os.path.exists(local_chunk_file) and os.path.exists(local_paths_file):
+                if os.path.exists(local_chunk_file):
                     ready = True
 
         # Load and search
@@ -279,8 +307,8 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_files: li
         load_start = time.time()
         index = faiss.read_index(local_chunk_file, faiss.IO_FLAG_MMAP)
 
-        # Load paths (compact IDs from local SSD, or paths.json from NAS as fallback)
-        paths_or_ids, id_to_path = load_chunk_paths(chunk_files[chunk_idx])
+        # Load paths using this chunk's category-specific IDs dir
+        paths_or_ids, id_to_path = load_chunk_paths(nas_chunk_file, chunk_ids_dir)
 
         load_time = time.time() - load_start
         logger.info(f"  Loaded in {load_time:.1f}s (mmap)")
@@ -301,7 +329,7 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_files: li
         # Free memory
         del index, paths_or_ids
 
-        # Delete this chunk to make room (paths file is on NAS, not copied)
+        # Delete this chunk to make room
         try:
             os.remove(local_chunk_file)
             logger.info(f"  Deleted {chunk_name} from buffer")
@@ -310,7 +338,7 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_files: li
 
         # Start copying next chunk if available
         if next_copy_idx < total_chunks:
-            copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_files, next_copy_idx, 1))
+            copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, next_copy_idx, 1))
             copy_thread.daemon = True
             copy_thread.start()
             next_copy_idx += 1
@@ -336,165 +364,7 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_files: li
     return all_votes.most_common(top_n)
 
 
-def _search_chunks_streaming(query_descriptors: np.ndarray, chunk_files: list, k: int, threshold: float, top_n: int):
-    """
-    Search using streaming mode: copy chunk from NAS → local SSD → search → delete.
-
-    This allows searching indexes larger than local storage by only keeping
-    one chunk on the SSD at a time.
-    """
-    all_votes = Counter()
-    total_chunks = len(chunk_files)
-
-    # Ensure buffer directory exists
-    os.makedirs(LOCAL_CHUNK_BUFFER, exist_ok=True)
-
-    search_start = time.time()
-
-    for chunk_idx, nas_chunk_file in enumerate(chunk_files):
-        nas_paths_file = nas_chunk_file.replace('.faiss', '_paths.json')
-        chunk_name = os.path.basename(nas_chunk_file)
-        paths_name = os.path.basename(nas_paths_file)
-
-        if not os.path.exists(nas_paths_file):
-            logger.warning(f"Missing paths file for {chunk_name}")
-            continue
-
-        # Copy FAISS index to local SSD (paths file read directly from NAS)
-        local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
-
-        # Check if index already cached
-        chunk_exists = os.path.exists(local_chunk_file)
-        same_size = chunk_exists and os.path.getsize(local_chunk_file) == os.path.getsize(nas_chunk_file)
-
-        if same_size:
-            logger.info(f"[{chunk_idx + 1}/{total_chunks}] Using cached {chunk_name} from local SSD")
-            copy_time = 0
-        else:
-            logger.info(f"[{chunk_idx + 1}/{total_chunks}] Copying {chunk_name} to local SSD...")
-            copy_start = time.time()
-
-            # Only copy FAISS index (paths file read directly from NAS - no corruption)
-            shutil.copy2(nas_chunk_file, local_chunk_file)
-
-            copy_time = time.time() - copy_start
-            chunk_size_gb = os.path.getsize(local_chunk_file) / (1024**3)
-            logger.info(f"  Copied {chunk_size_gb:.1f}GB in {copy_time:.1f}s ({chunk_size_gb/copy_time:.1f} GB/s)")
-
-        # Load and search from local SSD (fast)
-        logger.info(f"  Searching {chunk_name}...")
-        load_start = time.time()
-
-        # Use memory-mapped loading for fast access to large indexes
-        index = faiss.read_index(local_chunk_file, faiss.IO_FLAG_MMAP)
-        # Load paths (compact IDs from local SSD, or paths.json from NAS as fallback)
-        paths_or_ids, id_to_path = load_chunk_paths(nas_chunk_file)
-
-        load_time = time.time() - load_start
-        logger.info(f"  Loaded in {load_time:.1f}s (mmap)")
-
-        # Search
-        search_start_chunk = time.time()
-        distances, indices = index.search(query_descriptors, k)
-        search_time = time.time() - search_start_chunk
-        logger.info(f"  Searched in {search_time:.1f}s")
-
-        # Accumulate votes
-        for i in range(len(query_descriptors)):
-            for j in range(k):
-                idx = indices[i][j]
-                if idx >= 0 and distances[i][j] >= threshold:
-                    all_votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
-
-        # Free memory and delete local copy
-        del index, paths_or_ids
-
-        try:
-            os.remove(local_chunk_file)
-            os.remove(local_paths_file)
-        except Exception as e:
-            logger.warning(f"  Failed to cleanup local files: {e}")
-
-        # Progress update
-        elapsed = time.time() - search_start
-        avg_per_chunk = elapsed / (chunk_idx + 1)
-        remaining = (total_chunks - chunk_idx - 1) * avg_per_chunk
-        logger.info(f"  Progress: {chunk_idx + 1}/{total_chunks} chunks | "
-                   f"ETA: {remaining/60:.1f}m | Top vote: {all_votes.most_common(1)[0][1] if all_votes else 0}")
-
-    total_time = time.time() - search_start
-    logger.info(f"Search complete: {total_chunks} chunks in {total_time/60:.1f}m")
-
-    return all_votes.most_common(top_n)
-
-
-def _search_chunks_mode(query_descriptors: np.ndarray, chunk_files: list, k: int, threshold: float, top_n: int):
-    """Legacy: Search using consolidated chunks directly (requires chunks on local storage)."""
-    all_votes = Counter()
-
-    for chunk_file in chunk_files:
-        logger.info(f"Searching {os.path.basename(chunk_file)}...")
-
-        # Load chunk with memory mapping
-        index = faiss.read_index(chunk_file, faiss.IO_FLAG_MMAP)
-        paths_or_ids, id_to_path = load_chunk_paths(chunk_file)
-
-        # Search
-        distances, indices = index.search(query_descriptors, k)
-
-        # Accumulate votes
-        for i in range(len(query_descriptors)):
-            for j in range(k):
-                idx = indices[i][j]
-                if idx >= 0 and distances[i][j] >= threshold:
-                    all_votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
-
-        # Free memory
-        del index, paths_or_ids
-
-    return all_votes.most_common(top_n)
-
-
-def _search_books_mode(query_descriptors: np.ndarray, k: int, threshold: float, top_n: int):
-    """Fallback: search per-book indexes (slower)."""
-    all_votes = Counter()
-
-    book_dirs = [d for d in os.listdir(BOOKS_DIR)
-                 if os.path.isfile(os.path.join(BOOKS_DIR, d, "index.faiss"))]
-
-    for i, book in enumerate(book_dirs):
-        index_path = os.path.join(BOOKS_DIR, book, "index.faiss")
-        paths_path = os.path.join(BOOKS_DIR, book, "paths.json")
-
-        if not os.path.exists(paths_path):
-            continue
-
-        try:
-            index = faiss.read_index(index_path)
-            with open(paths_path, 'r') as f:
-                paths = json.load(f)
-
-            distances, indices = index.search(query_descriptors, k)
-
-            for qi in range(len(query_descriptors)):
-                for j in range(k):
-                    idx = indices[qi][j]
-                    if idx >= 0 and distances[qi][j] >= threshold:
-                        all_votes[paths[idx]] += 1
-
-            del index
-
-        except Exception as e:
-            logger.warning(f"Error searching {book}: {e}")
-            continue
-
-        if (i + 1) % 500 == 0:
-            logger.info(f"Searched {i + 1}/{len(book_dirs)} books...")
-
-    return all_votes.most_common(top_n)
-
-
-def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: float = 0.7, specific_chunks: list = None, progress_callback=None):
+def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: float = 0.7, specific_chunks: list = None, categories: list = None, progress_callback=None):
     """
     Main entry point for DISK search.
 
@@ -504,6 +374,7 @@ def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: floa
         k: Nearest neighbors per keypoint
         threshold: Minimum similarity for voting
         specific_chunks: Optional list of chunk numbers to search (e.g., [142])
+        categories: Optional list of categories to search (None = all)
         progress_callback: Optional callback for live progress updates
 
     Returns:
@@ -518,7 +389,7 @@ def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: floa
         return []
 
     # Search
-    results = search_chunks(descriptors, k=k, threshold=threshold, top_n=top_k, specific_chunks=specific_chunks, progress_callback=progress_callback)
+    results = search_chunks(descriptors, k=k, threshold=threshold, top_n=top_k, specific_chunks=specific_chunks, categories=categories, progress_callback=progress_callback)
 
     # Format results
     formatted = []
@@ -533,6 +404,12 @@ def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: floa
         })
 
     return formatted
+
+
+def get_total_chunks(categories=None):
+    """Get total chunk count across selected categories (for progress tracking)."""
+    _, category_counts = _collect_chunks(categories)
+    return sum(category_counts.values())
 
 
 # For testing
@@ -551,11 +428,16 @@ if __name__ == "__main__":
         # Check for specific chunks argument
         specific_chunks = None
         if len(sys.argv) > 2:
-            # Parse chunk numbers from command line (e.g., "142" or "142,200,300")
             specific_chunks = sys.argv[2].split(',')
             print(f"Searching only chunks: {specific_chunks}", flush=True)
 
-        results = search_disk(image_bytes, top_k=10, specific_chunks=specific_chunks)
+        # Check for categories argument
+        categories = None
+        if len(sys.argv) > 3:
+            categories = sys.argv[3].split(',')
+            print(f"Searching categories: {categories}", flush=True)
+
+        results = search_disk(image_bytes, top_k=10, specific_chunks=specific_chunks, categories=categories)
         print(f"\nResults ({len(results)} found):")
         for r in results:
             print(f"{r['votes']:4d} votes: {r['path']}")

@@ -1,21 +1,20 @@
 r"""
-Build DISK keypoint chunks for print ads - direct to chunks with compact IDs.
+Build DISK keypoint chunks for albums - direct to chunks with compact IDs.
 
-Unlike books (which go through per-book shards then consolidation), print ads
-are individual images with no natural grouping. This script goes straight from
-images to search-ready chunks:
+Same approach as print ads: individual images with no natural grouping, so we go
+straight from images to search-ready chunks:
 
-  1. List all images across all subfolders
-  2. Process in batches of IMAGES_PER_CHUNK (~5000)
-  3. Each batch: extract DISK features -> build FAISS index -> save chunk + compact IDs
+  1. List all images across all subfolders (A-Z, 0-9, #)
+  2. Extract DISK features per image on GPU
+  3. Accumulate vectors, flush to chunk when hitting ~10 GB (19.5M vectors)
   4. Compact IDs from the start (no paths.json bloat)
 
-Input:  Local copy of print ads (fast reads from SSD)
-Output: chunk_XXX.faiss  -> NAS (T:/faiss/disk_retrieval/printads_chunks/)
-        chunk_XXX_ids.npy -> local SSD (D:/faiss/disk_retrieval/printads_chunk_ids/)
+Input:  Local copy of albums (fast reads from SSD)
+Output: chunk_XXX.faiss  -> NAS (S:/faiss/disk_retrieval/albums_chunks/)
+        chunk_XXX_ids.npy -> local SSD (D:/faiss/disk_retrieval/albums_chunk_ids/)
         path_lookup.json  -> local SSD (same dir as IDs)
 
-Paths stored point to the NAS originals (T:/archiverelated/print ads/...).
+Paths stored point to the NAS originals (T:/albums/...).
 Resumable via progress file.
 """
 
@@ -44,18 +43,18 @@ except ImportError:
 # CONFIG - Edit these paths as needed
 # ============================================================================
 
-# Source: local copy of print ads for fast reading (scans all subfolders)
-LOCAL_IMAGES_DIR = r"C:\printads"
+# Source: local copy of albums for fast reading (scans all subfolders)
+LOCAL_IMAGES_DIR = r"C:\albums"
 
 # Path remapping: stored paths point to NAS originals
-NAS_IMAGES_DIR = r"T:\archiverelated\print ads"
+NAS_IMAGES_DIR = r"T:\albums"
 
 # Output: FAISS chunks go to NAS (searched via rolling buffer copy)
-NAS_CHUNKS_DIR = r"S:\faiss\disk_retrieval\printads_chunks"
-LOCAL_CHUNKS_BUFFER = r"D:\faiss\disk_retrieval\printads_chunks"  # Write here first, then copy to NAS
+NAS_CHUNKS_DIR = r"S:\faiss\disk_retrieval\albums_chunks"
+LOCAL_CHUNKS_BUFFER = r"D:\faiss\disk_retrieval\albums_chunks"  # Write here first, then copy to NAS
 
 # Output: Compact IDs stay on local SSD (fast reads during search)
-CHUNK_IDS_DIR = r"D:\faiss\disk_retrieval\printads_chunk_ids"
+CHUNK_IDS_DIR = r"D:\faiss\disk_retrieval\albums_chunk_ids"
 
 # Progress tracking
 PROGRESS_DIR = CHUNK_IDS_DIR
@@ -85,10 +84,8 @@ def log(msg):
 
 def remap_path(local_path):
     """Convert local read path to NAS storage path."""
-    # Replace local prefix with NAS prefix
     if local_path.startswith(LOCAL_IMAGES_DIR):
         return NAS_IMAGES_DIR + local_path[len(LOCAL_IMAGES_DIR):]
-    # Try with normalized separators
     local_norm = local_path.replace('\\', '/')
     local_dir_norm = LOCAL_IMAGES_DIR.replace('\\', '/')
     if local_norm.startswith(local_dir_norm):
@@ -136,7 +133,7 @@ def load_progress():
 
 
 def save_progress(next_chunk, processed_images, next_id):
-    """Save build progress (image list stored separately to keep this small)."""
+    """Save build progress."""
     os.makedirs(PROGRESS_DIR, exist_ok=True)
     state = {
         'next_chunk': next_chunk,
@@ -152,10 +149,9 @@ def save_progress(next_chunk, processed_images, next_id):
 
 
 def save_path_lookup(path_to_id):
-    """Save the global path lookup (both directions)."""
+    """Save the global path lookup (list indexed by ID) - used during search."""
     os.makedirs(CHUNK_IDS_DIR, exist_ok=True)
 
-    # Save id_to_path (list indexed by ID) - used during search
     id_to_path = [''] * len(path_to_id)
     for path, pid in path_to_id.items():
         id_to_path[pid] = path
@@ -197,16 +193,10 @@ def preprocess_image(image_path, max_dim=MAX_IMAGE_DIM):
 
 
 def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
-    """
-    Build FAISS index from accumulated descriptors and save chunk + IDs.
-
-    Returns:
-        num_vectors
-    """
+    """Build FAISS index from accumulated descriptors and save chunk + IDs."""
     if not all_descriptors:
         return 0
 
-    # Build FAISS index
     log(f"  Building FAISS index for chunk {chunk_num}...")
     all_desc = np.vstack(all_descriptors)
     num_vectors = len(all_desc)
@@ -250,7 +240,7 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
 
 def main():
     log("=" * 70)
-    log("PRINT ADS DISK CHUNK BUILDER")
+    log("ALBUMS DISK CHUNK BUILDER")
     log(f"Source (local):  {LOCAL_IMAGES_DIR}")
     log(f"Paths stored as: {NAS_IMAGES_DIR}")
     log(f"Chunks output:   {NAS_CHUNKS_DIR}")
@@ -261,7 +251,7 @@ def main():
     # Check source exists
     if not os.path.exists(LOCAL_IMAGES_DIR):
         log(f"ERROR: Source directory not found: {LOCAL_IMAGES_DIR}")
-        log(f"Copy print ads from NAS to local drive first.")
+        log(f"Copy albums from NAS to local drive first.")
         log(f"  robocopy \"{NAS_IMAGES_DIR}\" \"{LOCAL_IMAGES_DIR}\" /E /R:2 /W:5")
         sys.exit(1)
 

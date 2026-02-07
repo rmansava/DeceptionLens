@@ -1010,6 +1010,7 @@ async def disk_search_image(
     threshold: float = Query(default=0.7, ge=0.0, le=1.0, description="Minimum similarity for voting"),
     live_tracking: bool = Query(default=True, description="Enable live progress tracking"),
     chunk_ids: str = Query(default=None, description="Comma-separated chunk IDs for testing (e.g. '141,142,143')"),
+    collections: str = Query(default=None, description="Comma-separated collections to search (e.g. 'books,print_ads'). Default: all"),
     background_tasks: BackgroundTasks = None
 ):
     """
@@ -1027,27 +1028,35 @@ async def disk_search_image(
     - **threshold**: Minimum similarity score to count as vote
     - **live_tracking**: Enable live progress updates (default: true)
     - **chunk_ids**: Comma-separated chunk IDs for testing (e.g. '141,142,143')
+    - **collections**: Comma-separated collections to search (e.g. 'books,print_ads'). Default: all
     """
     start_time = time.time()
     search_id = None
 
     try:
-        from disk_searcher import search_disk
+        from disk_searcher import search_disk, get_total_chunks
         from db_helper import create_search_session, update_search_progress, complete_search_session, add_search_note
         from disk_queue import get_disk_queue
-        from glob import glob
         import asyncio
 
         image_bytes = await file.read()
         image_filename = file.filename
 
+        # Parse collections
+        categories = None
+        if collections:
+            categories = [c.strip() for c in collections.split(',') if c.strip()]
+            if not categories:
+                categories = None
+
         # Parse chunk_ids if provided
         specific_chunks = None
         if chunk_ids:
             specific_chunks = [int(x.strip()) for x in chunk_ids.split(',')]
-            logger.info(f"DISK search: {len(image_bytes)} bytes, top_k={top_k}, chunks={specific_chunks}, live_tracking={live_tracking}")
-        else:
-            logger.info(f"DISK search: {len(image_bytes)} bytes, top_k={top_k}, live_tracking={live_tracking}")
+
+        cat_label = ",".join(categories) if categories else "all"
+        logger.info(f"DISK search: {len(image_bytes)} bytes, top_k={top_k}, collections={cat_label}, live_tracking={live_tracking}" +
+                    (f", chunks={specific_chunks}" if specific_chunks else ""))
 
         # Create search session for live tracking
         if live_tracking:
@@ -1055,17 +1064,16 @@ async def disk_search_image(
             if specific_chunks:
                 total_chunks = len(specific_chunks)
             else:
-                chunk_files = sorted(glob(os.path.join("T:/faiss/disk_retrieval/chunks", "chunk_*.faiss")))
-                total_chunks = len(chunk_files)
+                total_chunks = get_total_chunks(categories)
 
             search_id = create_search_session(
                 search_type="DISK Keypoint",
                 query_image=image_bytes,
                 query_image_name=image_filename,
-                collection="books",
+                collection=cat_label,
                 total_chunks=total_chunks
             )
-            logger.info(f"Created search session #{search_id} with {total_chunks} chunks")
+            logger.info(f"Created search session #{search_id} with {total_chunks} chunks across {cat_label}")
 
         # Progress callback for live updates
         def progress_callback(current_chunk, total_chunks, top_results, elapsed_ms):
@@ -1075,7 +1083,7 @@ async def disk_search_image(
                 except Exception as e:
                     logger.error(f"Failed to update search progress: {e}")
 
-        # Define the search function to be executed
+        # Define the search function to be executed (categories captured in closure)
         def run_search(image_bytes, top_k, k, threshold, specific_chunks, progress_callback):
             return search_disk(
                 image_bytes,
@@ -1083,6 +1091,7 @@ async def disk_search_image(
                 k=k,
                 threshold=threshold,
                 specific_chunks=specific_chunks,
+                categories=categories,
                 progress_callback=progress_callback
             )
 
