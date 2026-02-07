@@ -31,6 +31,7 @@ import torch
 import cv2
 from glob import glob
 from datetime import datetime
+from threading import Thread, Event
 
 try:
     import kornia.feature as KF
@@ -196,15 +197,56 @@ def preprocess_image(image_path, max_dim=MAX_IMAGE_DIM):
         return None
 
 
+# Background NAS copy state
+_nas_copy_thread = None
+_nas_copy_error = None
+
+
+def _nas_copy_worker(local_faiss, nas_faiss, chunk_num):
+    """Background worker to copy a chunk from local SSD to NAS."""
+    global _nas_copy_error
+    try:
+        copy_start = time.time()
+        shutil.copy2(local_faiss, nas_faiss)
+        copy_time = time.time() - copy_start
+        faiss_size = os.path.getsize(nas_faiss) / (1024**3)
+        log(f"  NAS copy done: chunk {chunk_num:03d} ({faiss_size:.1f} GB in {copy_time:.0f}s)")
+        # Delete local buffer copy now that NAS has it
+        try:
+            os.remove(local_faiss)
+        except Exception:
+            pass
+    except Exception as e:
+        _nas_copy_error = str(e)
+        log(f"  ERROR: NAS copy failed for chunk {chunk_num:03d}: {e}")
+
+
+def wait_for_nas_copy():
+    """Wait for any pending NAS copy to finish. Call before starting a new one or at exit."""
+    global _nas_copy_thread, _nas_copy_error
+    if _nas_copy_thread is not None:
+        _nas_copy_thread.join()
+        _nas_copy_thread = None
+        if _nas_copy_error:
+            log(f"  WARNING: Previous NAS copy had error: {_nas_copy_error}")
+            _nas_copy_error = None
+
+
 def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
     """
     Build FAISS index from accumulated descriptors and save chunk + IDs.
+    NAS copy runs in background so GPU extraction can continue immediately.
 
     Returns:
         num_vectors
     """
+    global _nas_copy_thread
+
     if not all_descriptors:
         return 0
+
+    # Wait for any previous NAS copy to finish before writing new local file
+    wait_for_nas_copy()
 
     # Build FAISS index
     log(f"  Building FAISS index for chunk {chunk_num}...")
@@ -220,17 +262,6 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
     faiss.write_index(index, local_faiss)
     faiss_size = os.path.getsize(local_faiss) / (1024**3)
 
-    # Copy to NAS
-    os.makedirs(NAS_CHUNKS_DIR, exist_ok=True)
-    nas_faiss = os.path.join(NAS_CHUNKS_DIR, f"chunk_{chunk_num:03d}.faiss")
-    shutil.copy2(local_faiss, nas_faiss)
-
-    # Delete local buffer copy
-    try:
-        os.remove(local_faiss)
-    except Exception:
-        pass
-
     # Save compact IDs (stays on local SSD)
     os.makedirs(CHUNK_IDS_DIR, exist_ok=True)
     ids_array = np.array(all_ids, dtype=np.int32)
@@ -240,6 +271,14 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
 
     log(f"  Chunk {chunk_num:03d}: {num_vectors:,} vectors from {num_images} images "
         f"({faiss_size:.1f} GB index, {ids_size:.0f} MB IDs)")
+
+    # Queue NAS copy in background - GPU extraction continues immediately
+    os.makedirs(NAS_CHUNKS_DIR, exist_ok=True)
+    nas_faiss = os.path.join(NAS_CHUNKS_DIR, f"chunk_{chunk_num:03d}.faiss")
+    _nas_copy_thread = Thread(target=_nas_copy_worker, args=(local_faiss, nas_faiss, chunk_num))
+    _nas_copy_thread.daemon = True
+    _nas_copy_thread.start()
+    log(f"  NAS copy queued (background): {local_faiss} -> {nas_faiss}")
 
     # Cleanup
     del all_desc, all_descriptors, all_ids, ids_array, index
@@ -403,6 +442,9 @@ def main():
         chunk_num += 1
         save_progress(chunk_num, processed, next_id)
         save_path_lookup(path_to_id)
+
+    # Wait for any pending NAS copy before reporting final stats
+    wait_for_nas_copy()
 
     # Final summary
     log("\n" + "=" * 70)
