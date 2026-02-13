@@ -244,6 +244,10 @@ else
                                 {
                                     <p><strong>Elapsed:</strong> @FormatDuration(entry.SearchDurationMs.Value)</p>
                                 }
+                                @if (entry.TopResultVotes.HasValue && entry.TopResultVotes > 0)
+                                {
+                                    <p><strong>Top Votes:</strong> @entry.TopResultVotes.Value.ToString("N0")</p>
+                                }
                                 @if (!string.IsNullOrEmpty(entry.TopResultPath))
                                 {
                                     <p class="top-result"><strong>Top:</strong> @GetFileName(entry.TopResultPath)</p>
