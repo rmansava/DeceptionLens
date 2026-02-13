@@ -19,7 +19,7 @@ COLLECTIONS = {
         # DISK features path
         "disk_features": "T:/disk-features/books",
         # DISK search chunks
-        "disk_chunks_dir": "S:/faiss/disk_retrieval/chunks",
+        "disk_chunks_dir": "T:/faiss/disk_retrieval/chunks",
         "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/chunk_ids",
         # Source data
         "source_path": "T:/archiverelated/books",
@@ -53,7 +53,7 @@ COLLECTIONS = {
         # DISK features path
         "disk_features": "T:/disk-features/board_games",
         # DISK search chunks
-        "disk_chunks_dir": "S:/faiss/disk_retrieval/boardgames_chunks",
+        "disk_chunks_dir": "T:/faiss/disk_retrieval/boardgames_chunks",
         "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/boardgames_chunk_ids",
         # Source data
         "source_path": "T:/archiverelated/board games",
@@ -62,7 +62,7 @@ COLLECTIONS = {
         "name": "Albums",
         "description": "Album art",
         # DISK search chunks
-        "disk_chunks_dir": "S:/faiss/disk_retrieval/albums_chunks",
+        "disk_chunks_dir": "T:/faiss/disk_retrieval/albums_chunks",
         "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/albums_chunk_ids",
         # Source data
         "source_path": "T:/albums",
@@ -71,10 +71,19 @@ COLLECTIONS = {
         "name": "Comics",
         "description": "Comic book pages",
         # DISK search chunks
-        "disk_chunks_dir": "S:/faiss/disk_retrieval/comics_chunks",
+        "disk_chunks_dir": "T:/faiss/disk_retrieval/comics_chunks",
         "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/comics_chunk_ids",
         # Source data
         "source_path": "T:/comics",
+    },
+    "cereal": {
+        "name": "Cereal",
+        "description": "Cereal boxes and related imagery",
+        # DISK search chunks
+        "disk_chunks_dir": "T:/faiss/disk_retrieval/cereal_chunks",
+        "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/cereal_chunk_ids",
+        # Source data
+        "source_path": "T:/archiverelated/cereal",
     },
 }
 
@@ -112,12 +121,15 @@ def list_collections() -> list:
     """List all available collections with their status."""
     result = []
     for name, config in COLLECTIONS.items():
-        clip_exists = os.path.exists(config["clip_index"])
-        result.append({
+        clip_index = config.get("clip_index")
+        clip_exists = os.path.exists(clip_index) if clip_index else False
+        entry = {
             "name": name,
             "display_name": config["name"],
             "description": config["description"],
             "clip_index_exists": clip_exists,
-            "clip_index_path": config["clip_index"],
-        })
+        }
+        if clip_index:
+            entry["clip_index_path"] = clip_index
+        result.append(entry)
     return result

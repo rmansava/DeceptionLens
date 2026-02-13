@@ -1,6 +1,7 @@
 @page "/"
 @inject ISearchService SearchService
 @inject ILogger<Index> Logger
+@inject NavigationManager Navigation
 
 <PageTitle>Deception Lens - An Image Finder</PageTitle>
 
@@ -182,7 +183,7 @@
         <div class="results-header">
             <div class="results-title-row">
                 <h2>Results</h2>
-                <button class="history-btn" @onclick="ToggleHistoryPanel" title="Search History">
+                <button class="history-btn" @onclick="GoToHistory" title="Search History">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <circle cx="12" cy="12" r="10"/>
                         <polyline points="12,6 12,12 16,14"/>
@@ -1402,6 +1403,11 @@
             isSearching = false;
             StateHasChanged();
         }
+    }
+
+    private void GoToHistory()
+    {
+        Navigation.NavigateTo("/history");
     }
 
     private async Task ToggleHistoryPanel()

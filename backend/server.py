@@ -1317,6 +1317,10 @@ class SearchHistoryEntry(BaseModel):
     Collection: Optional[str] = None
     TopResultPath: Optional[str] = None
     TopResultScore: Optional[float] = None
+    Status: Optional[str] = "completed"
+    CurrentProgress: Optional[str] = None
+    TotalChunks: Optional[int] = None
+    TopResultVotes: Optional[int] = None
 
 
 class SearchHistoryListResponse(BaseModel):
@@ -1346,6 +1350,9 @@ class SearchHistoryDetail(BaseModel):
     SearchDurationMs: Optional[int] = None
     Collection: Optional[str] = None
     Notes: Optional[str] = None
+    Status: Optional[str] = "completed"
+    CurrentProgress: Optional[str] = None
+    TotalChunks: Optional[int] = None
     Results: List[SearchHistoryDetailResult]
 
 
@@ -1407,6 +1414,9 @@ def get_history_detail(search_id: int):
             SearchDurationMs=details.get('SearchDurationMs'),
             Collection=details.get('Collection'),
             Notes=details.get('Notes'),
+            Status=details.get('Status', 'completed'),
+            CurrentProgress=details.get('CurrentProgress'),
+            TotalChunks=details.get('TotalChunks'),
             Results=[SearchHistoryDetailResult(**r) for r in details['Results']]
         )
 

@@ -40,9 +40,8 @@ CHUNK_IDS_DIR = "D:/faiss/disk_retrieval/chunk_ids"
 # State file for instant resume (stored locally for speed)
 STATE_FILE = "D:/faiss/disk_retrieval/consolidation_state.json"
 
-# ~10GB chunks = ~19.5M vectors (128 dims * 4 bytes = 512 bytes/vector)
-# 10GB target for GPU FAISS (fits in 16GB VRAM with headroom for DISK model + scratch)
-MAX_VECTORS_PER_CHUNK = 19_500_000
+# ~10GB chunks = ~21M vectors (128 dims * 4 bytes = 512 bytes/vector)
+MAX_VECTORS_PER_CHUNK = 21_000_000
 
 # Buffer settings - target ~200GB on local SSD
 # Average book is ~2GB (index + paths), so ~100 books = 200GB
@@ -414,9 +413,18 @@ def main():
     total_vectors = 0
     last_status_time = time.time()
 
-    # Compact ID tracking
+    # Compact ID tracking - MUST load existing path_lookup on resume
     path_to_id = {}
     next_id = 0
+    existing_lookup = os.path.join(CHUNK_IDS_DIR, "path_lookup.json")
+    if os.path.exists(existing_lookup) and processed_books:
+        print("  Loading existing path_lookup.json for resume...")
+        with open(existing_lookup, 'r') as f:
+            id_to_path = json.load(f)
+        path_to_id = {p: i for i, p in enumerate(id_to_path)}
+        next_id = len(id_to_path)
+        print(f"  Loaded {len(path_to_id):,} existing paths (next_id={next_id})")
+        del id_to_path
 
     def flush_chunk():
         """Save current chunk and reset accumulators."""
@@ -481,10 +489,6 @@ def main():
 
             del index
 
-            # Check if adding this book would exceed chunk limit
-            if current_count > 0 and current_count + book_vector_count > MAX_VECTORS_PER_CHUNK:
-                flush_chunk()
-
             # Convert paths to compact IDs for this book's vectors
             book_ids = []
             for path in paths:
@@ -493,14 +497,24 @@ def main():
                     next_id += 1
                 book_ids.append(path_to_id[path])
 
-            # Now add this book to the (possibly new) chunk
-            current_vectors.append(vectors)
-            current_ids.extend(book_ids)
-            current_count += book_vector_count
+            # Add vectors, splitting across chunk boundaries as needed
+            offset = 0
+            while offset < book_vector_count:
+                space = MAX_VECTORS_PER_CHUNK - current_count
+                take = min(space, book_vector_count - offset)
+
+                current_vectors.append(vectors[offset:offset + take])
+                current_ids.extend(book_ids[offset:offset + take])
+                current_count += take
+                offset += take
+                total_vectors += take
+
+                if current_count >= MAX_VECTORS_PER_CHUNK:
+                    flush_chunk()
+
             books_in_chunk += 1
             books_in_current_chunk.append(book)
             books_processed += 1
-            total_vectors += book_vector_count
 
         except Exception as e:
             print(f"    Warning: Failed to load {book}: {e}")
@@ -509,10 +523,6 @@ def main():
 
         # Delete processed book from buffer
         buffer.mark_processed(book)
-
-        # Check if chunk is full (for books that exceed limit on their own)
-        if current_count >= MAX_VECTORS_PER_CHUNK:
-            flush_chunk()
 
         # Progress update every 30 seconds
         if time.time() - last_status_time > 30:

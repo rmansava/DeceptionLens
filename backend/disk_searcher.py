@@ -39,6 +39,125 @@ _id_to_path_cache = {}
 _disk_model = None
 _device = None
 
+# GPU search via PyTorch (works on Windows, no faiss-gpu needed)
+_gpu_search_available = None  # None = not checked, True/False after check
+
+def _check_gpu_search():
+    """Check if GPU search via PyTorch is available."""
+    global _gpu_search_available
+    if _gpu_search_available is not None:
+        return _gpu_search_available
+    _gpu_search_available = torch.cuda.is_available()
+    if _gpu_search_available:
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        logger.info(f"GPU search enabled via PyTorch ({torch.cuda.get_device_name(0)}, {vram_gb:.0f}GB VRAM)")
+    else:
+        logger.info("GPU search not available, using CPU FAISS")
+    return _gpu_search_available
+
+def _gpu_search(index, query_descriptors, k):
+    """
+    GPU-accelerated brute-force inner product search using PyTorch.
+
+    Replaces faiss IndexFlatIP.search() — same inputs/outputs.
+    """
+    results = _gpu_search_batch(index, [("single", query_descriptors)], k)
+    return results["single"]
+
+
+def _gpu_search_batch(index, query_list, k):
+    """
+    GPU-accelerated search for MULTIPLE query descriptor sets against ONE index.
+
+    Loads each DB batch to GPU ONCE and searches ALL query sets against it,
+    avoiding redundant CPU->GPU transfers.
+
+    Args:
+        index: FAISS IndexFlatIP
+        query_list: List of (name, descriptors_ndarray) tuples
+        k: Number of nearest neighbors
+
+    Returns:
+        Dict of {name: (distances, indices)} numpy arrays
+    """
+    n_vectors = index.ntotal
+    dim = index.d
+
+    # Get all vectors as a numpy view directly from FAISS internal storage (zero copy)
+    all_vectors = faiss.vector_to_array(index.codes).view("float32").reshape(n_vectors, dim)
+
+    batch_size = 2_000_000  # ~1GB per batch at dim=128
+
+    # Prepare per-query state on GPU
+    query_tensors = {}
+    running_distances = {}
+    running_indices = {}
+    for name, descriptors in query_list:
+        if len(descriptors) == 0:
+            continue
+        query_tensors[name] = torch.from_numpy(descriptors).cuda()
+        running_distances[name] = torch.full((len(descriptors), k), -1e9, device='cuda')
+        running_indices[name] = torch.full((len(descriptors), k), -1, dtype=torch.long, device='cuda')
+
+    # Max scores matrix ~4GB to prevent OOM (scores = n_query * db_count * 4 bytes)
+    MAX_SCORES_BYTES = 4 * 1024 ** 3
+
+    # Load each DB batch to GPU ONCE, search ALL queries against it
+    for start in range(0, n_vectors, batch_size):
+        end = min(start + batch_size, n_vectors)
+        db_count = end - start
+
+        # Single CPU->GPU transfer per batch
+        db_tensor = torch.from_numpy(all_vectors[start:end].copy()).cuda()
+        db_t = db_tensor.t()  # Transpose once, reuse for all queries
+        batch_k = min(k, db_count)
+
+        # Max query keypoints per sub-batch to keep scores matrix under limit
+        max_qb = max(1, MAX_SCORES_BYTES // (db_count * 4))
+
+        for name, q_tensor in query_tensors.items():
+            n_kp = q_tensor.shape[0]
+
+            for q_start in range(0, n_kp, max_qb):
+                q_end = min(q_start + max_qb, n_kp)
+                q_batch = q_tensor[q_start:q_end]
+
+                # Inner product: (n_query_sub, dim) @ (dim, db_count) = (n_query_sub, db_count)
+                scores = torch.mm(q_batch, db_t)
+
+                batch_scores, batch_idx = scores.topk(batch_k, dim=1)
+                batch_idx += start
+
+                # Merge with running top-k for this keypoint slice
+                rd = running_distances[name][q_start:q_end]
+                ri = running_indices[name][q_start:q_end]
+                combined_scores = torch.cat([rd, batch_scores], dim=1)
+                combined_indices = torch.cat([ri, batch_idx], dim=1)
+                topk_scores, topk_pos = combined_scores.topk(k, dim=1)
+                running_distances[name][q_start:q_end] = topk_scores
+                running_indices[name][q_start:q_end] = combined_indices.gather(1, topk_pos)
+
+                del scores, batch_scores, batch_idx, combined_scores, combined_indices, rd, ri
+
+        del db_tensor, db_t
+
+    # Collect results
+    results = {}
+    for name, descriptors in query_list:
+        if len(descriptors) == 0:
+            results[name] = (np.empty((0, k)), np.empty((0, k), dtype=np.int64))
+        else:
+            results[name] = (
+                running_distances[name].cpu().numpy(),
+                running_indices[name].cpu().numpy()
+            )
+
+    # Cleanup
+    del query_tensors, running_distances, running_indices
+    torch.cuda.empty_cache()
+
+    return results
+
 
 def get_disk_model():
     """Lazy-load DISK feature extractor."""
@@ -232,13 +351,27 @@ def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 
         return []
 
 
-def _copy_chunk_worker(copy_queue: Queue, chunk_list: list, start_idx: int, count: int):
+def _copy_chunk_worker(copy_queue: Queue, chunk_list: list, start_idx: int, count: int, buffer_size: int = 5):
     """Background worker to copy chunks ahead of time.
+
+    Throttles so at most buffer_size chunks are in the local buffer at once.
+    Waits when the buffer is full before copying the next chunk.
 
     Args:
         chunk_list: List of (chunk_file, chunk_ids_dir) tuples
+        buffer_size: Max chunks to keep ahead in the local buffer
     """
     for i in range(start_idx, min(start_idx + count, len(chunk_list))):
+        # Throttle: wait if buffer is full (count .faiss files in buffer dir)
+        while True:
+            try:
+                buffered = len([f for f in os.listdir(LOCAL_CHUNK_BUFFER) if f.endswith('.faiss')])
+                if buffered < buffer_size:
+                    break
+                time.sleep(1)
+            except OSError:
+                break
+
         nas_chunk_file, _ = chunk_list[i]
         chunk_name = os.path.basename(nas_chunk_file)
         local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
@@ -261,7 +394,7 @@ def _copy_chunk_worker(copy_queue: Queue, chunk_list: list, start_idx: int, coun
 
 def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, search_id: int = None, progress_callback=None):
     """
-    Search using rolling buffer: maintain 5 chunks in local buffer, copy next chunk while searching current.
+    Search using rolling buffer: maintain chunks in local buffer, copy next chunk while searching current.
 
     Args:
         chunk_list: List of (chunk_file, chunk_ids_dir) tuples
@@ -270,16 +403,23 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
     """
     all_votes = Counter()
     total_chunks = len(chunk_list)
+    use_gpu = _check_gpu_search()
 
+    # Clean buffer of any stale files from previous searches
+    if os.path.exists(LOCAL_CHUNK_BUFFER):
+        for f in os.listdir(LOCAL_CHUNK_BUFFER):
+            try:
+                os.remove(os.path.join(LOCAL_CHUNK_BUFFER, f))
+            except OSError:
+                pass
     os.makedirs(LOCAL_CHUNK_BUFFER, exist_ok=True)
     search_start = time.time()
 
-    # Start copying first buffer_size chunks
+    # Start continuous background copy of ALL chunks (keeps NAS pipe full)
     copy_queue = Queue()
-    next_copy_idx = buffer_size
 
-    logger.info(f"Starting rolling buffer search (buffer size: {buffer_size} chunks)")
-    copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, 0, buffer_size))
+    logger.info(f"Starting rolling buffer search (buffer size: {buffer_size} chunks, GPU: {use_gpu})")
+    copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, 0, total_chunks, buffer_size))
     copy_thread.daemon = True
     copy_thread.start()
 
@@ -299,8 +439,7 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
                 else:
                     copy_queue.put((ready_idx, _))
             except Empty:
-                if os.path.exists(local_chunk_file):
-                    ready = True
+                pass  # keep waiting for queue signal
 
         # Load and search
         logger.info(f"  Searching {chunk_name}...")
@@ -311,13 +450,16 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
         paths_or_ids, id_to_path = load_chunk_paths(nas_chunk_file, chunk_ids_dir)
 
         load_time = time.time() - load_start
-        logger.info(f"  Loaded in {load_time:.1f}s (mmap)")
+        logger.info(f"  Loaded in {load_time:.1f}s")
 
-        # Search
+        # Search (GPU via PyTorch or CPU via FAISS)
         search_start_chunk = time.time()
-        distances, indices = index.search(query_descriptors, k)
+        if use_gpu:
+            distances, indices = _gpu_search(index, query_descriptors, k)
+        else:
+            distances, indices = index.search(query_descriptors, k)
         search_time = time.time() - search_start_chunk
-        logger.info(f"  Searched in {search_time:.1f}s")
+        logger.info(f"  Searched in {search_time:.1f}s ({'GPU' if use_gpu else 'CPU'})")
 
         # Accumulate votes
         for i in range(len(query_descriptors)):
@@ -329,19 +471,12 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
         # Free memory
         del index, paths_or_ids
 
-        # Delete this chunk to make room
+        # Delete this chunk to make room for more in the buffer
         try:
             os.remove(local_chunk_file)
             logger.info(f"  Deleted {chunk_name} from buffer")
         except Exception as e:
             logger.warning(f"  Failed to delete {chunk_name}: {e}")
-
-        # Start copying next chunk if available
-        if next_copy_idx < total_chunks:
-            copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, next_copy_idx, 1))
-            copy_thread.daemon = True
-            copy_thread.start()
-            next_copy_idx += 1
 
         # Progress update
         elapsed = time.time() - search_start
@@ -410,6 +545,202 @@ def get_total_chunks(categories=None):
     """Get total chunk count across selected categories (for progress tracking)."""
     _, category_counts = _collect_chunks(categories)
     return sum(category_counts.values())
+
+
+def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, progress_callback=None):
+    """
+    Search using rolling buffer with MULTIPLE query images at once.
+
+    Loads each chunk once and searches ALL query images against it.
+    Same rolling buffer pattern as single-image version.
+
+    Args:
+        query_list: List of (image_name, descriptors_ndarray) tuples
+        chunk_list: List of (chunk_file, chunk_ids_dir) tuples
+        progress_callback: Optional callback(chunk_idx, total_chunks, per_image_results, elapsed_ms)
+
+    Returns:
+        Dict of {image_name: Counter()} with vote counts per image
+    """
+    per_image_votes = {name: Counter() for name, _ in query_list}
+    total_chunks = len(chunk_list)
+    use_gpu = _check_gpu_search()
+
+    # Clean buffer
+    if os.path.exists(LOCAL_CHUNK_BUFFER):
+        for f in os.listdir(LOCAL_CHUNK_BUFFER):
+            try:
+                os.remove(os.path.join(LOCAL_CHUNK_BUFFER, f))
+            except OSError:
+                pass
+    os.makedirs(LOCAL_CHUNK_BUFFER, exist_ok=True)
+    search_start = time.time()
+
+    # Start continuous background copy of ALL chunks (keeps NAS pipe full)
+    copy_queue = Queue()
+
+    logger.info(f"Starting batch rolling buffer search ({len(query_list)} images, buffer: {buffer_size} chunks, GPU: {use_gpu})")
+    copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, 0, total_chunks, buffer_size))
+    copy_thread.daemon = True
+    copy_thread.start()
+
+    for chunk_idx in range(total_chunks):
+        nas_chunk_file, chunk_ids_dir = chunk_list[chunk_idx]
+        chunk_name = os.path.basename(nas_chunk_file)
+        local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
+
+        # Wait for this chunk to be ready
+        logger.info(f"[{chunk_idx + 1}/{total_chunks}] Waiting for {chunk_name}...")
+        ready = False
+        while not ready:
+            try:
+                ready_idx, _ = copy_queue.get(timeout=1)
+                if ready_idx == chunk_idx:
+                    ready = True
+                else:
+                    copy_queue.put((ready_idx, _))
+            except Empty:
+                pass
+
+        # Load chunk
+        logger.info(f"  Loading {chunk_name}...")
+        load_start = time.time()
+        index = faiss.read_index(local_chunk_file, faiss.IO_FLAG_MMAP)
+        paths_or_ids, id_to_path = load_chunk_paths(nas_chunk_file, chunk_ids_dir)
+        load_time = time.time() - load_start
+        logger.info(f"  Loaded in {load_time:.1f}s")
+
+        # Search ALL query images against this chunk
+        search_start_chunk = time.time()
+
+        if use_gpu:
+            # Batch GPU search: load DB vectors to GPU ONCE, search all images
+            gpu_results = _gpu_search_batch(index, query_list, k)
+            gpu_time = time.time() - search_start_chunk
+            logger.info(f"  GPU search ({len(query_list)} images): {gpu_time:.1f}s")
+
+            # Accumulate votes from GPU results
+            vote_start = time.time()
+            for name, descriptors in query_list:
+                if len(descriptors) == 0:
+                    continue
+                img_start = time.time()
+                distances, indices = gpu_results[name]
+                votes = per_image_votes[name]
+                matched = 0
+                for i in range(len(descriptors)):
+                    for j in range(k):
+                        idx = indices[i][j]
+                        if idx >= 0 and distances[i][j] >= threshold:
+                            votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
+                            matched += 1
+                top_votes = votes.most_common(1)[0][1] if votes else 0
+                logger.info(f"    {name}: {time.time() - img_start:.1f}s ({len(descriptors)} kp, {matched} matches, top={top_votes} votes)")
+            vote_time = time.time() - vote_start
+            logger.info(f"  Vote accumulation: {vote_time:.1f}s")
+            del gpu_results
+        else:
+            for name, descriptors in query_list:
+                if len(descriptors) == 0:
+                    continue
+                img_start = time.time()
+                distances, indices = index.search(descriptors, k)
+                votes = per_image_votes[name]
+                for i in range(len(descriptors)):
+                    for j in range(k):
+                        idx = indices[i][j]
+                        if idx >= 0 and distances[i][j] >= threshold:
+                            votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
+                logger.info(f"    {name}: {time.time() - img_start:.1f}s ({len(descriptors)} keypoints)")
+
+        search_time = time.time() - search_start_chunk
+        logger.info(f"  Searched {len(query_list)} images in {search_time:.1f}s ({'GPU' if use_gpu else 'CPU'})")
+
+        # Free memory
+        del index, paths_or_ids
+
+        # Delete chunk to make room for more in the buffer
+        try:
+            os.remove(local_chunk_file)
+        except Exception as e:
+            logger.warning(f"  Failed to delete {chunk_name}: {e}")
+
+        # Progress
+        elapsed = time.time() - search_start
+        avg_per_chunk = elapsed / (chunk_idx + 1)
+        remaining = (total_chunks - chunk_idx - 1) * avg_per_chunk
+        logger.info(f"  Progress: {chunk_idx + 1}/{total_chunks} chunks | ETA: {remaining/60:.1f}m")
+
+        if progress_callback:
+            per_image_results = {}
+            for name, votes in per_image_votes.items():
+                if votes:
+                    max_v = votes.most_common(1)[0][1]
+                    per_image_results[name] = [
+                        {'path': p, 'votes': v, 'score': v / max_v}
+                        for p, v in votes.most_common(100)
+                    ]
+                else:
+                    per_image_results[name] = []
+            progress_callback(chunk_idx + 1, total_chunks, per_image_results, int(elapsed * 1000))
+
+    total_time = time.time() - search_start
+    logger.info(f"Batch search complete: {total_chunks} chunks, {len(query_list)} images in {total_time/60:.1f}m")
+
+    return per_image_votes
+
+
+def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: float = 0.7, categories: list = None, progress_callback=None):
+    """
+    Batch DISK search: search multiple images in one pass through all chunks.
+
+    Args:
+        image_list: List of (image_bytes, image_name) tuples
+        top_k: Number of results per image
+        k: Nearest neighbors per keypoint
+        threshold: Minimum similarity for voting
+        categories: Optional list of categories (None = all)
+        progress_callback: Optional callback(chunk_idx, total_chunks, per_image_results, elapsed_ms)
+
+    Returns:
+        Dict of {image_name: [{'path', 'votes', 'score'}, ...]}
+    """
+    # Extract features for all images
+    query_list = []
+    for image_bytes, image_name in image_list:
+        logger.info(f"Extracting features: {image_name}...")
+        descriptors = extract_disk_features(image_bytes)
+        logger.info(f"  {image_name}: {len(descriptors)} keypoints")
+        query_list.append((image_name, descriptors))
+
+    # Collect chunks
+    cat_label = ",".join(categories) if categories else "all"
+    logger.info(f"Collecting chunks for categories: {cat_label}")
+    all_chunks, category_counts = _collect_chunks(categories)
+
+    if not all_chunks:
+        logger.warning("No chunks found")
+        return {name: [] for name, _ in query_list}
+
+    logger.info(f"Searching {len(all_chunks)} chunks across {len(category_counts)} categories")
+
+    # Search
+    per_image_votes = _search_chunks_rolling_buffer_batch(
+        query_list, all_chunks, k, threshold, top_k,
+        buffer_size=5, progress_callback=progress_callback
+    )
+
+    # Format results
+    results = {}
+    for name, votes in per_image_votes.items():
+        top = votes.most_common(top_k)
+        max_v = top[0][1] if top else 1
+        results[name] = [
+            {'path': p, 'votes': v, 'score': v / max_v, 'verified_matches': v}
+            for p, v in top
+        ]
+
+    return results
 
 
 # For testing

@@ -1,7 +1,7 @@
 r"""
-Build DISK keypoint chunks for board games - direct to chunks with compact IDs.
+Build DISK keypoint chunks for cereal boxes - direct to chunks with compact IDs.
 
-Same approach as print ads: individual images with no natural grouping, so we go
+Same approach as board games: individual images with no natural grouping, so we go
 straight from images to search-ready chunks:
 
   1. List all images across all subfolders
@@ -9,12 +9,12 @@ straight from images to search-ready chunks:
   3. Accumulate vectors, flush to chunk when hitting ~10 GB (19.5M vectors)
   4. Compact IDs from the start (no paths.json bloat)
 
-Input:  Local copy of board games (fast reads from SSD)
-Output: chunk_XXX.faiss  -> NAS (S:/faiss/disk_retrieval/boardgames_chunks/)
-        chunk_XXX_ids.npy -> local SSD (D:/faiss/disk_retrieval/boardgames_chunk_ids/)
+Input:  Local copy of cereal images (fast reads from SSD)
+Output: chunk_XXX.faiss  -> NAS (T:/faiss/disk_retrieval/cereal_chunks/)
+        chunk_XXX_ids.npy -> local SSD (D:/faiss/disk_retrieval/cereal_chunk_ids/)
         path_lookup.json  -> local SSD (same dir as IDs)
 
-Paths stored point to the NAS originals (T:/archiverelated/board games/...).
+Paths stored point to the NAS originals (T:/archiverelated/cereal/...).
 Resumable via progress file.
 """
 
@@ -44,18 +44,18 @@ except ImportError:
 # CONFIG - Edit these paths as needed
 # ============================================================================
 
-# Source: local copy of board games for fast reading (scans all subfolders)
-LOCAL_IMAGES_DIR = r"C:\boardgames"
+# Source: local copy of cereal images for fast reading (scans all subfolders)
+LOCAL_IMAGES_DIR = r"C:\cereal"
 
 # Path remapping: stored paths point to NAS originals
-NAS_IMAGES_DIR = r"T:\archiverelated\board games"
+NAS_IMAGES_DIR = r"T:\archiverelated\cereal"
 
 # Output: FAISS chunks go to NAS (searched via rolling buffer copy)
-NAS_CHUNKS_DIR = r"T:\faiss\disk_retrieval\boardgames_chunks"
-LOCAL_CHUNKS_BUFFER = r"D:\faiss\disk_retrieval\boardgames_chunks"  # Write here first, then copy to NAS
+NAS_CHUNKS_DIR = r"T:\faiss\disk_retrieval\cereal_chunks"
+LOCAL_CHUNKS_BUFFER = r"D:\faiss\disk_retrieval\cereal_chunks"  # Write here first, then copy to NAS
 
 # Output: Compact IDs stay on local SSD (fast reads during search)
-CHUNK_IDS_DIR = r"D:\faiss\disk_retrieval\boardgames_chunk_ids"
+CHUNK_IDS_DIR = r"D:\faiss\disk_retrieval\cereal_chunk_ids"
 
 # Progress tracking
 PROGRESS_DIR = CHUNK_IDS_DIR
@@ -276,7 +276,7 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
 
 def main():
     log("=" * 70)
-    log("BOARD GAMES DISK CHUNK BUILDER")
+    log("CEREAL DISK CHUNK BUILDER")
     log(f"Source (local):  {LOCAL_IMAGES_DIR}")
     log(f"Paths stored as: {NAS_IMAGES_DIR}")
     log(f"Chunks output:   {NAS_CHUNKS_DIR}")
@@ -287,7 +287,7 @@ def main():
     # Check source exists
     if not os.path.exists(LOCAL_IMAGES_DIR):
         log(f"ERROR: Source directory not found: {LOCAL_IMAGES_DIR}")
-        log(f"Copy board games from NAS to local drive first.")
+        log(f"Copy cereal images from NAS to local drive first.")
         log(f"  robocopy \"{NAS_IMAGES_DIR}\" \"{LOCAL_IMAGES_DIR}\" /E /R:2 /W:5")
         sys.exit(1)
 

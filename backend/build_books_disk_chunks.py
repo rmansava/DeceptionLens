@@ -1,21 +1,22 @@
 r"""
-Build DISK keypoint chunks for board games - direct to chunks with compact IDs.
+Build DISK keypoint chunks for books - direct from images to 10GB chunks.
 
-Same approach as print ads: individual images with no natural grouping, so we go
-straight from images to search-ready chunks:
+Same approach as print ads/cereal/board games: goes straight from images to
+search-ready chunks. Use this for new books instead of the old two-step
+(per-book shards -> consolidation) pipeline.
 
-  1. List all images across all subfolders
+  1. List all images across all book subfolders
   2. Extract DISK features per image on GPU
   3. Accumulate vectors, flush to chunk when hitting ~10 GB (19.5M vectors)
   4. Compact IDs from the start (no paths.json bloat)
 
-Input:  Local copy of board games (fast reads from SSD)
-Output: chunk_XXX.faiss  -> NAS (S:/faiss/disk_retrieval/boardgames_chunks/)
-        chunk_XXX_ids.npy -> local SSD (D:/faiss/disk_retrieval/boardgames_chunk_ids/)
+Input:  Local copy of book page images (D:\books\pdf-images)
+Output: chunk_XXX.faiss  -> NAS (T:/faiss/disk_retrieval/chunks/)
+        chunk_XXX_ids.npy -> local SSD (D:/faiss/disk_retrieval/chunk_ids/)
         path_lookup.json  -> local SSD (same dir as IDs)
 
-Paths stored point to the NAS originals (T:/archiverelated/board games/...).
-Resumable via progress file.
+Paths stored match the existing convention (D:/books/pdf-images/...).
+Resumable via progress file. Loads existing path_lookup.json to continue IDs.
 """
 
 import os
@@ -44,25 +45,26 @@ except ImportError:
 # CONFIG - Edit these paths as needed
 # ============================================================================
 
-# Source: local copy of board games for fast reading (scans all subfolders)
-LOCAL_IMAGES_DIR = r"C:\boardgames"
+# Source: book page images (already on local SSD)
+LOCAL_IMAGES_DIR = r"D:\books\pdf-images"
 
-# Path remapping: stored paths point to NAS originals
-NAS_IMAGES_DIR = r"T:\archiverelated\board games"
+# No path remapping needed - stored paths use D:/books/pdf-images/... to match
+# existing chunks built by consolidation
+NAS_IMAGES_DIR = r"D:\books\pdf-images"
 
-# Output: FAISS chunks go to NAS (searched via rolling buffer copy)
-NAS_CHUNKS_DIR = r"T:\faiss\disk_retrieval\boardgames_chunks"
-LOCAL_CHUNKS_BUFFER = r"D:\faiss\disk_retrieval\boardgames_chunks"  # Write here first, then copy to NAS
+# Output: FAISS chunks go to NAS (same dir as existing book chunks)
+NAS_CHUNKS_DIR = r"T:\faiss\disk_retrieval\chunks"
+LOCAL_CHUNKS_BUFFER = r"D:\faiss\disk_retrieval\chunks"  # Write here first, then copy to NAS
 
-# Output: Compact IDs stay on local SSD (fast reads during search)
-CHUNK_IDS_DIR = r"D:\faiss\disk_retrieval\boardgames_chunk_ids"
+# Output: Compact IDs stay on local SSD (same dir as existing book chunk IDs)
+CHUNK_IDS_DIR = r"D:\faiss\disk_retrieval\chunk_ids"
 
 # Progress tracking
 PROGRESS_DIR = CHUNK_IDS_DIR
-PROGRESS_FILE = os.path.join(PROGRESS_DIR, "build_progress.json")
-LOG_FILE = os.path.join(PROGRESS_DIR, "build_log.txt")
+PROGRESS_FILE = os.path.join(PROGRESS_DIR, "build_progress_newbooks.json")
+LOG_FILE = os.path.join(PROGRESS_DIR, "build_newbooks_log.txt")
 
-# Chunk sizing: target ~10GB per chunk for GPU FAISS (fits in 16GB VRAM with headroom)
+# Chunk sizing: target ~10GB per chunk
 # 10GB = ~19.5M vectors at 128 dims * 4 bytes = 512 bytes/vector
 MAX_VECTORS_PER_CHUNK = 19_500_000  # ~10 GB
 
@@ -84,7 +86,7 @@ def log(msg):
 
 
 def remap_path(local_path):
-    """Convert local read path to NAS storage path."""
+    """Convert local read path to stored path."""
     if local_path.startswith(LOCAL_IMAGES_DIR):
         return NAS_IMAGES_DIR + local_path[len(LOCAL_IMAGES_DIR):]
     local_norm = local_path.replace('\\', '/')
@@ -108,29 +110,41 @@ def find_all_images():
 
 def load_progress():
     """Load build progress. Returns (next_chunk_num, set of processed image paths, path_to_id dict, next_id)."""
+    # Always load existing path_lookup if it exists (shared with consolidation chunks)
+    path_to_id = {}
+    next_id = 0
+    lookup_file = os.path.join(CHUNK_IDS_DIR, "path_lookup.json")
+    if os.path.exists(lookup_file):
+        log(f"  Loading existing path_lookup.json...")
+        with open(lookup_file, 'r') as f:
+            id_to_path = json.load(f)
+        path_to_id = {p: i for i, p in enumerate(id_to_path)}
+        next_id = len(id_to_path)
+        log(f"  Loaded {len(path_to_id):,} existing paths (next_id={next_id})")
+        del id_to_path
+
     if not os.path.exists(PROGRESS_FILE):
-        return 1, set(), {}, 0
+        # Find the highest existing chunk number to continue from
+        existing_chunks = glob(os.path.join(NAS_CHUNKS_DIR, "chunk_*.faiss"))
+        if existing_chunks:
+            max_chunk = max(
+                int(os.path.basename(f).replace('chunk_', '').replace('.faiss', ''))
+                for f in existing_chunks
+            )
+            log(f"  Found existing chunks up to {max_chunk}, will start at {max_chunk + 1}")
+            return max_chunk + 1, set(), path_to_id, next_id
+        return 1, set(), path_to_id, next_id
 
     try:
         with open(PROGRESS_FILE, 'r') as f:
             state = json.load(f)
         processed = set(state.get('processed_images', []))
         next_chunk = state.get('next_chunk', 1)
-        next_id = state.get('next_id', 0)
-
-        # Load path_to_id from existing path_lookup
-        path_to_id = {}
-        lookup_file = os.path.join(CHUNK_IDS_DIR, "path_lookup.json")
-        if os.path.exists(lookup_file):
-            with open(lookup_file, 'r') as f:
-                id_to_path = json.load(f)
-            path_to_id = {p: i for i, p in enumerate(id_to_path)}
-            next_id = len(id_to_path)
 
         return next_chunk, processed, path_to_id, next_id
     except Exception as e:
         log(f"Warning: Could not load progress: {e}")
-        return 1, set(), {}, 0
+        return 1, set(), path_to_id, next_id
 
 
 def save_progress(next_chunk, processed_images, next_id):
@@ -276,8 +290,8 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
 
 def main():
     log("=" * 70)
-    log("BOARD GAMES DISK CHUNK BUILDER")
-    log(f"Source (local):  {LOCAL_IMAGES_DIR}")
+    log("BOOKS DISK CHUNK BUILDER (Direct to Chunks)")
+    log(f"Source:          {LOCAL_IMAGES_DIR}")
     log(f"Paths stored as: {NAS_IMAGES_DIR}")
     log(f"Chunks output:   {NAS_CHUNKS_DIR}")
     log(f"Compact IDs:     {CHUNK_IDS_DIR}")
@@ -287,8 +301,6 @@ def main():
     # Check source exists
     if not os.path.exists(LOCAL_IMAGES_DIR):
         log(f"ERROR: Source directory not found: {LOCAL_IMAGES_DIR}")
-        log(f"Copy board games from NAS to local drive first.")
-        log(f"  robocopy \"{NAS_IMAGES_DIR}\" \"{LOCAL_IMAGES_DIR}\" /E /R:2 /W:5")
         sys.exit(1)
 
     # Find all images
@@ -362,12 +374,12 @@ def main():
                 del tensor
                 continue
 
-            # Get or assign path ID (using NAS path)
-            nas_path = remap_path(image_path)
-            if nas_path not in path_to_id:
-                path_to_id[nas_path] = next_id
+            # Get or assign path ID
+            stored_path = remap_path(image_path)
+            if stored_path not in path_to_id:
+                path_to_id[stored_path] = next_id
                 next_id += 1
-            pid = path_to_id[nas_path]
+            pid = path_to_id[stored_path]
 
             # Accumulate
             chunk_descriptors.append(descriptors)

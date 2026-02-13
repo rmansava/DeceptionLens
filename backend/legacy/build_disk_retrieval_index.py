@@ -35,8 +35,7 @@ def sanitize_dirname(name):
 NAS_FEATURES = "T:/disk-features/books"
 LOCAL_BUFFER = "C:/temp/disk-retrieval-buffer"
 LOCAL_INDEX = "C:/temp/disk-retrieval-index"
-NAS_INDEX = "D:/faiss/disk_retrieval/books"
-BACKUP_INDEX = "T:/faiss/disk_retrieval/books"  # NAS backup
+NAS_INDEX = "T:/faiss/disk_retrieval/books"
 IMAGES_DIR = "D:/books/pdf-images"
 
 BATCH_SIZE = 50  # Books to copy to local at a time
@@ -75,22 +74,7 @@ def nas_copy_worker():
                     os.path.join(dst_dir, "paths.json")
                 )
 
-                # Also copy to backup (T:)
-                backup_dir = os.path.join(BACKUP_INDEX, book_name)
-                try:
-                    os.makedirs(backup_dir, exist_ok=True)
-                    shutil.copy2(
-                        os.path.join(src_dir, "index.faiss"),
-                        os.path.join(backup_dir, "index.faiss")
-                    )
-                    shutil.copy2(
-                        os.path.join(src_dir, "paths.json"),
-                        os.path.join(backup_dir, "paths.json")
-                    )
-                except Exception:
-                    pass  # Backup failure is non-fatal
-
-                # Remove local copy after successful primary copy
+                # Remove local copy after successful NAS copy
                 shutil.rmtree(src_dir, ignore_errors=True)
 
                 with nas_copy_lock:
@@ -129,19 +113,51 @@ def get_indexed_books():
         for d in os.listdir(NAS_INDEX):
             if os.path.exists(os.path.join(NAS_INDEX, d, "index.faiss")):
                 indexed.add(d)
+                # If this is a split part (e.g. "BookName_part1"), also mark the original
+                if "_part" in d:
+                    original = d.rsplit("_part", 1)[0]
+                    indexed.add(original)
 
     # Check local (pending NAS copy)
     if os.path.exists(LOCAL_INDEX):
         for d in os.listdir(LOCAL_INDEX):
             if os.path.exists(os.path.join(LOCAL_INDEX, d, "index.faiss")):
                 indexed.add(d)
+                if "_part" in d:
+                    original = d.rsplit("_part", 1)[0]
+                    indexed.add(original)
 
     return indexed
+
+
+def reset_nas_connection():
+    """Force Windows to re-establish the SMB session to NAS."""
+    import subprocess
+    try:
+        # Test if NAS is reachable
+        os.listdir(NAS_FEATURES)
+        return True
+    except OSError:
+        print("\n    NAS connection lost, attempting recovery...")
+        try:
+            # Extract UNC path from mapped drive and reconnect
+            result = subprocess.run(['net', 'use', 'T:'], capture_output=True, text=True, timeout=10)
+            if '\\\\' in result.stdout:
+                # Drive is mapped, just needs a kick - access root to force reconnect
+                subprocess.run(['dir', 'T:\\'], capture_output=True, shell=True, timeout=15)
+            time.sleep(5)
+            os.listdir(NAS_FEATURES)
+            print("    NAS connection restored!")
+            return True
+        except Exception as e:
+            print(f"    NAS recovery failed: {e}")
+            return False
 
 
 def copy_batch_to_local(books):
     """Copy batch of books to local buffer with retry on network errors."""
     os.makedirs(LOCAL_BUFFER, exist_ok=True)
+    consecutive_failures = 0
     for book in books:
         src = os.path.join(NAS_FEATURES, book)
         dst = os.path.join(LOCAL_BUFFER, book)
@@ -149,17 +165,29 @@ def copy_batch_to_local(books):
             for attempt in range(5):
                 try:
                     shutil.copytree(src, dst)
+                    consecutive_failures = 0
                     break
                 except (OSError, shutil.Error) as e:
                     if attempt < 4:
-                        print(f"\n    Network error copying {book}, retry {attempt+1}/5...")
-                        time.sleep(5)
+                        backoff = 5 * (attempt + 1)  # 5s, 10s, 15s, 20s
+                        print(f"\n    Network error copying {book}, retry {attempt+1}/5 (wait {backoff}s)...")
+                        time.sleep(backoff)
                         # Clean up partial copy
                         if os.path.exists(dst):
                             shutil.rmtree(dst, ignore_errors=True)
+                        # After 2nd failure, try resetting the connection
+                        if attempt >= 1:
+                            reset_nas_connection()
                     else:
                         print(f"\n    SKIP: Failed to copy {book} after 5 attempts")
+                        consecutive_failures += 1
                         break
+
+            # If multiple books fail in a row, the session is likely dead
+            if consecutive_failures >= 3:
+                print(f"\n    {consecutive_failures} consecutive failures, forcing NAS reconnect...")
+                reset_nas_connection()
+                time.sleep(10)
 
 
 def clear_local_buffer():
@@ -191,7 +219,7 @@ def process_and_save_book(book):
         return 0
 
     # FIRST PASS: Count keypoints per file (no loading into memory)
-    MAX_KEYPOINTS = 50_000_000  # 50M = ~25GB per shard
+    MAX_KEYPOINTS = 15_000_000  # 15M = ~7.5GB per shard, ~23GB peak with copies
     file_kp_counts = []
     total_kp = 0
 

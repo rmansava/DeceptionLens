@@ -275,7 +275,11 @@ def get_search_history(
                     h.SearchDurationMs,
                     h.Collection,
                     r.ImagePath AS TopResultPath,
-                    r.Score AS TopResultScore
+                    r.Score AS TopResultScore,
+                    h.Status,
+                    h.CurrentProgress,
+                    h.TotalChunks,
+                    r.VerifiedMatches AS TopResultVotes
                 FROM ImageSearchHistory h
                 LEFT JOIN ImageSearchResults r ON h.Id = r.SearchHistoryId AND r.Rank = 1
                 WHERE h.SearchType = ?
@@ -295,7 +299,11 @@ def get_search_history(
                     h.SearchDurationMs,
                     h.Collection,
                     r.ImagePath AS TopResultPath,
-                    r.Score AS TopResultScore
+                    r.Score AS TopResultScore,
+                    h.Status,
+                    h.CurrentProgress,
+                    h.TotalChunks,
+                    r.VerifiedMatches AS TopResultVotes
                 FROM ImageSearchHistory h
                 LEFT JOIN ImageSearchResults r ON h.Id = r.SearchHistoryId AND r.Rank = 1
                 ORDER BY h.SearchDate DESC
@@ -359,7 +367,8 @@ def get_search_details(search_id: int) -> Optional[Dict[str, Any]]:
         cursor.execute("""
             SELECT
                 Id, SearchDate, SearchType, QueryText,
-                QueryImageName, ResultCount, SearchDurationMs, Collection, Notes
+                QueryImageName, ResultCount, SearchDurationMs, Collection, Notes,
+                Status, CurrentProgress, TotalChunks
             FROM ImageSearchHistory
             WHERE Id = ?
         """, (search_id,))
