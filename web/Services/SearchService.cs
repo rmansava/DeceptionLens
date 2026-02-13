@@ -479,4 +479,18 @@ public class SearchService : ISearchService
             return false;
         }
     }
+
+    public async Task<bool> StopSearchAsync(int searchId)
+    {
+        try
+        {
+            var response = await _httpClient.PostAsync($"/history/{searchId}/stop", null);
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to stop search {SearchId}", searchId);
+            return false;
+        }
+    }
 }

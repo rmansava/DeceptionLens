@@ -226,9 +226,14 @@ def load_chunk_paths(chunk_file, chunk_ids_dir):
 
 
 def resolve_path(paths_or_ids, id_to_path, idx):
-    """Resolve a FAISS index to a file path string."""
+    """Resolve a FAISS index to a file path string. Returns None if out of bounds."""
+    if idx < 0 or idx >= len(paths_or_ids):
+        return None
     if id_to_path is not None and len(id_to_path) > 0:
-        return id_to_path[paths_or_ids[idx]]
+        compact_id = paths_or_ids[idx]
+        if compact_id < 0 or compact_id >= len(id_to_path):
+            return None
+        return id_to_path[compact_id]
     else:
         return paths_or_ids[idx]
 
@@ -292,7 +297,8 @@ def _collect_chunks(categories=None):
         chunks_dir = cat_config["chunks_dir"]
         ids_dir = cat_config["ids_dir"]
 
-        chunk_files = sorted(glob(os.path.join(chunks_dir, "chunk_*.faiss")))
+        chunk_files = sorted(glob(os.path.join(chunks_dir, "chunk_*.faiss")),
+                             key=lambda f: int(os.path.basename(f).split('_')[1].split('.')[0]))
         category_counts[cat_name] = len(chunk_files)
 
         for cf in chunk_files:
@@ -466,7 +472,9 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
             for j in range(k):
                 idx = indices[i][j]
                 if idx >= 0 and distances[i][j] >= threshold:
-                    all_votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
+                    path = resolve_path(paths_or_ids, id_to_path, idx)
+                    if path is not None:
+                        all_votes[path] += 1
 
         # Free memory
         del index, paths_or_ids
@@ -547,7 +555,7 @@ def get_total_chunks(categories=None):
     return sum(category_counts.values())
 
 
-def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, progress_callback=None):
+def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, progress_callback=None, check_stopped=None):
     """
     Search using rolling buffer with MULTIPLE query images at once.
 
@@ -558,6 +566,7 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
         query_list: List of (image_name, descriptors_ndarray) tuples
         chunk_list: List of (chunk_file, chunk_ids_dir) tuples
         progress_callback: Optional callback(chunk_idx, total_chunks, per_image_results, elapsed_ms)
+        check_stopped: Optional callable returning set of image names to skip
 
     Returns:
         Dict of {image_name: Counter()} with vote counts per image
@@ -610,6 +619,18 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
         load_time = time.time() - load_start
         logger.info(f"  Loaded in {load_time:.1f}s")
 
+        # Check for stopped images every 10 chunks
+        if check_stopped and chunk_idx % 10 == 0:
+            stopped = check_stopped()
+            if stopped:
+                active_query_list = [(n, d) for n, d in query_list if n not in stopped]
+                if not active_query_list:
+                    logger.info("All images stopped by user. Ending search.")
+                    break
+                if len(active_query_list) < len(query_list):
+                    logger.info(f"  Skipping {len(query_list) - len(active_query_list)} stopped images")
+                    query_list = active_query_list
+
         # Search ALL query images against this chunk
         search_start_chunk = time.time()
 
@@ -632,8 +653,10 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
                     for j in range(k):
                         idx = indices[i][j]
                         if idx >= 0 and distances[i][j] >= threshold:
-                            votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
-                            matched += 1
+                            path = resolve_path(paths_or_ids, id_to_path, idx)
+                            if path is not None:
+                                votes[path] += 1
+                                matched += 1
                 top_votes = votes.most_common(1)[0][1] if votes else 0
                 logger.info(f"    {name}: {time.time() - img_start:.1f}s ({len(descriptors)} kp, {matched} matches, top={top_votes} votes)")
             vote_time = time.time() - vote_start
@@ -650,7 +673,9 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
                     for j in range(k):
                         idx = indices[i][j]
                         if idx >= 0 and distances[i][j] >= threshold:
-                            votes[resolve_path(paths_or_ids, id_to_path, idx)] += 1
+                            path = resolve_path(paths_or_ids, id_to_path, idx)
+                            if path is not None:
+                                votes[path] += 1
                 logger.info(f"    {name}: {time.time() - img_start:.1f}s ({len(descriptors)} keypoints)")
 
         search_time = time.time() - search_start_chunk
@@ -690,7 +715,7 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
     return per_image_votes
 
 
-def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: float = 0.7, categories: list = None, progress_callback=None):
+def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: float = 0.7, categories: list = None, progress_callback=None, check_stopped=None):
     """
     Batch DISK search: search multiple images in one pass through all chunks.
 
@@ -701,6 +726,7 @@ def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: 
         threshold: Minimum similarity for voting
         categories: Optional list of categories (None = all)
         progress_callback: Optional callback(chunk_idx, total_chunks, per_image_results, elapsed_ms)
+        check_stopped: Optional callable returning set of image names to skip
 
     Returns:
         Dict of {image_name: [{'path', 'votes', 'score'}, ...]}
@@ -727,7 +753,8 @@ def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: 
     # Search
     per_image_votes = _search_chunks_rolling_buffer_batch(
         query_list, all_chunks, k, threshold, top_k,
-        buffer_size=5, progress_callback=progress_callback
+        buffer_size=5, progress_callback=progress_callback,
+        check_stopped=check_stopped
     )
 
     # Format results

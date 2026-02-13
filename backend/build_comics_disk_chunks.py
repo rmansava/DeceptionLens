@@ -36,6 +36,7 @@ from collections import Counter
 from datetime import datetime
 from threading import Thread, Lock, Event
 from collections import deque
+from disk_chunk_db import sync_chunk_to_db, sync_paths_to_db, create_tables
 
 try:
     import kornia.feature as KF
@@ -72,6 +73,9 @@ LOG_FILE = os.path.join(PROGRESS_DIR, "build_log.txt")
 
 # Chunk sizing
 MAX_VECTORS_PER_CHUNK = 19_500_000  # ~10 GB
+
+# Collection name for DB sync
+COLLECTION_NAME = "comics"
 
 # Buffer settings - comics folders are ~43MB each (much larger than albums)
 # 8 GB per batch = ~186 folders, 3 batches max = ~24 GB buffer
@@ -322,6 +326,9 @@ def save_path_lookup(path_to_id):
     log(f"  Saved path_lookup.json: {len(path_to_id):,} unique paths "
         f"({os.path.getsize(lookup_file) / 1e6:.1f} MB)")
 
+    # Sync new paths to DB
+    sync_paths_to_db(COLLECTION_NAME, path_to_id)
+
 
 def preprocess_image(image_path, max_dim=MAX_IMAGE_DIM):
     """Load and preprocess image for DISK extraction."""
@@ -402,6 +409,9 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
     ids_file = os.path.join(CHUNK_IDS_DIR, f"chunk_{chunk_num:03d}_ids.npy")
     np.save(ids_file, ids_array)
     ids_size = os.path.getsize(ids_file) / (1024**2)
+
+    # Sync to DB
+    sync_chunk_to_db(COLLECTION_NAME, chunk_num, ids_array)
 
     log(f"  Chunk {chunk_num:03d}: {num_vectors:,} vectors from {num_images} images "
         f"({faiss_size:.1f} GB index, {ids_size:.0f} MB IDs)")

@@ -123,6 +123,19 @@ def main():
     # Progress callback: updates all search sessions + console
     start_time = time.time()
 
+    def check_stopped():
+        """Check DB for images that have been stopped by user. Returns set of image names to skip."""
+        stopped = set()
+        try:
+            from db_helper import get_search_status
+            for image_name, sid in search_ids.items():
+                status = get_search_status(sid)
+                if status in ('stopped', 'completed'):
+                    stopped.add(image_name)
+        except Exception:
+            pass
+        return stopped
+
     def progress_callback(chunk_idx, total_chunks, per_image_results, elapsed_ms):
         # Update each image's search session in DB
         for image_name, results in per_image_results.items():
@@ -174,7 +187,8 @@ def main():
         k=args.k,
         threshold=args.threshold,
         categories=categories,
-        progress_callback=progress_callback
+        progress_callback=progress_callback,
+        check_stopped=check_stopped
     )
     print()  # Newline after progress
 

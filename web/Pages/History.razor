@@ -24,6 +24,7 @@
                 @if (selectedDetail.IsInProgress)
                 {
                     <span class="status-badge status-running">Searching...</span>
+                    <button class="btn-stop-detail" @onclick="() => StopEntry(selectedDetail.Id)">Stop</button>
                 }
                 <span class="search-date">@FormatDate(DateTime.Parse(selectedDetail.SearchDate))</span>
             </div>
@@ -219,6 +220,14 @@ else
                                 {
                                     <span class="status-badge status-running">Searching...</span>
                                 }
+                                else if (entry.Status == "stopped")
+                                {
+                                    <span class="status-badge status-stopped">Stopped</span>
+                                }
+                                else if (entry.Status == "failed")
+                                {
+                                    <span class="status-badge status-failed">Failed</span>
+                                }
                                 @if (entry.HasPossibleHit)
                                 {
                                     <span class="hit-badge">Possible Hit (@entry.TopResultVotes votes)</span>
@@ -255,6 +264,14 @@ else
                             </div>
                         </div>
                         <div class="history-card-actions">
+                            @if (entry.IsInProgress)
+                            {
+                                <button class="btn-icon btn-stop" @onclick:stopPropagation="true" @onclick="() => StopEntry(entry.Id)" title="Stop search">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                        <rect x="6" y="6" width="12" height="12" rx="1"/>
+                                    </svg>
+                                </button>
+                            }
                             <button class="btn-icon" @onclick:stopPropagation="true" @onclick="() => DeleteEntry(entry.Id)" title="Delete">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
@@ -581,6 +598,30 @@ else
         color: #ef4444;
     }
 
+    .btn-icon.btn-stop {
+        color: #f59e0b;
+    }
+
+    .btn-icon.btn-stop:hover {
+        background: #374151;
+        color: #ef4444;
+    }
+
+    .btn-stop-detail {
+        padding: 4px 12px;
+        background: #dc2626;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+
+    .btn-stop-detail:hover {
+        background: #b91c1c;
+    }
+
     .pagination {
         display: flex;
         justify-content: center;
@@ -639,6 +680,16 @@ else
         background: #f59e0b;
         color: black;
         animation: pulse-bg 2s ease-in-out infinite;
+    }
+
+    .status-stopped {
+        background: #6b7280;
+        color: white;
+    }
+
+    .status-failed {
+        background: #ef4444;
+        color: white;
     }
 
     @@keyframes pulse-bg {
@@ -881,10 +932,23 @@ else
         Navigation.NavigateTo("/");
     }
 
+    private async Task StopEntry(int searchId)
+    {
+        if (await SearchService.StopSearchAsync(searchId))
+        {
+            await RefreshSilent();
+        }
+    }
+
     private async Task DeleteEntry(int searchId)
     {
         if (await SearchService.DeleteSearchHistoryAsync(searchId))
         {
+            if (selectedDetail?.Id == searchId)
+            {
+                selectedDetail = null;
+                selectedResult = null;
+            }
             await LoadHistory();
         }
     }

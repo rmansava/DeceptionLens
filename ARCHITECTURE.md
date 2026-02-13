@@ -1,6 +1,6 @@
 # Deception Lens - System Architecture
 
-A visual search engine for scanned book pages, board games, and print ads. Given an image (or text), it finds visually similar or matching pages across millions of indexed images.
+A visual search engine for scanned book pages, board games, print ads, album covers, comic books, and cereal boxes. Given an image (or text), it finds visually similar or matching pages across millions of indexed images.
 
 ---
 
@@ -55,7 +55,16 @@ A visual search engine for scanned book pages, board games, and print ads. Given
 
 ## How to Run
 
-### Start Backend
+### Quick Start (Recommended)
+```bash
+start_deception_lens.bat
+# Checks if services are already running
+# Starts backend (port 8000) and frontend (port 5000) in separate terminals
+```
+
+### Manual Start
+
+**Backend:**
 ```bash
 cd backend
 python server.py
@@ -63,7 +72,7 @@ python server.py
 # DISK search queue starts automatically
 ```
 
-### Start Frontend
+**Frontend:**
 ```bash
 cd web
 dotnet run
@@ -84,14 +93,16 @@ The web UI offers 5 search modes:
 ### 1. Keypoint Search (DISK Chunks)
 **UI Label:** "Keypoint Search" — "Find the source of cropped images."
 
-**What it does:** Given a cropped/zoomed portion of a page, finds the original full source page by matching local keypoint features across all indexed books.
+**What it does:** Given a cropped/zoomed portion of a page, finds the original full source page by matching local keypoint features across all indexed collections.
 
 **How it works:**
 1. Extract DISK keypoints from query image (128-dim descriptors, normalized)
-2. Search each FAISS chunk (441 chunks, ~22GB each) for nearest neighbors per keypoint
+2. Search each FAISS chunk for nearest neighbors per keypoint
 3. Each matched keypoint "votes" for the page it belongs to
 4. Pages with the most votes are the best matches
-5. Results aggregated across all chunks
+5. Results aggregated across all chunks from selected collections
+
+**Multi-collection support:** Searches books, print_ads, board_games, albums, comics, and cereal. Pass `collections` param to search specific categories or omit to search all.
 
 **Key parameters:**
 - `k=5` — nearest neighbors per keypoint
@@ -101,6 +112,8 @@ The web UI offers 5 search modes:
 **Performance:** ~5.5 minutes per chunk × 441 chunks = ~40 hours for full search (network-bound at ~14 MB/s from NAS). With 10GbE upgrade, ~5-6 hours.
 
 **Queue system:** Only 1 keypoint search runs at a time. Others wait in queue to prevent GPU memory exhaustion and SSD overflow.
+
+**Batch mode:** `batch_disk_search.py` searches a directory of images. Each chunk is loaded once and all query images are searched against it, making batch searches nearly as fast as a single search.
 
 ---
 
@@ -114,7 +127,7 @@ The web UI offers 5 search modes:
 2. Search FAISS index (IndexFlatIP, inner product similarity)
 3. Return top-k results
 
-**Supports:** "All Collections" mode — searches books, board_games, print_ads, albums in parallel and merges results.
+**Supports:** "All Collections" mode — searches books, board_games, print_ads, albums, comics, cereal in parallel and merges results.
 
 ---
 
@@ -187,16 +200,20 @@ cd backend
 python batch_disk_index_file.py
 ```
 - Extracts DISK keypoints + 128-dim descriptors per image
-- Stores as `.npz` files on NAS (`T:/disk-features/books/`)
+- Stores as `.npz` files on NAS (`T:/disk-features/<collection>/`)
 - Multi-threaded pipeline: 8 workers for image decode, async saves
 - Rate: ~10-13 images/sec on RTX 4070 Super
 - Total: ~19.6 billion keypoints across 4,735 books
+- Supported collections: books, print_ads, board_games, albums, comics, cereal
 
 ### DISK Chunk Building (FAISS chunks)
 After DISK features are extracted, they're consolidated into searchable FAISS chunks:
-- Each chunk: ~22GB FAISS index + ~6.5GB paths JSON
-- 441 chunks total on NAS at `T:/faiss/disk_retrieval/chunks/`
-- Each chunk contains keypoint descriptors for a batch of books
+- Each chunk: ~22GB FAISS index + compact ID mapping
+- Chunks stored on NAS at `T:/faiss/disk_retrieval/chunks/`
+- Each chunk contains keypoint descriptors for a batch of items from a collection
+- **Compact IDs:** Path lookup uses integer IDs instead of full path strings (reduced paths.json from 3.3TB to 95GB — 35x smaller)
+- **Background NAS copies:** During chunk builds, NAS copies run in a background thread so GPU extraction continues immediately (saves ~23 hours on a full build)
+- Per-collection chunk builders: `build_books_disk_chunks.py`, `build_printads_disk_chunks.py`, `build_boardgames_disk_chunks.py`, `build_albums_disk_chunks.py`, `build_comics_disk_chunks.py`, `build_cereal_disk_chunks.py`
 
 ### Deduplication Strategy
 Four-stage pipeline prevents reprocessing:
@@ -222,10 +239,13 @@ Four-stage pipeline prevents reprocessing:
 ### NAS (T: drive)
 | Path | Contents | Size |
 |------|----------|------|
-| `T:/faiss/disk_retrieval/chunks/` | 441 DISK FAISS chunks | ~9.7 TB |
+| `T:/faiss/disk_retrieval/chunks/` | DISK FAISS chunks (all collections) | ~9.7 TB |
 | `T:/disk-features/books/` | DISK `.npz` feature files per book | ~2 TB |
 | `T:/disk-features/board_games/` | DISK `.npz` features | varies |
 | `T:/disk-features/print_ads/` | DISK `.npz` features | varies |
+| `T:/disk-features/albums/` | DISK `.npz` features | varies |
+| `T:/disk-features/comics/` | DISK `.npz` features | varies |
+| `T:/disk-features/cereal/` | DISK `.npz` features | varies |
 | `T:/archiverelated/books/` | Source images (NAS copy) | varies |
 | `T:/faiss/` | Backup of D:/faiss/ | varies |
 
@@ -245,6 +265,8 @@ Four-stage pipeline prevents reprocessing:
 | `ImageHashes` | SHA256 hashes for deduplication |
 | `ImageSearchHistory` | Search sessions with progress tracking |
 | `ImageSearchResults` | Results for each search session |
+| `DiskPathLookup` | Compact ID → image path mapping for DISK chunks |
+| `DiskChunkMap` | Run-length encoded vector → ID mapping per chunk |
 
 ---
 
@@ -253,10 +275,11 @@ Four-stage pipeline prevents reprocessing:
 This is the most complex feature. It enables finding the source page of a cropped image across millions of pages.
 
 ### Why Chunks?
-- Each book page has ~4,000 DISK keypoints (128-dim descriptors)
-- ~5M pages × 4,000 keypoints = ~19.6 billion descriptors
-- Too large to fit in memory → split into 441 FAISS chunks (~22GB each)
+- Each image has ~4,000 DISK keypoints (128-dim descriptors)
+- ~5M pages × 4,000 keypoints = ~19.6 billion descriptors (books alone)
+- Too large to fit in memory → split into FAISS chunks (~22GB each)
 - Only 1 chunk can be loaded at a time (GPU/RAM constraint)
+- Each collection (books, print_ads, board_games, albums, comics, cereal) has its own set of chunks
 
 ### Rolling Buffer Strategy
 ```
@@ -348,7 +371,15 @@ complete_search_session() → Status: "completed", Duration: 145232ms
 
 ## Search History
 
-All searches are saved to SQL Server and viewable in the web UI's History panel.
+All searches are saved to SQL Server and viewable in the web UI at `/history`.
+
+**Full-page history view** with:
+- **List view** — paginated cards (20 per page) showing search type, duration, top vote counts, and status badges
+- **Type filtering** — filter by DINOv2, CLIP, Deep Search, Face, DISK, or Text
+- **Detail view** — sidebar with query image and metadata, results grid with configurable thumbnail sizes (small/medium/large)
+- **Live progress** — in-progress searches show a progress bar with auto-refresh every 5 seconds
+- **Comparison mode** — side-by-side query vs. matched image
+- **Stop button** — cancel running searches from the UI
 
 **Stored per search:**
 - Search type (CLIP Text, CLIP Visual, DINOv2, Face, Keypoint, Deep Search)
@@ -358,6 +389,7 @@ All searches are saved to SQL Server and viewable in the web UI's History panel.
 - Search duration
 - Collection searched
 - Notes (queue position, etc.)
+- Vote counts and "possible hit" threshold (500+ votes)
 
 ---
 
@@ -386,11 +418,12 @@ All searches are saved to SQL Server and viewable in the web UI's History panel.
 ### Search History
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/search-history` | GET | Paginated search history |
+| `/search-history` | GET | Paginated search history with type filtering |
 | `/search-history/{id}` | GET | Full search details |
 | `/search-history/{id}` | DELETE | Delete search record |
 | `/search-history/{id}/image` | GET | Query image for search |
 | `/search-history/{id}/note` | PUT | Add note to search |
+| `/history/{id}/stop` | POST | Stop an in-progress search |
 
 ### Indexing
 | Endpoint | Method | Description |
@@ -405,48 +438,55 @@ All searches are saved to SQL Server and viewable in the web UI's History panel.
 
 ```
 DinoDeceptionLens/
+├── start_deception_lens.bat         # Launch both backend + frontend
+├── ARCHITECTURE.md                  # This file
+├── DISK_SEARCH_QUICKSTART.md        # Quick start for DISK search
+├── TRIVIA-IMAGE-SEARCH.md           # Detailed trivia search docs
+│
 ├── backend/
 │   ├── server.py                    # FastAPI REST API server
 │   ├── disk_searcher.py             # DISK chunk-based keypoint search
 │   ├── disk_queue.py                # Search queue (1 at a time)
 │   ├── db_helper.py                 # SQL Server helpers (history, progress)
+│   ├── collections_config.py        # Per-collection paths and settings
+│   ├── disk_chunk_db.py             # DISK compact ID ↔ path DB management
 │   │
 │   ├── clip_searcher.py             # CLIP text/image search (FAISS)
 │   ├── clip_indexer.py              # CLIP FAISS index builder
-│   ├── searcher.py                  # DINOv2 search + LightGlue verification
-│   ├── indexer.py                   # DINOv2 indexing to ChromaDB/OpenSearch
-│   ├── opensearch_searcher.py       # OpenSearch vector search
+│   ├── clip_reranker.py             # CLIP re-ranking with ORB + template
+│   ├── indexer.py                   # DINOv2 indexing to OpenSearch
+│   ├── file_watcher.py              # Watch folders for new images to index
 │   │
-│   ├── disk_features_file.py        # DISK feature file storage (.npz)
-│   ├── disk_indexer_file.py         # DISK feature extraction (file-based)
-│   ├── batch_disk_index_file.py     # Batch DISK indexing
-│   ├── disk_features.py             # DISK features (SQL storage, legacy)
-│   ├── disk_indexer.py              # DISK extraction (SQL, legacy)
-│   │
-│   ├── batch_index.py               # Batch DINOv2 indexing
-│   ├── board_games_dino_indexer.py   # Board games indexer with dedup
-│   ├── verify_disk_coverage.py       # Verify DISK feature completeness
-│   ├── verify_opensearch_coverage.py # Verify OpenSearch completeness
-│   ├── verify_indexing.py           # Post-indexing verification + dedup
+│   ├── batch_disk_search.py         # Batch DISK search (directory of images)
+│   ├── build_books_disk_chunks.py   # Build DISK chunks for books
+│   ├── build_printads_disk_chunks.py    # Build DISK chunks for print ads
+│   ├── build_boardgames_disk_chunks.py  # Build DISK chunks for board games
+│   ├── build_albums_disk_chunks.py      # Build DISK chunks for albums
+│   ├── build_comics_disk_chunks.py      # Build DISK chunks for comics
+│   ├── build_cereal_disk_chunks.py      # Build DISK chunks for cereal
 │   │
 │   ├── main.py                      # CLI entry point
-│   └── test_3chunk.py               # Test script for 3-chunk validation
+│   ├── tests/                       # Test scripts
+│   │   ├── test_3chunk.py           # 3-chunk validation
+│   │   ├── test_decoupled_save.py   # Decoupled save test
+│   │   ├── test_disk_api.py         # DISK API endpoint test
+│   │   └── ...
+│   └── legacy/                      # Archived scripts (80+ files)
+│       ├── searcher.py              # Old DINOv2 search
+│       ├── opensearch_searcher.py   # Old OpenSearch search
+│       ├── DISK_SEARCH_STATUS.md    # Old status docs
+│       └── ...
 │
-├── web/
-│   ├── Pages/
-│   │   └── Index.razor              # Main search UI
-│   ├── Services/
-│   │   └── SearchService.cs         # HTTP client for backend API
-│   ├── Models/
-│   │   └── SearchResult.cs          # Data models
-│   └── Program.cs                   # ASP.NET Core startup
-│
-├── ARCHITECTURE.md                  # This file
-├── DISK_SEARCH_QUICKSTART.md        # Quick start for DISK search
-├── TRIVIA-IMAGE-SEARCH.md           # Detailed trivia search docs
-└── backend/
-    ├── DISK_SEARCH_STRATEGY.md      # DISK indexing strategy
-    └── DISK_SEARCH_STATUS.md        # Implementation status
+└── web/
+    ├── Pages/
+    │   ├── Index.razor              # Main search UI
+    │   └── History.razor            # Full-page search history view
+    ├── Services/
+    │   ├── ISearchService.cs        # Search service interface
+    │   └── SearchService.cs         # HTTP client for backend API
+    ├── Models/
+    │   └── SearchResult.cs          # Data models
+    └── Program.cs                   # ASP.NET Core startup
 ```
 
 ---
@@ -497,12 +537,14 @@ System.Text.Json
 | Frontend port | 5000 | `web/Properties/launchSettings.json` |
 | CLIP model | ViT-L/14 | `clip_searcher.py` |
 | DINOv2 model | facebook/dinov2-base | `indexer.py` |
-| DISK chunk dir | `T:/faiss/disk_retrieval/chunks/` | `disk_searcher.py` |
+| Collection configs | Per-collection paths, chunk dirs | `collections_config.py` |
+| DISK chunk dirs | `T:/faiss/disk_retrieval/chunks/` (per collection) | `collections_config.py` |
 | Chunk buffer dir | `D:/faiss/disk_retrieval/chunk_buffer/` | `disk_searcher.py` |
 | Buffer size | 5 chunks | `disk_searcher.py` |
 | DISK features dir | `T:/disk-features/` | `disk_features_file.py` |
 | SQL Server | `localhost/trivia` (Windows Auth) | `db_helper.py` |
-| OpenSearch | `localhost:9200` | `opensearch_searcher.py` |
+| OpenSearch | `localhost:9200` | `collections_config.py` |
+| HasPossibleHit threshold | 500 votes | `db_helper.py` |
 
 ---
 
@@ -531,7 +573,8 @@ System.Text.Json
 | Books indexed | 4,735 (69.4% of total) |
 | Total images (books) | ~5M pages |
 | DISK keypoints | ~19.6 billion |
-| FAISS chunks | 441 × ~22GB |
+| FAISS chunks (books) | 441 × ~22GB |
 | Total chunk storage | ~9.7 TB |
 | CLIP index (books) | ~15 GB |
-| Collections | books, board_games, print_ads, albums |
+| Collections | books, board_games, print_ads, albums, comics, cereal |
+| Compact ID path storage | ~95 GB (down from 3.3 TB) |

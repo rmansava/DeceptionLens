@@ -36,4 +36,5 @@ public interface ISearchService
     string GetSearchHistoryImageUrl(int searchId);
     Task<SaveSearchResponse?> SaveSearchHistoryAsync(Stream? imageStream, string? fileName, string searchType, string? queryText, List<SearchResult> results, int? durationMs, string? collection);
     Task<bool> DeleteSearchHistoryAsync(int searchId);
+    Task<bool> StopSearchAsync(int searchId);
 }

@@ -160,6 +160,47 @@ def complete_search_session(search_id: int, duration_ms: int):
         conn.close()
 
 
+def stop_search_session(search_id: int):
+    """Mark a search session as stopped."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            UPDATE ImageSearchHistory
+            SET Status = 'stopped',
+                CurrentProgress = 'Stopped by user'
+            WHERE Id = ? AND Status = 'in_progress'
+        """, (search_id,))
+        conn.commit()
+        updated = cursor.rowcount > 0
+        if updated:
+            logger.info(f"Stopped search session #{search_id}")
+        return updated
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to stop search session: {e}")
+        return False
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_search_status(search_id: int) -> Optional[str]:
+    """Get the current status of a search session."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT Status FROM ImageSearchHistory WHERE Id = ?", (search_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        cursor.close()
+        conn.close()
+
+
 def save_search_history(
     search_type: str,
     query_image: Optional[bytes] = None,

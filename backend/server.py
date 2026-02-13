@@ -1522,6 +1522,24 @@ def delete_history_entry(search_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/history/{search_id}/stop")
+def stop_history_entry(search_id: int):
+    """Stop an in-progress search session."""
+    try:
+        from db_helper import stop_search_session
+
+        if stop_search_session(search_id):
+            return {"message": "Stopped"}
+        else:
+            raise HTTPException(status_code=404, detail="Search not found or not in progress")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to stop search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.put("/history/{search_id}/note")
 def update_history_note(search_id: int, note: str = Query(...)):
     """Add or update a note on a search."""

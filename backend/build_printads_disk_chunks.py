@@ -32,6 +32,7 @@ import cv2
 from glob import glob
 from datetime import datetime
 from threading import Thread, Event
+from disk_chunk_db import sync_chunk_to_db, sync_paths_to_db, create_tables
 
 try:
     import kornia.feature as KF
@@ -66,6 +67,9 @@ LOG_FILE = os.path.join(PROGRESS_DIR, "build_log.txt")
 # Chunk sizing: target ~10GB per chunk for GPU FAISS (fits in 16GB VRAM with headroom)
 # 10GB = ~19.5M vectors at 128 dims * 4 bytes = 512 bytes/vector
 MAX_VECTORS_PER_CHUNK = 19_500_000  # ~10 GB
+
+# Collection name for DB sync
+COLLECTION_NAME = "print_ads"
 
 # DISK extraction settings
 MAX_IMAGE_DIM = 1600  # Resize images larger than this
@@ -166,6 +170,9 @@ def save_path_lookup(path_to_id):
         json.dump(id_to_path, f)
 
     log(f"  Saved path_lookup.json: {len(path_to_id):,} unique paths ({os.path.getsize(lookup_file) / 1e6:.1f} MB)")
+
+    # Sync new paths to DB
+    sync_paths_to_db(COLLECTION_NAME, path_to_id)
 
 
 def preprocess_image(image_path, max_dim=MAX_IMAGE_DIM):
@@ -268,6 +275,9 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
     ids_file = os.path.join(CHUNK_IDS_DIR, f"chunk_{chunk_num:03d}_ids.npy")
     np.save(ids_file, ids_array)
     ids_size = os.path.getsize(ids_file) / (1024**2)
+
+    # Sync to DB
+    sync_chunk_to_db(COLLECTION_NAME, chunk_num, ids_array)
 
     log(f"  Chunk {chunk_num:03d}: {num_vectors:,} vectors from {num_images} images "
         f"({faiss_size:.1f} GB index, {ids_size:.0f} MB IDs)")
