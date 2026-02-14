@@ -21,7 +21,11 @@ import logging
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from disk_searcher import search_disk_batch, get_total_chunks
-from db_helper import create_search_session, update_search_progress, complete_search_session
+from db_helper import (
+    create_search_session,
+    update_search_progress_batch,
+    complete_search_session
+)
 
 LOG_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(LOG_DIR, "batch_search.log")
@@ -137,19 +141,19 @@ def main():
         return stopped
 
     def progress_callback(chunk_idx, total_chunks, per_image_results, elapsed_ms):
-        # Update each image's search session in DB
-        for image_name, results in per_image_results.items():
-            if image_name in search_ids:
-                try:
-                    update_search_progress(
-                        search_ids[image_name],
-                        chunk_idx,
-                        total_chunks,
-                        results,
-                        elapsed_ms
-                    )
-                except Exception as e:
-                    pass  # Don't let DB errors stop the search
+        # Update all image sessions for this chunk in one DB transaction.
+        try:
+            updates = []
+            for image_name, results in per_image_results.items():
+                search_id = search_ids.get(image_name)
+                if search_id:
+                    updates.append({
+                        "search_id": search_id,
+                        "top_results": results
+                    })
+            update_search_progress_batch(updates, chunk_idx, total_chunks, elapsed_ms)
+        except Exception:
+            pass  # Don't let DB errors stop the search
 
         # Console progress
         elapsed = time.time() - start_time
@@ -201,19 +205,19 @@ def main():
         except Exception as e:
             print(f"  Warning: Failed to complete session #{search_id}: {e}")
 
-    # Final update: write final results to each session
-    for image_name, image_results in results.items():
-        if image_name in search_ids:
-            try:
-                update_search_progress(
-                    search_ids[image_name],
-                    total_chunks,
-                    total_chunks,
-                    image_results,
-                    duration_ms
-                )
-            except Exception:
-                pass
+    # Final update: write final results for all sessions in one DB transaction
+    try:
+        final_updates = []
+        for image_name, image_results in results.items():
+            search_id = search_ids.get(image_name)
+            if search_id:
+                final_updates.append({
+                    "search_id": search_id,
+                    "top_results": image_results
+                })
+        update_search_progress_batch(final_updates, total_chunks, total_chunks, duration_ms)
+    except Exception:
+        pass
 
     # Summary
     elapsed = time.time() - start_time

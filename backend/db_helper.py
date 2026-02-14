@@ -10,6 +10,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Keep ODBC pooling explicitly enabled (it is usually on by default).
+pyodbc.pooling = True
+
 # Connection settings from environment or defaults
 DB_SERVER = os.environ.get("DB_SERVER", "localhost")
 DB_NAME = os.environ.get("DB_NAME", "trivia")
@@ -29,6 +32,23 @@ def get_connection_string() -> str:
 def get_connection() -> pyodbc.Connection:
     """Get a database connection."""
     return pyodbc.connect(get_connection_string())
+
+
+def _build_result_rows(search_id: int, top_results: List[Dict[str, Any]]) -> List[tuple]:
+    """Build INSERT rows for top results."""
+    rows = []
+    for rank, result in enumerate(top_results[:100], 1):  # Top 100
+        rows.append((
+            search_id,
+            rank,
+            result.get('path', ''),
+            result.get('score', 0.0),
+            result.get('verified_matches', result.get('votes', None)),
+            result.get('keypoint_matches', None),
+            result.get('template_score', None),
+            result.get('combined_score', None)
+        ))
+    return rows
 
 
 def create_search_session(
@@ -105,32 +125,93 @@ def update_search_progress(
             WHERE Id = ?
         """, (progress_text, len(top_results), elapsed_ms, search_id))
 
-        # Delete old results and insert new ones
+        # Delete old results and bulk-insert new ones
         cursor.execute("DELETE FROM ImageSearchResults WHERE SearchHistoryId = ?", (search_id,))
 
-        for rank, result in enumerate(top_results[:100], 1):  # Top 100
-            cursor.execute("""
+        rows = _build_result_rows(search_id, top_results)
+        if rows:
+            cursor.fast_executemany = True
+            cursor.executemany("""
                 INSERT INTO ImageSearchResults (
                     SearchHistoryId, Rank, ImagePath, Score,
                     VerifiedMatches, KeypointMatches, TemplateScore, CombinedScore
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                search_id,
-                rank,
-                result.get('path', ''),
-                result.get('score', 0.0),
-                result.get('verified_matches', result.get('votes', None)),
-                result.get('keypoint_matches', None),
-                result.get('template_score', None),
-                result.get('combined_score', None)
-            ))
+            """, rows)
 
         conn.commit()
 
     except Exception as e:
         conn.rollback()
         logger.error(f"Failed to update search progress: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def update_search_progress_batch(
+    progress_updates: List[Dict[str, Any]],
+    current_chunk: int,
+    total_chunks: int,
+    elapsed_ms: Optional[int] = None
+):
+    """
+    Update progress for multiple search sessions in one DB transaction.
+
+    Args:
+        progress_updates: List of {'search_id': int, 'top_results': list}
+        current_chunk: Current chunk index (1-based)
+        total_chunks: Total chunks in this run
+        elapsed_ms: Elapsed search time in ms
+    """
+    if not progress_updates:
+        return
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        progress_text = f"Searching chunk {current_chunk}/{total_chunks}"
+
+        # Update all history rows in one batched call.
+        history_rows = [
+            (progress_text, len(update.get('top_results', [])), elapsed_ms, update['search_id'])
+            for update in progress_updates
+        ]
+        cursor.fast_executemany = True
+        cursor.executemany("""
+            UPDATE ImageSearchHistory
+            SET CurrentProgress = ?,
+                ResultCount = ?,
+                SearchDurationMs = ?
+            WHERE Id = ?
+        """, history_rows)
+
+        # Replace results for all sessions in one transaction.
+        delete_rows = [(update['search_id'],) for update in progress_updates]
+        cursor.executemany(
+            "DELETE FROM ImageSearchResults WHERE SearchHistoryId = ?",
+            delete_rows
+        )
+
+        insert_rows = []
+        for update in progress_updates:
+            insert_rows.extend(_build_result_rows(update['search_id'], update.get('top_results', [])))
+
+        if insert_rows:
+            cursor.executemany("""
+                INSERT INTO ImageSearchResults (
+                    SearchHistoryId, Rank, ImagePath, Score,
+                    VerifiedMatches, KeypointMatches, TemplateScore, CombinedScore
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, insert_rows)
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to update batch search progress: {e}")
     finally:
         cursor.close()
         conn.close()
