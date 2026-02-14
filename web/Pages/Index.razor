@@ -1,7 +1,9 @@
 @page "/"
+@implements IDisposable
 @inject ISearchService SearchService
 @inject ILogger<Index> Logger
 @inject NavigationManager Navigation
+@inject IJSRuntime JSRuntime
 
 <PageTitle>Deception Lens - An Image Finder</PageTitle>
 
@@ -36,12 +38,7 @@
             <p class="search-info">Find the source of cropped images.</p>
 
             <!-- Keypoint Visual Search -->
-            <div class="upload-area @(isDragging ? "dragging" : "")"
-                 @ondragenter="HandleDragEnter"
-                 @ondragleave="HandleDragLeave"
-                 @ondragover:preventDefault
-                 @ondrop="HandleDrop"
-                 @ondrop:preventDefault>
+            <div id="disk-upload-area" class="upload-area">
 
                 @if (diskPreviewUrl != null)
                 {
@@ -58,7 +55,7 @@
                     </div>
                 }
 
-                <InputFile OnChange="HandleDiskFileSelected" accept="image/*" class="file-input" />
+                <InputFile id="disk-file-input" OnChange="HandleDiskFileSelected" accept="image/*" class="file-input" />
             </div>
             <button class="search-btn disk-search-btn" @onclick="PerformDiskImageSearch"
                     disabled="@(diskFileBytes == null || diskFileBytes.Length == 0 || isSearching)">
@@ -89,12 +86,7 @@
             <div class="form-group">
                 <label>Visual Search</label>
             </div>
-            <div class="upload-area @(isDragging ? "dragging" : "")"
-                 @ondragenter="HandleDragEnter"
-                 @ondragleave="HandleDragLeave"
-                 @ondragover:preventDefault
-                 @ondrop="HandleDrop"
-                 @ondrop:preventDefault>
+            <div id="clip-upload-area" class="upload-area">
 
                 @if (clipPreviewUrl != null)
                 {
@@ -111,7 +103,7 @@
                     </div>
                 }
 
-                <InputFile OnChange="HandleClipFileSelected" accept="image/*" class="file-input" />
+                <InputFile id="clip-file-input" OnChange="HandleClipFileSelected" accept="image/*" class="file-input" />
             </div>
             <button class="search-btn clip-search-btn" @onclick="PerformClipImageSearch"
                     disabled="@(clipFileBytes == null || clipFileBytes.Length == 0 || isSearching)">
@@ -124,12 +116,7 @@
             <h2 class="section-title">Face Search</h2>
             <p class="search-info">Find matching faces using ArcFace recognition. Upload a photo with a face to find similar faces.</p>
 
-            <div class="upload-area @(isDragging ? "dragging" : "")"
-                 @ondragenter="HandleDragEnter"
-                 @ondragleave="HandleDragLeave"
-                 @ondragover:preventDefault
-                 @ondrop="HandleDrop"
-                 @ondrop:preventDefault>
+            <div id="face-upload-area" class="upload-area">
 
                 @if (facePreviewUrl != null)
                 {
@@ -146,8 +133,12 @@
                     </div>
                 }
 
-                <InputFile OnChange="HandleFaceFileSelected" accept="image/*" class="file-input" />
+                <InputFile id="face-file-input" OnChange="HandleFaceFileSelected" accept="image/*" class="file-input" />
             </div>
+            <button class="search-btn face-search-btn" @onclick="PerformFaceSearch"
+                    disabled="@(faceFileBytes == null || faceFileBytes.Length == 0 || isSearching)">
+                Search Faces
+            </button>
         </div>
 
         <!-- Stats -->
@@ -249,7 +240,21 @@
             <div class="loading-container">
                 <div class="spinner"></div>
                 <p class="progress-main">@searchProgressMessage</p>
-                @if (lastSearchType == "DINOv2 Visual" && currentProgress != null)
+                @if (activeDiskSearchId.HasValue && currentDiskSearch != null)
+                {
+                    @if (currentDiskSearch.TotalChunks.GetValueOrDefault() > 0)
+                    {
+                        <div class="progress-details">
+                            <div class="progress-bar-container">
+                                <div class="progress-bar" style="width: @(GetDiskProgressPercent(currentDiskSearch))%"></div>
+                            </div>
+                        </div>
+                    }
+                    <button class="search-btn" @onclick="StopActiveDiskSearch">
+                        Cancel DISK Search
+                    </button>
+                }
+                else if (lastSearchType == "DINOv2 Visual" && currentProgress != null)
                 {
                     <div class="progress-details">
                         @if (currentProgress.Total > 0)
@@ -296,6 +301,10 @@
                         <div class="result-info">
                             <h3 class="result-filename" title="@result.Path">@result.FileName</h3>
                             <div class="result-stats">
+                                @if (selectedCollection == "all" && !string.IsNullOrEmpty(GetResultCollection(result)))
+                                {
+                                    <span class="verified-badge">@GetResultCollection(result)</span>
+                                }
                                 @if (lastSearchType == "DINOv2 Visual" && verify && result.VerifiedMatches > 0)
                                 {
                                     <span class="verified-badge verified-positive">
@@ -885,8 +894,6 @@
     private SearchProgressResponse? currentProgress;
     private bool isSearching = false;
     private bool hasSearched = false;
-    private bool isDragging = false;
-
     // CLIP file state
     private string? clipPreviewUrl;
     private IBrowserFile? clipSelectedFile;
@@ -906,6 +913,9 @@
     private string? diskPreviewUrl;
     private IBrowserFile? diskSelectedFile;
     private byte[]? diskFileBytes;
+    private int? activeDiskSearchId;
+    private SearchHistoryDetail? currentDiskSearch;
+    private CancellationTokenSource? diskSearchPollCts;
 
     // History state
     private bool showHistoryPanel = false;
@@ -921,6 +931,18 @@
         await LoadCollections();
         await LoadStats();
         await LoadClipStats();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+        {
+            return;
+        }
+
+        await JSRuntime.InvokeVoidAsync("deceptionLensDragDrop.bind", "disk-upload-area", "disk-file-input");
+        await JSRuntime.InvokeVoidAsync("deceptionLensDragDrop.bind", "clip-upload-area", "clip-file-input");
+        await JSRuntime.InvokeVoidAsync("deceptionLensDragDrop.bind", "face-upload-area", "face-file-input");
     }
 
     private async Task LoadCollections()
@@ -1205,8 +1227,7 @@
         faceFileBytes = ms.ToArray();
 
         facePreviewUrl = $"data:{faceSelectedFile.ContentType};base64,{Convert.ToBase64String(faceFileBytes)}";
-
-        await PerformFaceSearch();
+        StateHasChanged();
     }
 
     private async Task PerformFaceSearch()
@@ -1280,37 +1301,119 @@
     {
         if (diskSelectedFile == null || diskFileBytes == null || diskFileBytes.Length == 0) return;
 
+        diskSearchPollCts?.Cancel();
+        diskSearchPollCts?.Dispose();
+        diskSearchPollCts = new CancellationTokenSource();
+
         isSearching = true;
         hasSearched = true;
         errorMessage = null;
         lastSearchType = "Keypoint";
-        searchProgressMessage = "Extracting keypoints and searching...";
+        searchProgressMessage = "Queueing DISK search...";
+        currentDiskSearch = null;
+        activeDiskSearchId = null;
+        results = new List<SearchResult>();
         StateHasChanged();
 
         try
         {
             using var ms = new MemoryStream(diskFileBytes);
-            results = await SearchService.DiskSearchAsync(
+            var start = await SearchService.DiskSearchAsync(
                 ms,
                 diskSelectedFile.Name,
-                topK
+                topK,
+                selectedCollection
             );
 
-            if (results.Count == 0)
+            if (start == null || start.SearchId <= 0)
             {
-                errorMessage = "No keypoint matches found";
+                throw new InvalidOperationException("DISK search was not queued");
             }
+
+            activeDiskSearchId = start.SearchId;
+            searchProgressMessage = start.Message;
+            _ = PollDiskSearchAsync(start.SearchId, diskSearchPollCts.Token);
         }
         catch (Exception ex)
         {
             Logger.LogError(ex, "DISK search failed");
             errorMessage = $"DISK search failed: {ex.Message}";
             results = new List<SearchResult>();
-        }
-        finally
-        {
             isSearching = false;
+            activeDiskSearchId = null;
+            currentDiskSearch = null;
             StateHasChanged();
+        }
+    }
+
+    private async Task PollDiskSearchAsync(int searchId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(1000, cancellationToken);
+
+                var detail = await SearchService.GetSearchHistoryDetailAsync(searchId);
+                if (detail == null)
+                {
+                    continue;
+                }
+
+                currentDiskSearch = detail;
+                if (!string.IsNullOrWhiteSpace(detail.Notes))
+                {
+                    searchProgressMessage = detail.Notes;
+                }
+                else if (!string.IsNullOrWhiteSpace(detail.CurrentProgress))
+                {
+                    searchProgressMessage = detail.CurrentProgress;
+                }
+
+                results = detail.Results
+                    .OrderBy(r => r.Rank)
+                    .Select(r => new SearchResult
+                    {
+                        Path = r.ImagePath,
+                        Score = r.Score,
+                        VerifiedMatches = r.VerifiedMatches ?? 0
+                    })
+                    .ToList();
+
+                if (!detail.IsInProgress)
+                {
+                    isSearching = false;
+                    activeDiskSearchId = null;
+                    if (string.Equals(detail.Status, "stopped", StringComparison.OrdinalIgnoreCase))
+                    {
+                        errorMessage = "DISK search stopped.";
+                    }
+                    else if (string.Equals(detail.Status, "failed", StringComparison.OrdinalIgnoreCase))
+                    {
+                        errorMessage = "DISK search failed.";
+                    }
+                    else if (results.Count == 0)
+                    {
+                        errorMessage = "No keypoint matches found";
+                    }
+                    await InvokeAsync(StateHasChanged);
+                    break;
+                }
+
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (TaskCanceledException)
+        {
+            // Expected when a new DISK search starts or user cancels.
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "DISK polling failed");
+            errorMessage = $"DISK polling failed: {ex.Message}";
+            isSearching = false;
+            activeDiskSearchId = null;
+            await InvokeAsync(StateHasChanged);
         }
     }
 
@@ -1321,12 +1424,23 @@
         diskPreviewUrl = null;
     }
 
-    private void HandleDragEnter() => isDragging = true;
-    private void HandleDragLeave() => isDragging = false;
-
-    private void HandleDrop(DragEventArgs e)
+    private async Task StopActiveDiskSearch()
     {
-        isDragging = false;
+        if (!activeDiskSearchId.HasValue)
+        {
+            return;
+        }
+
+        var stopped = await SearchService.StopSearchAsync(activeDiskSearchId.Value);
+        if (!stopped)
+        {
+            errorMessage = "Failed to stop DISK search.";
+            StateHasChanged();
+            return;
+        }
+
+        searchProgressMessage = "Stopping DISK search...";
+        StateHasChanged();
     }
 
     private void OpenImage(string path)
@@ -1343,6 +1457,49 @@
 
     private void HandleImageError()
     {
+    }
+
+    private double GetDiskProgressPercent(SearchHistoryDetail detail)
+    {
+        if (!detail.TotalChunks.HasValue || detail.TotalChunks.Value <= 0 || string.IsNullOrWhiteSpace(detail.CurrentProgress))
+        {
+            return 0;
+        }
+
+        var parts = detail.CurrentProgress.Split(' ', StringSplitOptions.RemoveEmptyEntries).LastOrDefault();
+        if (string.IsNullOrWhiteSpace(parts) || !parts.Contains('/'))
+        {
+            return 0;
+        }
+
+        var chunks = parts.Split('/');
+        if (chunks.Length != 2 || !int.TryParse(chunks[0], out var current))
+        {
+            return 0;
+        }
+
+        return Math.Clamp((double)current / detail.TotalChunks.Value * 100.0, 0, 100);
+    }
+
+    private string? GetResultCollection(SearchResult result)
+    {
+        if (result.Metadata != null && result.Metadata.TryGetValue("collection", out var raw) && raw != null)
+        {
+            var value = raw.ToString();
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        var path = result.Path?.ToLowerInvariant() ?? string.Empty;
+        if (path.Contains("\\books\\") || path.Contains("/books/")) return "books";
+        if (path.Contains("\\print_ads\\") || path.Contains("/print_ads/")) return "print_ads";
+        if (path.Contains("\\board_games\\") || path.Contains("/board_games/")) return "board_games";
+        if (path.Contains("\\cereal\\") || path.Contains("/cereal/")) return "cereal";
+        if (path.Contains("\\albums\\") || path.Contains("/albums/")) return "albums";
+        if (path.Contains("\\comics\\") || path.Contains("/comics/")) return "comics";
+        return null;
     }
 
     private bool CanDeepSearch()
@@ -1528,5 +1685,11 @@
         if (date.Date == DateTime.Today.AddDays(-1))
             return $"Yesterday {date:HH:mm}";
         return date.ToString("MMM d, HH:mm");
+    }
+
+    public void Dispose()
+    {
+        diskSearchPollCts?.Cancel();
+        diskSearchPollCts?.Dispose();
     }
 }

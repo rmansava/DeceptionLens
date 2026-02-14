@@ -2,7 +2,7 @@
 Deception Lens API Server
 FastAPI backend for the web application.
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
@@ -167,6 +167,14 @@ class SearchProgressResponse(BaseModel):
     eta_seconds: int
 
 
+class DiskSearchStartResponse(BaseModel):
+    search_id: int
+    status: str
+    queue_position: int
+    total_chunks: int
+    message: str
+
+
 @app.get("/health", response_model=HealthResponse)
 def health_check():
     """Check if the API is healthy."""
@@ -285,13 +293,6 @@ async def search_image(
                 matches = os_searcher.search(temp_path, top_k=fetch_k, collection=collection)
 
                 update_progress("searching", f"Found {len(matches)} candidates", len(matches), len(matches), 0, 0, 0, 0)
-
-                # Debug: Show where encyclopedia of monsters page210 appears in initial ranking
-                for idx, m in enumerate(matches):
-                    if 'monsters' in m['path'].lower() and 'page210' in m['path'].lower():
-                        logger.info(f"DEBUG: encyclopedia of monsters page210 found at initial rank {idx+1} with score {m['score']:.4f}")
-                        logger.info(f"DEBUG: path = {m['path']}")
-                        break  # Only show the first match
 
                 # Show progress during model loading (can take a while on first search)
                 update_progress("loading_models", "Loading DINOv2 + DISK + LightGlue models...", 0, len(matches), 0, 0, 0, 0)
@@ -1002,7 +1003,7 @@ async def clip_text_search_get(
 
 # ============== DISK Search Endpoints ==============
 
-@app.post("/disk/search", response_model=List[SearchResult])
+@app.post("/disk/search", response_model=DiskSearchStartResponse)
 async def disk_search_image(
     file: UploadFile = File(...),
     top_k: int = Query(default=50, ge=1, le=500),
@@ -1014,10 +1015,10 @@ async def disk_search_image(
     background_tasks: BackgroundTasks = None
 ):
     """
-    Search for source pages using DISK keypoint matching with live progress.
+    Queue a DISK keypoint search and return immediately.
 
-    Best for finding the source of cropped images. Shows live progress as
-    chunks are searched with top 100 results updating in real-time.
+    Best for finding the source of cropped images. Client should poll
+    `/history/{search_id}` for progress and results.
 
     IMPORTANT: Uses a queue to ensure only one search runs at a time.
     Other requests will wait in queue to prevent GPU/memory issues.
@@ -1030,14 +1031,16 @@ async def disk_search_image(
     - **chunk_ids**: Comma-separated chunk IDs for testing (e.g. '141,142,143')
     - **collections**: Comma-separated collections to search (e.g. 'books,print_ads'). Default: all
     """
-    start_time = time.time()
-    search_id = None
-
     try:
         from disk_searcher import search_disk, get_total_chunks
-        from db_helper import create_search_session, update_search_progress, complete_search_session, add_search_note
+        from db_helper import (
+            create_search_session,
+            update_search_progress,
+            complete_search_session,
+            fail_search_session,
+            add_search_note
+        )
         from disk_queue import get_disk_queue
-        import asyncio
 
         image_bytes = await file.read()
         image_filename = file.filename
@@ -1058,47 +1061,54 @@ async def disk_search_image(
         logger.info(f"DISK search: {len(image_bytes)} bytes, top_k={top_k}, collections={cat_label}, live_tracking={live_tracking}" +
                     (f", chunks={specific_chunks}" if specific_chunks else ""))
 
-        # Create search session for live tracking
-        if live_tracking:
-            # Count total chunks for progress tracking
-            if specific_chunks:
-                total_chunks = len(specific_chunks)
-            else:
-                total_chunks = get_total_chunks(categories)
+        # Count total chunks for progress tracking
+        if specific_chunks:
+            total_chunks = len(specific_chunks)
+        else:
+            total_chunks = get_total_chunks(categories)
 
-            search_id = create_search_session(
-                search_type="DISK Keypoint",
-                query_image=image_bytes,
-                query_image_name=image_filename,
-                collection=cat_label,
-                total_chunks=total_chunks
-            )
-            logger.info(f"Created search session #{search_id} with {total_chunks} chunks across {cat_label}")
+        # Async DISK search always creates a history row for polling.
+        search_id = create_search_session(
+            search_type="DISK Keypoint",
+            query_image=image_bytes,
+            query_image_name=image_filename,
+            collection=cat_label,
+            total_chunks=total_chunks
+        )
+        logger.info(f"Created search session #{search_id} with {total_chunks} chunks across {cat_label}")
 
         # Progress callback for live updates
         def progress_callback(current_chunk, total_chunks, top_results, elapsed_ms):
-            if live_tracking and search_id:
-                try:
-                    update_search_progress(search_id, current_chunk, total_chunks, top_results, elapsed_ms)
-                except Exception as e:
-                    logger.error(f"Failed to update search progress: {e}")
+            try:
+                update_search_progress(search_id, current_chunk, total_chunks, top_results, elapsed_ms)
+            except Exception as e:
+                logger.error(f"Failed to update search progress: {e}")
 
         # Define the search function to be executed (categories captured in closure)
         def run_search(image_bytes, top_k, k, threshold, specific_chunks, progress_callback, check_stopped=None):
-            return search_disk(
-                image_bytes,
-                top_k=top_k,
-                k=k,
-                threshold=threshold,
-                specific_chunks=specific_chunks,
-                categories=categories,
-                progress_callback=progress_callback,
-                check_stopped=check_stopped
-            )
+            run_start = time.time()
+            try:
+                matches = search_disk(
+                    image_bytes,
+                    top_k=top_k,
+                    k=k,
+                    threshold=threshold,
+                    specific_chunks=specific_chunks,
+                    categories=categories,
+                    progress_callback=progress_callback,
+                    check_stopped=check_stopped
+                )
+                if not (check_stopped and check_stopped()):
+                    duration_ms = int((time.time() - run_start) * 1000)
+                    complete_search_session(search_id, duration_ms)
+                return matches
+            except Exception as e:
+                fail_search_session(search_id, str(e))
+                raise
 
         # Add to queue
         queue = get_disk_queue()
-        position = await queue.add_search(
+        queue_position = await queue.add_search(
             search_id=search_id if search_id else 0,
             image_bytes=image_bytes,
             top_k=top_k,
@@ -1109,62 +1119,24 @@ async def disk_search_image(
             search_function=run_search
         )
 
-        if position > 1 and live_tracking and search_id:
-            # Update search note to show queue position
-            add_search_note(search_id, f"Waiting in queue (position: {position})")
-            logger.info(f"Search #{search_id} added to queue at position {position}")
+        status = await queue.get_status(search_id)
+        status_label = status['status'] if status else 'queued'
+        if status_label == 'queued':
+            queue_pos = status.get('position', queue_position) if status else queue_position
+            add_search_note(search_id, f"Waiting in queue (position: {queue_pos})")
+            message = f"Queued at position {queue_pos}"
+        else:
+            add_search_note(search_id, "")
+            message = "Search started"
 
-        # Poll for completion
-        logger.info(f"Waiting for search #{search_id} to complete...")
-        while True:
-            await asyncio.sleep(1)  # Check every second
-
-            status = await queue.get_status(search_id if search_id else 0)
-            if status:
-                if status['status'] == 'completed':
-                    matches = status['result']
-                    logger.info(f"Search #{search_id} completed from queue")
-                    break
-                elif status['status'] == 'failed':
-                    error_msg = status.get('error', 'Unknown error')
-                    logger.error(f"Search #{search_id} failed in queue: {error_msg}")
-                    raise HTTPException(status_code=500, detail=error_msg)
-                elif status['status'] == 'queued' and live_tracking and search_id:
-                    # Update queue position in notes
-                    queue_pos = status.get('position', 0)
-                    add_search_note(search_id, f"Waiting in queue (position: {queue_pos})")
-                elif status['status'] == 'running' and live_tracking and search_id:
-                    # Clear queue note once running
-                    add_search_note(search_id, "")
-
-        # Process results
-        results = []
-        for m in matches:
-            results.append(SearchResult(
-                path=m['path'],
-                score=m['score'],
-                verified_matches=m['votes'],
-                metadata={'votes': m['votes']}
-            ))
-
-        # Complete search session
-        duration_ms = int((time.time() - start_time) * 1000)
-        if live_tracking and search_id:
-            complete_search_session(search_id, duration_ms)
-        elif not live_tracking and background_tasks:
-            # Save to history in background (legacy mode)
-            history_results = [{'path': m['path'], 'score': m['score'], 'votes': m['votes']} for m in matches]
-            background_tasks.add_task(
-                save_search_to_history,
-                search_type="DISK Keypoint",
-                results=history_results,
-                search_duration_ms=duration_ms,
-                query_image=image_bytes,
-                query_image_name=image_filename
-            )
-
-        logger.info(f"DISK search completed in {duration_ms}ms, found {len(results)} results")
-        return results
+        logger.info(f"DISK search #{search_id} accepted ({message})")
+        return DiskSearchStartResponse(
+            search_id=search_id,
+            status=status_label,
+            queue_position=status.get('position', queue_position) if status else queue_position,
+            total_chunks=total_chunks,
+            message=message
+        )
 
     except Exception as e:
         logger.error(f"DISK search failed: {e}")
@@ -1465,11 +1437,11 @@ def get_history_query_image(search_id: int):
 @app.post("/history", response_model=SaveSearchResponse)
 async def save_history(
     file: UploadFile = File(None),
-    search_type: str = Query(...),
-    query_text: Optional[str] = Query(default=None),
-    results_json: str = Query(..., description="JSON array of results"),
-    search_duration_ms: Optional[int] = Query(default=None),
-    collection: Optional[str] = Query(default=None)
+    search_type: str = Form(...),
+    query_text: Optional[str] = Form(default=None),
+    results_json: str = Form(..., description="JSON array of results"),
+    search_duration_ms: Optional[int] = Form(default=None),
+    collection: Optional[str] = Form(default=None)
 ):
     """
     Save a search to history.
@@ -1537,7 +1509,7 @@ def delete_history_entry(search_id: int):
 
 
 @app.post("/history/{search_id}/stop")
-def stop_history_entry(search_id: int):
+async def stop_history_entry(search_id: int):
     """Stop an in-progress search session."""
     try:
         from db_helper import stop_search_session
@@ -1545,7 +1517,7 @@ def stop_history_entry(search_id: int):
 
         # Signal the search thread to stop
         queue = get_disk_queue()
-        queue.stop_search(search_id)
+        await queue.stop_search(search_id)
 
         # Mark as stopped in DB
         if stop_search_session(search_id):

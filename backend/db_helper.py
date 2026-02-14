@@ -241,6 +241,32 @@ def complete_search_session(search_id: int, duration_ms: int):
         conn.close()
 
 
+def fail_search_session(search_id: int, error_message: Optional[str] = None):
+    """Mark search as failed."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        progress = "Failed"
+        if error_message:
+            progress = f"Failed: {error_message[:200]}"
+        cursor.execute("""
+            UPDATE ImageSearchHistory
+            SET Status = 'failed',
+                CurrentProgress = ?
+            WHERE Id = ?
+        """, (progress, search_id))
+        conn.commit()
+        logger.info(f"Marked search session #{search_id} as failed")
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to mark search session as failed: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
 def stop_search_session(search_id: int):
     """Mark a search session as stopped."""
     conn = get_connection()

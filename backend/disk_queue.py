@@ -151,13 +151,17 @@ class DiskSearchQueue:
 
             return None
 
-    def stop_search(self, search_id: int) -> bool:
-        """Signal a running or queued search to stop. Thread-safe."""
-        self._stopped_ids.add(search_id)
-        # Remove from queue if still queued
-        self.queue = [r for r in self.queue if r.search_id != search_id]
+    async def stop_search(self, search_id: int) -> bool:
+        """Signal a running or queued search to stop."""
+        async with self.lock:
+            self._stopped_ids.add(search_id)
+            queued_before = len(self.queue)
+            self.queue = [r for r in self.queue if r.search_id != search_id]
+            removed_from_queue = len(self.queue) < queued_before
+            is_current = self.current_search is not None and self.current_search.search_id == search_id
+
         logger.info(f"Stop signal sent for search #{search_id}")
-        return True
+        return removed_from_queue or is_current
 
     def is_stopped(self, search_id: int) -> bool:
         """Check if a search has been stopped. Called from search thread."""

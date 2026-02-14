@@ -252,10 +252,11 @@ public class SearchService : ISearchService
         }
     }
 
-    public async Task<List<SearchResult>> DiskSearchAsync(
+    public async Task<DiskSearchStartResponse?> DiskSearchAsync(
         Stream imageStream,
         string fileName,
-        int topK = 50)
+        int topK = 50,
+        string collection = "all")
     {
         try
         {
@@ -265,17 +266,21 @@ public class SearchService : ISearchService
             content.Add(streamContent, "file", fileName);
 
             var url = $"/disk/search?top_k={topK}";
+            if (!string.IsNullOrWhiteSpace(collection) && !string.Equals(collection, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                url += $"&collections={Uri.EscapeDataString(collection)}";
+            }
 
-            _logger.LogInformation("DISK search: {FileName}, topK: {TopK}", fileName, topK);
+            _logger.LogInformation("DISK search queued: {FileName}, topK: {TopK}, collection: {Collection}", fileName, topK, collection);
 
             var response = await _httpClient.PostAsync(url, content);
             response.EnsureSuccessStatusCode();
 
             var json = await response.Content.ReadAsStringAsync();
-            var results = JsonSerializer.Deserialize<List<SearchResult>>(json) ?? new List<SearchResult>();
+            var queued = JsonSerializer.Deserialize<DiskSearchStartResponse>(json);
 
-            _logger.LogInformation("DISK search found {Count} results", results.Count);
-            return results;
+            _logger.LogInformation("DISK search queued with search_id={SearchId}", queued?.SearchId);
+            return queued;
         }
         catch (Exception ex)
         {
@@ -442,18 +447,24 @@ public class SearchService : ISearchService
                 content.Add(streamContent, "file", fileName);
             }
 
-            var url = $"/history?search_type={Uri.EscapeDataString(searchType)}&results_json={Uri.EscapeDataString(resultsJson)}";
-
+            content.Add(new StringContent(searchType), "search_type");
+            content.Add(new StringContent(resultsJson), "results_json");
             if (!string.IsNullOrEmpty(queryText))
-                url += $"&query_text={Uri.EscapeDataString(queryText)}";
+            {
+                content.Add(new StringContent(queryText), "query_text");
+            }
             if (durationMs.HasValue)
-                url += $"&search_duration_ms={durationMs}";
+            {
+                content.Add(new StringContent(durationMs.Value.ToString()), "search_duration_ms");
+            }
             if (!string.IsNullOrEmpty(collection))
-                url += $"&collection={Uri.EscapeDataString(collection)}";
+            {
+                content.Add(new StringContent(collection), "collection");
+            }
 
             _logger.LogInformation("Saving search history: type={SearchType}, results={Count}", searchType, results.Count);
 
-            var response = await _httpClient.PostAsync(url, content);
+            var response = await _httpClient.PostAsync("/history", content);
             response.EnsureSuccessStatusCode();
 
             var json = await response.Content.ReadAsStringAsync();

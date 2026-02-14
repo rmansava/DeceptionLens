@@ -266,6 +266,44 @@ def resolve_path(paths_or_ids, id_to_path, idx):
         return paths_or_ids[idx]
 
 
+def _accumulate_votes_vectorized(votes: Counter, distances, indices, threshold, paths_or_ids, id_to_path):
+    """
+    Vectorized vote accumulation from kNN results.
+
+    Returns the number of matched keypoint-neighbor pairs that passed threshold.
+    """
+    if distances.size == 0 or indices.size == 0 or len(paths_or_ids) == 0:
+        return 0
+
+    mask = (indices >= 0) & (distances >= threshold)
+    if not np.any(mask):
+        return 0
+
+    valid_indices = indices[mask].astype(np.int64, copy=False)
+    in_range = (valid_indices >= 0) & (valid_indices < len(paths_or_ids))
+    if not np.any(in_range):
+        return 0
+    valid_indices = valid_indices[in_range]
+
+    if id_to_path is not None and len(id_to_path) > 0:
+        compact_ids = np.asarray(paths_or_ids[valid_indices], dtype=np.int64)
+        compact_in_range = (compact_ids >= 0) & (compact_ids < len(id_to_path))
+        if not np.any(compact_in_range):
+            return 0
+        compact_ids = compact_ids[compact_in_range]
+        unique_ids, counts = np.unique(compact_ids, return_counts=True)
+        for compact_id, count in zip(unique_ids.tolist(), counts.tolist()):
+            votes[id_to_path[compact_id]] += int(count)
+        return int(compact_ids.size)
+
+    unique_indices, counts = np.unique(valid_indices, return_counts=True)
+    for vector_idx, count in zip(unique_indices.tolist(), counts.tolist()):
+        path = paths_or_ids[vector_idx]
+        if path is not None:
+            votes[path] += int(count)
+    return int(valid_indices.size)
+
+
 def extract_disk_features(image_bytes: bytes) -> np.ndarray:
     """Extract DISK keypoint descriptors from image bytes."""
     import cv2
@@ -453,9 +491,6 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
     copy_queue = Queue()
 
     logger.info(f"Starting rolling buffer search (buffer size: {buffer_size} chunks, GPU: {use_gpu})")
-    # Debug: write GPU status to file for diagnostics
-    with open("D:/faiss/disk_retrieval/gpu_debug.txt", "w") as _dbg:
-        _dbg.write(f"use_gpu={use_gpu}\n_gpu_search_available={_gpu_search_available}\ncuda={torch.cuda.is_available()}\n")
     copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, 0, total_chunks, buffer_size))
     copy_thread.daemon = True
     copy_thread.start()
@@ -508,8 +543,6 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
                 search_method = "GPU"
             except Exception as gpu_err:
                 logger.error(f"  GPU search failed, falling back to CPU: {gpu_err}")
-                with open("D:/faiss/disk_retrieval/gpu_debug.txt", "a") as _dbg:
-                    _dbg.write(f"GPU FAILED on chunk {chunk_idx}: {gpu_err}\n")
                 distances, indices = index.search(query_descriptors, k)
                 search_method = "CPU-fallback"
         else:
@@ -517,18 +550,11 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
             search_method = "CPU"
         search_time = time.time() - search_start_chunk
         logger.info(f"  Searched in {search_time:.1f}s ({search_method})")
-        if chunk_idx == 0:
-            with open("D:/faiss/disk_retrieval/gpu_debug.txt", "a") as _dbg:
-                _dbg.write(f"chunk0: method={search_method}, time={search_time:.1f}s, vram_before_search=see_nvidia-smi\n")
 
         # Accumulate votes
-        for i in range(len(query_descriptors)):
-            for j in range(k):
-                idx = indices[i][j]
-                if idx >= 0 and distances[i][j] >= threshold:
-                    path = resolve_path(paths_or_ids, id_to_path, idx)
-                    if path is not None:
-                        all_votes[path] += 1
+        _accumulate_votes_vectorized(
+            all_votes, distances, indices, threshold, paths_or_ids, id_to_path
+        )
 
         # Free memory
         del index, paths_or_ids
@@ -702,15 +728,9 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
                 img_start = time.time()
                 distances, indices = gpu_results[name]
                 votes = per_image_votes[name]
-                matched = 0
-                for i in range(len(descriptors)):
-                    for j in range(k):
-                        idx = indices[i][j]
-                        if idx >= 0 and distances[i][j] >= threshold:
-                            path = resolve_path(paths_or_ids, id_to_path, idx)
-                            if path is not None:
-                                votes[path] += 1
-                                matched += 1
+                matched = _accumulate_votes_vectorized(
+                    votes, distances, indices, threshold, paths_or_ids, id_to_path
+                )
                 top_votes = votes.most_common(1)[0][1] if votes else 0
                 logger.info(f"    {name}: {time.time() - img_start:.1f}s ({len(descriptors)} kp, {matched} matches, top={top_votes} votes)")
             vote_time = time.time() - vote_start
@@ -723,13 +743,9 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
                 img_start = time.time()
                 distances, indices = index.search(descriptors, k)
                 votes = per_image_votes[name]
-                for i in range(len(descriptors)):
-                    for j in range(k):
-                        idx = indices[i][j]
-                        if idx >= 0 and distances[i][j] >= threshold:
-                            path = resolve_path(paths_or_ids, id_to_path, idx)
-                            if path is not None:
-                                votes[path] += 1
+                _accumulate_votes_vectorized(
+                    votes, distances, indices, threshold, paths_or_ids, id_to_path
+                )
                 logger.info(f"    {name}: {time.time() - img_start:.1f}s ({len(descriptors)} keypoints)")
 
         search_time = time.time() - search_start_chunk

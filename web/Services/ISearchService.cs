@@ -18,8 +18,8 @@ public interface ISearchService
     // Face search methods
     Task<List<SearchResult>> FaceSearchAsync(Stream imageStream, string fileName, int topK = 50, string collection = "images");
 
-    // DISK keypoint search (for finding source of cropped images)
-    Task<List<SearchResult>> DiskSearchAsync(Stream imageStream, string fileName, int topK = 50);
+    // DISK keypoint search (queued job with history polling)
+    Task<DiskSearchStartResponse?> DiskSearchAsync(Stream imageStream, string fileName, int topK = 50, string collection = "all");
 
     // Visualization methods
     Task<byte[]?> GetVisualizationAsync(Stream queryImageStream, string fileName, string matchPath);
