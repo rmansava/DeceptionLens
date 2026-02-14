@@ -11,7 +11,8 @@ Ensures only one DISK search runs at a time to prevent:
 import asyncio
 import logging
 import time
-from typing import Optional, Dict, Any, Callable
+import threading
+from typing import Optional, Dict, Any, Callable, Set
 from dataclasses import dataclass
 from enum import Enum
 
@@ -59,6 +60,7 @@ class DiskSearchQueue:
         self.completed_searches: Dict[int, SearchRequest] = {}  # Keep last 100
         self.lock = asyncio.Lock()
         self.processing_task: Optional[asyncio.Task] = None
+        self._stopped_ids: Set[int] = set()  # Thread-safe via GIL for set ops
 
     async def start(self):
         """Start the queue processor."""
@@ -149,6 +151,18 @@ class DiskSearchQueue:
 
             return None
 
+    def stop_search(self, search_id: int) -> bool:
+        """Signal a running or queued search to stop. Thread-safe."""
+        self._stopped_ids.add(search_id)
+        # Remove from queue if still queued
+        self.queue = [r for r in self.queue if r.search_id != search_id]
+        logger.info(f"Stop signal sent for search #{search_id}")
+        return True
+
+    def is_stopped(self, search_id: int) -> bool:
+        """Check if a search has been stopped. Called from search thread."""
+        return search_id in self._stopped_ids
+
     async def get_queue_info(self) -> Dict[str, Any]:
         """Get overall queue information."""
         async with self.lock:
@@ -174,10 +188,26 @@ class DiskSearchQueue:
                         request.started_time = time.time()
 
                 if request:
+                    # Check if already stopped before starting
+                    if self.is_stopped(request.search_id):
+                        logger.info(f"Search #{request.search_id} was stopped before starting")
+                        request.status = SearchStatus.FAILED
+                        request.error = "Stopped by user"
+                        request.completed_time = time.time()
+                        async with self.lock:
+                            self.completed_searches[request.search_id] = request
+                            self.current_search = None
+                        self._stopped_ids.discard(request.search_id)
+                        continue
+
                     logger.info(f"Starting search #{request.search_id} (waited {time.time() - request.queued_time:.1f}s in queue)")
 
+                    # Create stop checker for this search
+                    sid = request.search_id
+                    stop_check = lambda: self.is_stopped(sid)
+
                     try:
-                        # Run the search function
+                        # Run the search function with stop check
                         result = await asyncio.to_thread(
                             request.search_function,
                             request.image_bytes,
@@ -185,12 +215,18 @@ class DiskSearchQueue:
                             request.k,
                             request.threshold,
                             request.specific_chunks,
-                            request.progress_callback
+                            request.progress_callback,
+                            stop_check
                         )
 
-                        request.result = result
-                        request.status = SearchStatus.COMPLETED
-                        logger.info(f"Search #{request.search_id} completed successfully")
+                        if self.is_stopped(request.search_id):
+                            request.status = SearchStatus.FAILED
+                            request.error = "Stopped by user"
+                            logger.info(f"Search #{request.search_id} stopped by user")
+                        else:
+                            request.result = result
+                            request.status = SearchStatus.COMPLETED
+                            logger.info(f"Search #{request.search_id} completed successfully")
 
                     except Exception as e:
                         logger.error(f"Search #{request.search_id} failed: {e}", exc_info=True)
@@ -199,6 +235,7 @@ class DiskSearchQueue:
 
                     finally:
                         request.completed_time = time.time()
+                        self._stopped_ids.discard(request.search_id)
 
                         # Move to completed searches
                         async with self.lock:

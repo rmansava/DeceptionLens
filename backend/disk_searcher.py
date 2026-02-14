@@ -41,6 +41,9 @@ _device = None
 
 # GPU search via PyTorch (works on Windows, no faiss-gpu needed)
 _gpu_search_available = None  # None = not checked, True/False after check
+GPU_SEARCH_BATCH_SIZE = int(os.environ.get("DISK_GPU_BATCH_SIZE", "4000000"))
+GPU_SEARCH_USE_FP16 = os.environ.get("DISK_GPU_FP16", "1") != "0"
+GPU_SEARCH_MAX_SCORES_BYTES = int(float(os.environ.get("DISK_GPU_MAX_SCORES_GB", "4")) * (1024 ** 3))
 
 def _check_gpu_search():
     """Check if GPU search via PyTorch is available."""
@@ -86,60 +89,85 @@ def _gpu_search_batch(index, query_list, k):
     # Get all vectors as a numpy view directly from FAISS internal storage (zero copy)
     all_vectors = faiss.vector_to_array(index.codes).view("float32").reshape(n_vectors, dim)
 
-    batch_size = 2_000_000  # ~1GB per batch at dim=128
+    batch_size = GPU_SEARCH_BATCH_SIZE
 
     # Prepare per-query state on GPU
     query_tensors = {}
     running_distances = {}
     running_indices = {}
+    tensor_dtype = torch.float16 if GPU_SEARCH_USE_FP16 else torch.float32
+    distance_floor = -2.0 if GPU_SEARCH_USE_FP16 else -1e9
     for name, descriptors in query_list:
         if len(descriptors) == 0:
             continue
-        query_tensors[name] = torch.from_numpy(descriptors).cuda()
-        running_distances[name] = torch.full((len(descriptors), k), -1e9, device='cuda')
+        query_tensors[name] = torch.from_numpy(np.ascontiguousarray(descriptors)).to(device='cuda', dtype=tensor_dtype)
+        running_distances[name] = torch.full((len(descriptors), k), distance_floor, dtype=tensor_dtype, device='cuda')
         running_indices[name] = torch.full((len(descriptors), k), -1, dtype=torch.long, device='cuda')
 
-    # Max scores matrix ~4GB to prevent OOM (scores = n_query * db_count * 4 bytes)
-    MAX_SCORES_BYTES = 4 * 1024 ** 3
+    score_elem_bytes = 2 if GPU_SEARCH_USE_FP16 else 4
+    min_batch_vectors = 250_000
+    current = 0
 
     # Load each DB batch to GPU ONCE, search ALL queries against it
-    for start in range(0, n_vectors, batch_size):
-        end = min(start + batch_size, n_vectors)
-        db_count = end - start
+    while current < n_vectors:
+        target_end = min(current + batch_size, n_vectors)
+        end = target_end
 
-        # Single CPU->GPU transfer per batch
-        db_tensor = torch.from_numpy(all_vectors[start:end].copy()).cuda()
-        db_t = db_tensor.t()  # Transpose once, reuse for all queries
-        batch_k = min(k, db_count)
+        while True:
+            db_count = end - current
+            db_slice = None
+            db_tensor = None
+            db_t = None
+            try:
+                # If FAISS slice is already contiguous, this avoids an unnecessary copy.
+                db_slice = np.ascontiguousarray(all_vectors[current:end])
+                db_tensor = torch.from_numpy(db_slice).to(device='cuda', dtype=tensor_dtype)
+                db_t = db_tensor.t()  # Transpose once, reuse for all queries
+                batch_k = min(k, db_count)
 
-        # Max query keypoints per sub-batch to keep scores matrix under limit
-        max_qb = max(1, MAX_SCORES_BYTES // (db_count * 4))
+                # Max query keypoints per sub-batch to keep scores matrix under the memory cap
+                max_qb = max(1, GPU_SEARCH_MAX_SCORES_BYTES // (db_count * score_elem_bytes))
 
-        for name, q_tensor in query_tensors.items():
-            n_kp = q_tensor.shape[0]
+                for name, q_tensor in query_tensors.items():
+                    n_kp = q_tensor.shape[0]
 
-            for q_start in range(0, n_kp, max_qb):
-                q_end = min(q_start + max_qb, n_kp)
-                q_batch = q_tensor[q_start:q_end]
+                    for q_start in range(0, n_kp, max_qb):
+                        q_end = min(q_start + max_qb, n_kp)
+                        q_batch = q_tensor[q_start:q_end]
 
-                # Inner product: (n_query_sub, dim) @ (dim, db_count) = (n_query_sub, db_count)
-                scores = torch.mm(q_batch, db_t)
+                        # Inner product: (n_query_sub, dim) @ (dim, db_count) = (n_query_sub, db_count)
+                        scores = torch.mm(q_batch, db_t)
 
-                batch_scores, batch_idx = scores.topk(batch_k, dim=1)
-                batch_idx += start
+                        batch_scores, batch_idx = scores.topk(batch_k, dim=1)
+                        batch_idx += current
 
-                # Merge with running top-k for this keypoint slice
-                rd = running_distances[name][q_start:q_end]
-                ri = running_indices[name][q_start:q_end]
-                combined_scores = torch.cat([rd, batch_scores], dim=1)
-                combined_indices = torch.cat([ri, batch_idx], dim=1)
-                topk_scores, topk_pos = combined_scores.topk(k, dim=1)
-                running_distances[name][q_start:q_end] = topk_scores
-                running_indices[name][q_start:q_end] = combined_indices.gather(1, topk_pos)
+                        # Merge with running top-k for this keypoint slice
+                        rd = running_distances[name][q_start:q_end]
+                        ri = running_indices[name][q_start:q_end]
+                        combined_scores = torch.cat([rd, batch_scores], dim=1)
+                        combined_indices = torch.cat([ri, batch_idx], dim=1)
+                        topk_scores, topk_pos = combined_scores.topk(k, dim=1)
+                        running_distances[name][q_start:q_end] = topk_scores
+                        running_indices[name][q_start:q_end] = combined_indices.gather(1, topk_pos)
 
-                del scores, batch_scores, batch_idx, combined_scores, combined_indices, rd, ri
+                        del scores, batch_scores, batch_idx, combined_scores, combined_indices, rd, ri
 
-        del db_tensor, db_t
+                del db_tensor, db_t, db_slice
+                current = end
+                break
+
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+                del db_tensor, db_t, db_slice
+                torch.cuda.empty_cache()
+                if db_count <= min_batch_vectors:
+                    raise
+                end = current + max(min_batch_vectors, db_count // 2)
+                logger.warning(
+                    f"GPU OOM in DISK search batch ({db_count:,} vectors). "
+                    f"Retrying with {end - current:,} vectors."
+                )
 
     # Collect results
     results = {}
@@ -312,7 +340,7 @@ def _collect_chunks(categories=None):
     return all_chunks, category_counts
 
 
-def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 0.7, top_n: int = 50, specific_chunks: list = None, categories: list = None, search_id: int = None, progress_callback=None):
+def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 0.7, top_n: int = 50, specific_chunks: list = None, categories: list = None, search_id: int = None, progress_callback=None, check_stopped=None):
     """
     Search consolidated chunks for matching images using streaming mode.
 
@@ -351,7 +379,7 @@ def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 
 
     if all_chunks:
         logger.info(f"Searching {len(all_chunks)} total chunks across {len(category_counts)} categories")
-        return _search_chunks_rolling_buffer(query_descriptors, all_chunks, k, threshold, top_n, buffer_size=5, search_id=search_id, progress_callback=progress_callback)
+        return _search_chunks_rolling_buffer(query_descriptors, all_chunks, k, threshold, top_n, buffer_size=5, search_id=search_id, progress_callback=progress_callback, check_stopped=check_stopped)
     else:
         logger.warning("No chunks found for any selected category")
         return []
@@ -398,7 +426,7 @@ def _copy_chunk_worker(copy_queue: Queue, chunk_list: list, start_idx: int, coun
         copy_queue.put((i, local_chunk_file))
 
 
-def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, search_id: int = None, progress_callback=None):
+def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, search_id: int = None, progress_callback=None, check_stopped=None):
     """
     Search using rolling buffer: maintain chunks in local buffer, copy next chunk while searching current.
 
@@ -425,11 +453,19 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
     copy_queue = Queue()
 
     logger.info(f"Starting rolling buffer search (buffer size: {buffer_size} chunks, GPU: {use_gpu})")
+    # Debug: write GPU status to file for diagnostics
+    with open("D:/faiss/disk_retrieval/gpu_debug.txt", "w") as _dbg:
+        _dbg.write(f"use_gpu={use_gpu}\n_gpu_search_available={_gpu_search_available}\ncuda={torch.cuda.is_available()}\n")
     copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, 0, total_chunks, buffer_size))
     copy_thread.daemon = True
     copy_thread.start()
 
     for chunk_idx in range(total_chunks):
+        # Check if search was stopped
+        if check_stopped and check_stopped():
+            logger.info(f"Search stopped by user at chunk {chunk_idx}/{total_chunks}")
+            break
+
         nas_chunk_file, chunk_ids_dir = chunk_list[chunk_idx]
         chunk_name = os.path.basename(nas_chunk_file)
         local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
@@ -438,6 +474,8 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
         logger.info(f"[{chunk_idx + 1}/{total_chunks}] Waiting for {chunk_name}...")
         ready = False
         while not ready:
+            if check_stopped and check_stopped():
+                break
             try:
                 ready_idx, _ = copy_queue.get(timeout=1)
                 if ready_idx == chunk_idx:
@@ -446,6 +484,10 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
                     copy_queue.put((ready_idx, _))
             except Empty:
                 pass  # keep waiting for queue signal
+
+        if check_stopped and check_stopped():
+            logger.info(f"Search stopped by user while waiting for chunk")
+            break
 
         # Load and search
         logger.info(f"  Searching {chunk_name}...")
@@ -461,11 +503,23 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
         # Search (GPU via PyTorch or CPU via FAISS)
         search_start_chunk = time.time()
         if use_gpu:
-            distances, indices = _gpu_search(index, query_descriptors, k)
+            try:
+                distances, indices = _gpu_search_batch(index, [("query", query_descriptors)], k)["query"]
+                search_method = "GPU"
+            except Exception as gpu_err:
+                logger.error(f"  GPU search failed, falling back to CPU: {gpu_err}")
+                with open("D:/faiss/disk_retrieval/gpu_debug.txt", "a") as _dbg:
+                    _dbg.write(f"GPU FAILED on chunk {chunk_idx}: {gpu_err}\n")
+                distances, indices = index.search(query_descriptors, k)
+                search_method = "CPU-fallback"
         else:
             distances, indices = index.search(query_descriptors, k)
+            search_method = "CPU"
         search_time = time.time() - search_start_chunk
-        logger.info(f"  Searched in {search_time:.1f}s ({'GPU' if use_gpu else 'CPU'})")
+        logger.info(f"  Searched in {search_time:.1f}s ({search_method})")
+        if chunk_idx == 0:
+            with open("D:/faiss/disk_retrieval/gpu_debug.txt", "a") as _dbg:
+                _dbg.write(f"chunk0: method={search_method}, time={search_time:.1f}s, vram_before_search=see_nvidia-smi\n")
 
         # Accumulate votes
         for i in range(len(query_descriptors)):
@@ -507,7 +561,7 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
     return all_votes.most_common(top_n)
 
 
-def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: float = 0.7, specific_chunks: list = None, categories: list = None, progress_callback=None):
+def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: float = 0.7, specific_chunks: list = None, categories: list = None, progress_callback=None, check_stopped=None):
     """
     Main entry point for DISK search.
 
@@ -532,7 +586,7 @@ def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: floa
         return []
 
     # Search
-    results = search_chunks(descriptors, k=k, threshold=threshold, top_n=top_k, specific_chunks=specific_chunks, categories=categories, progress_callback=progress_callback)
+    results = search_chunks(descriptors, k=k, threshold=threshold, top_n=top_k, specific_chunks=specific_chunks, categories=categories, progress_callback=progress_callback, check_stopped=check_stopped)
 
     # Format results
     formatted = []

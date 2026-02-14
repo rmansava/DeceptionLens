@@ -1,0 +1,19 @@
+
+======================================================================
+  3-CHUNK DISK SEARCH TEST
+======================================================================
+
+  Testing multi-chunk aggregation with chunks 141,142,143
+  Encyclopedia of Monsters is in chunk 142
+  Test image: D:\trivpics\2023-5.jpg
+
+Checking if server is running...
+  [OK] Server is running
+
+Starting 3-chunk search...
+Chunks: 141,142,143
+Live tracking: ENABLED
+
+Sending request to API...
+  [ERROR] Search failed with status 500
+  Error: {"detail":"Invalid control character at: line 1 column 6242172929 (char 6242172928)"}

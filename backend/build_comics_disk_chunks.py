@@ -85,7 +85,7 @@ MAX_BUFFERED_BATCHES = 3
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'}
 
 # DISK extraction settings
-MAX_IMAGE_DIM = 1600
+MAX_IMAGE_DIM = 4096  # Cap large scans (2.5x old 1600, prevents GPU hangs on huge images)
 GPU_BATCH_SIZE = 1
 
 # ============================================================================
@@ -337,7 +337,8 @@ def preprocess_image(image_path, max_dim=MAX_IMAGE_DIM):
         if img is None:
             return None
         h, w = img.shape[:2]
-        if max(h, w) > max_dim:
+        # Resize only if max_dim is set (used for OOM retry)
+        if max_dim is not None and max(h, w) > max_dim:
             scale = max_dim / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
             h, w = img.shape[:2]
@@ -394,10 +395,14 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
 
     log(f"  Building FAISS index for chunk {chunk_num}...")
     all_desc = np.vstack(all_descriptors)
+    all_descriptors.clear()
+    gc.collect()
     num_vectors = len(all_desc)
 
     index = faiss.IndexFlatIP(128)
     index.add(all_desc)
+    del all_desc
+    gc.collect()
 
     os.makedirs(LOCAL_CHUNKS_BUFFER, exist_ok=True)
     local_faiss = os.path.join(LOCAL_CHUNKS_BUFFER, f"chunk_{chunk_num:03d}.faiss")
@@ -561,7 +566,18 @@ def main():
                 try:
                     tensor = tensor.to(device)
                     with torch.no_grad():
-                        feats = extractor(tensor)[0]
+                        try:
+                            feats = extractor(tensor)[0]
+                        except torch.cuda.OutOfMemoryError:
+                            del tensor
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                            tensor = preprocess_image(image_path, max_dim=2048)
+                            if tensor is None:
+                                total_failed += 1
+                                continue
+                            tensor = tensor.to(device)
+                            feats = extractor(tensor)[0]
                         descriptors = feats.descriptors.cpu().numpy()
 
                     if len(descriptors) == 0:

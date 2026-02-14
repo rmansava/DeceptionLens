@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(dir:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd stop search, chunk DB management, and update architecture docs\n\n- Add /history/{id}/stop endpoint to cancel in-progress searches\n- Add disk_chunk_db.py for compact ID path lookup management\n- Add check_chunk_integrity.py and fix_stuck_sessions.py utilities\n- Add rebuild_chunk_1011.py for chunk repair\n- Update ARCHITECTURE.md with multi-collection DISK search, batch mode,\n  compact IDs, full-page history view, start_deception_lens launcher,\n  and reorganized directory structure reflecting legacy/ move\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push:*)",
+      "Bash(python:*)",
+      "Bash(cmd.exe /c \"cd /d c:\\\\Users\\\\rmans\\\\source\\\\repos\\\\DinoDeceptionLens\\\\backend && python -c \"\"import sys; sys.path.insert\\(0, ''.''\\); from db_helper import get_connection; conn = get_connection\\(\\); cursor = conn.cursor\\(\\); cursor.execute\\(\\\\\"\"SELECT CompactId, ImagePath FROM DiskPathLookup WHERE Collection = ''books'' AND ImagePath LIKE ''%%Encyclopedia of Monsters%%page210.jpg''\\\\\"\"\\); [print\\(f''ID {r[0]}: {r[1]}''\\) for r in cursor.fetchall\\(\\)]; cursor.close\\(\\); conn.close\\(\\)\"\"\")",
+      "Bash(cmd.exe /c \"cd /d c:\\\\Users\\\\rmans\\\\source\\\\repos\\\\DinoDeceptionLens\\\\backend && python diag_fp16.py\")",
+      "Bash(cmd.exe /c \"cd /d c:\\\\Users\\\\rmans\\\\source\\\\repos\\\\DinoDeceptionLens\\\\backend && python diag_fp16.py 2>&1\")",
+      "Bash(powershell.exe:*)",
+      "Bash(git log:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(curl:*)",
+      "Bash(dotnet build:*)",
+      "Bash(taskkill:*)",
+      "Bash(cmd.exe /c \"taskkill /IM DinoDeceptionLens.Web.exe /F\")",
+      "Bash(cmd.exe:*)",
+      "Bash(cmd /c \"tasklist | findstr DinoDeception\")",
+      "Bash(cmd /c \"tasklist | findstr -i dino\")",
+      "Bash(cmd /c \"wmic process where \"\"ProcessId=44344\"\" get Name,ExecutablePath 2>nul\")",
+      "Bash(cmd /c:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(tasklist:*)",
+      "Bash(powershell -NoProfile -Command:*)"
+    ]
+  }
+}

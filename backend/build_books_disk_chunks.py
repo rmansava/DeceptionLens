@@ -73,7 +73,7 @@ MAX_VECTORS_PER_CHUNK = 19_500_000  # ~10 GB
 COLLECTION_NAME = "books"
 
 # DISK extraction settings
-MAX_IMAGE_DIM = 1600  # Resize images larger than this
+MAX_IMAGE_DIM = None  # No resize - extract at full resolution (matches query-side extraction)
 GPU_BATCH_SIZE = 1    # Images per GPU batch (1 is safest for varied sizes)
 
 # ============================================================================
@@ -194,8 +194,8 @@ def preprocess_image(image_path, max_dim=MAX_IMAGE_DIM):
 
         h, w = img.shape[:2]
 
-        # Resize if too large
-        if max(h, w) > max_dim:
+        # Resize only if max_dim is set (used for OOM retry)
+        if max_dim is not None and max(h, w) > max_dim:
             scale = max_dim / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
             h, w = img.shape[:2]
@@ -259,10 +259,14 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
 
     log(f"  Building FAISS index for chunk {chunk_num}...")
     all_desc = np.vstack(all_descriptors)
+    all_descriptors.clear()
+    gc.collect()
     num_vectors = len(all_desc)
 
     index = faiss.IndexFlatIP(128)
     index.add(all_desc)
+    del all_desc
+    gc.collect()
 
     # Save chunk .faiss to local buffer first
     os.makedirs(LOCAL_CHUNKS_BUFFER, exist_ok=True)
@@ -371,11 +375,23 @@ def main():
             processed.add(image_path)
             continue
 
-        # Extract DISK features
+        # Extract DISK features (with OOM retry at reduced resolution)
         try:
             tensor = tensor.to(device)
             with torch.no_grad():
-                feats = extractor(tensor)[0]
+                try:
+                    feats = extractor(tensor)[0]
+                except torch.cuda.OutOfMemoryError:
+                    del tensor
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    tensor = preprocess_image(image_path, max_dim=2048)
+                    if tensor is None:
+                        total_failed += 1
+                        processed.add(image_path)
+                        continue
+                    tensor = tensor.to(device)
+                    feats = extractor(tensor)[0]
                 descriptors = feats.descriptors.cpu().numpy()  # (N, 128)
 
             if len(descriptors) == 0:

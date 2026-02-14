@@ -88,6 +88,36 @@ This will:
 3. Verify results come back
 4. Confirm search is in history
 
+### Verified Test: Dino Image vs Chunk 183
+
+The canonical test is searching `D:\trivpics\2023-5.jpg` (a cropped dinosaur from Encyclopedia of Monsters page 206) against the chunk that contains that book:
+
+```bash
+curl -X POST "http://localhost:8000/disk/search?chunk_ids=183&collections=books&top_k=20" -F "file=@D:/trivpics/2023-5.jpg"
+```
+
+**Expected result:** Encyclopedia of Monsters page 206 is #1 with ~157 votes, massively ahead of #2 at ~6 votes.
+
+**What went wrong before (Feb 2026):** All chunk build scripts had `MAX_IMAGE_DIM = 1600`, which downscaled source images before DISK feature extraction. Since the query side extracts at full resolution, the descriptors didn't match well -- votes were low and results were unreliable. The per-book FAISS shards on T: and S: were built by an older pipeline at full resolution and were fine. The bug only affected the consolidated 10GB chunks.
+
+**The fix:** Removed the 1600px resize cap from all build scripts. Books are rebuilt via `consolidate_search_chunks.py` which reads the original full-resolution per-book shards (no re-extraction needed). Other categories (board_games, print_ads, cereal, albums, comics) use `MAX_IMAGE_DIM = 4096` to cap only outlier-huge images while preserving full quality for the vast majority. All old bad chunks and SQL data were deleted and rebuilt from scratch.
+
+**How to find which chunk a book is in:**
+```bash
+python -c "
+import json, numpy as np, os
+from glob import glob
+ids_dir = 'D:/faiss/disk_retrieval/chunk_ids'
+paths = json.load(open(os.path.join(ids_dir, 'path_lookup.json')))
+ids = [i for i, p in enumerate(paths) if 'Encyclopedia Of Monsters' in p]
+print(f'Compact IDs: {ids[0]}-{ids[-1]} ({len(ids)} images)')
+for f in sorted(glob(os.path.join(ids_dir, 'chunk_*_ids.npy'))):
+    if ids[0] in np.load(f):
+        print(f'Found in {os.path.basename(f).replace(\"_ids.npy\",\"\")}')
+        break
+"
+```
+
 ## Performance
 
 **Current (14 MB/s network):**

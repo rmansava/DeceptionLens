@@ -1084,7 +1084,7 @@ async def disk_search_image(
                     logger.error(f"Failed to update search progress: {e}")
 
         # Define the search function to be executed (categories captured in closure)
-        def run_search(image_bytes, top_k, k, threshold, specific_chunks, progress_callback):
+        def run_search(image_bytes, top_k, k, threshold, specific_chunks, progress_callback, check_stopped=None):
             return search_disk(
                 image_bytes,
                 top_k=top_k,
@@ -1092,7 +1092,8 @@ async def disk_search_image(
                 threshold=threshold,
                 specific_chunks=specific_chunks,
                 categories=categories,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                check_stopped=check_stopped
             )
 
         # Add to queue
@@ -1170,6 +1171,19 @@ async def disk_search_image(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/disk/gpu-status")
+async def get_disk_gpu_status():
+    """Check if GPU search is enabled for DISK searches."""
+    from disk_searcher import _gpu_search_available, _check_gpu_search
+    import torch
+    return {
+        "cached_value": _gpu_search_available,
+        "cuda_available": torch.cuda.is_available(),
+        "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "check_result": _check_gpu_search()
+    }
 
 
 @app.get("/disk/queue")
@@ -1527,7 +1541,13 @@ def stop_history_entry(search_id: int):
     """Stop an in-progress search session."""
     try:
         from db_helper import stop_search_session
+        from disk_queue import get_disk_queue
 
+        # Signal the search thread to stop
+        queue = get_disk_queue()
+        queue.stop_search(search_id)
+
+        # Mark as stopped in DB
         if stop_search_session(search_id):
             return {"message": "Stopped"}
         else:

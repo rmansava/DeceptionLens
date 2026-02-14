@@ -28,8 +28,17 @@ from collections import deque
 import argparse
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from disk_chunk_db import sync_chunk_to_db, sync_paths_to_db, create_tables
+
+COLLECTION_NAME = "books"
+
 # Config - 13TB index requires NAS storage with local SSD for fast processing
-NAS_BOOKS_DIR = "T:/faiss/disk_retrieval/books"      # Source: per-book indexes on NAS
+NAS_BOOKS_DIRS = [                                    # Source: per-book indexes on NAS
+    "T:/faiss/disk_retrieval/books",
+    "S:/faiss/disk_retrieval/books",
+]
+NAS_BOOKS_DIR = NAS_BOOKS_DIRS[0]                     # Primary (for backward compat)
 LOCAL_BOOKS_BUFFER = "D:/faiss/disk_retrieval/books" # Buffer: copy books here for fast reads
 LOCAL_CHUNKS_DIR = "D:/faiss/disk_retrieval/chunks"  # Buffer: write chunks here first
 NAS_CHUNKS_DIR = "T:/faiss/disk_retrieval/chunks"    # Final: move chunks to NAS
@@ -53,8 +62,9 @@ COPY_BATCH_SIZE = 10       # Copy this many books at a time in background
 class BookBuffer:
     """Manages the local book buffer with background copying."""
 
-    def __init__(self, all_books):
+    def __init__(self, all_books, book_source_map=None):
         self.all_books = deque(all_books)  # Books not yet copied
+        self.book_source_map = book_source_map or {}  # book_name -> source_dir
         self.ready_books = deque()          # Books copied and ready to process
         self.copying = set()                # Books currently being copied
         self.lock = threading.Lock()
@@ -107,7 +117,8 @@ class BookBuffer:
                     break
 
                 try:
-                    src_dir = os.path.join(NAS_BOOKS_DIR, book)
+                    source_base = self.book_source_map.get(book, NAS_BOOKS_DIR)
+                    src_dir = os.path.join(source_base, book)
                     dst_dir = os.path.join(LOCAL_BOOKS_BUFFER, book)
 
                     os.makedirs(dst_dir, exist_ok=True)
@@ -234,6 +245,10 @@ def save_chunk(chunk_num, vectors_list, ids_list, path_to_id):
     with open(lookup_file, 'w') as f:
         json.dump(lookup_list, f)
 
+    # Sync to SQL DB (non-fatal)
+    sync_chunk_to_db(COLLECTION_NAME, chunk_num, ids_array)
+    sync_paths_to_db(COLLECTION_NAME, path_to_id)
+
     # Get file sizes
     index_size = os.path.getsize(nas_index) / (1024**3)
     ids_size = os.path.getsize(ids_file) / (1024**2)
@@ -314,9 +329,11 @@ def rebuild_state_from_chunks():
 
 
 def main():
+    create_tables()
+
     print()
     print("=" * 70)
-    print("  CONSOLIDATE SEARCH CHUNKS (Pipelined NAS → Local → NAS)")
+    print("  CONSOLIDATE SEARCH CHUNKS (Pipelined NAS -> Local -> NAS)")
     print("=" * 70)
     print()
     print(f"  Source:      {NAS_BOOKS_DIR}")
@@ -361,9 +378,19 @@ def main():
         print(f"  Loaded {len(all_book_dirs):,} books from file")
     else:
         print("  Scanning NAS for books...")
-        all_book_dirs = sorted([d for d in os.listdir(NAS_BOOKS_DIR)
-                                if os.path.isfile(os.path.join(NAS_BOOKS_DIR, d, "index.faiss"))])
-        print(f"  Found {len(all_book_dirs):,} total book indexes")
+        book_source_map = {}
+        for nas_dir in NAS_BOOKS_DIRS:
+            if not os.path.exists(nas_dir):
+                print(f"    Skipping {nas_dir} (not found)")
+                continue
+            count = 0
+            for d in os.listdir(nas_dir):
+                if d not in book_source_map and os.path.isfile(os.path.join(nas_dir, d, "index.faiss")):
+                    book_source_map[d] = nas_dir
+                    count += 1
+            print(f"    {nas_dir}: {count:,} books")
+        all_book_dirs = sorted(book_source_map.keys())
+        print(f"  Found {len(all_book_dirs):,} total book indexes across {len(NAS_BOOKS_DIRS)} sources")
 
     # Filter out already processed books
     book_dirs = [b for b in all_book_dirs if b not in processed_books]
@@ -388,7 +415,8 @@ def main():
     print()
 
     # Initialize buffer manager
-    buffer = BookBuffer(book_dirs)
+    source_map = book_source_map if not args.books_file else {}
+    buffer = BookBuffer(book_dirs, source_map)
     buffer.start_copying()
 
     # Wait for initial buffer fill
@@ -530,7 +558,7 @@ def main():
             elapsed = time.time() - start_time
             rate = books_processed / elapsed if elapsed > 0 else 0
             remaining = remaining_books - books_processed
-            eta = remaining / rate / 60 if rate > 0 else 0
+            eta_hours = remaining / rate / 3600 if rate > 0 else 0
 
             # Show progress - simple when using books file, detailed otherwise
             if using_books_file:
@@ -539,7 +567,7 @@ def main():
                       f"{total_vectors:,} vectors | "
                       f"Chunk {chunk_num} | "
                       f"Buffer: {status['ready']} ready | "
-                      f"ETA: {eta:.0f}m")
+                      f"ETA: {eta_hours:.1f}h")
             else:
                 # Show batch and total when scanning all books
                 batch_done = books_processed
@@ -550,7 +578,7 @@ def main():
                       f"{total_vectors:,} vectors | "
                       f"Chunk {chunk_num} | "
                       f"Buffer: {status['ready']} ready | "
-                      f"ETA: {eta:.0f}m")
+                      f"ETA: {eta_hours:.1f}h")
             last_status_time = time.time()
 
     # Stop background copying
