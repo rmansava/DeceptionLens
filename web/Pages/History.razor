@@ -26,6 +26,10 @@
                     <span class="status-badge status-running">Searching...</span>
                     <button class="btn-stop-detail" @onclick="() => StopEntry(selectedDetail.Id)">Stop</button>
                 }
+                else if (IsResumableDisk(selectedDetail))
+                {
+                    <button class="btn-stop-detail" @onclick="() => ResumeEntry(selectedDetail.Id)">Resume</button>
+                }
                 <span class="search-date">@FormatDate(DateTime.Parse(selectedDetail.SearchDate))</span>
             </div>
         </header>
@@ -269,6 +273,14 @@ else
                                 <button class="btn-icon btn-stop" @onclick:stopPropagation="true" @onclick="() => StopEntry(entry.Id)" title="Stop search">
                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                                         <rect x="6" y="6" width="12" height="12" rx="1"/>
+                                    </svg>
+                                </button>
+                            }
+                            else if (IsResumableDisk(entry))
+                            {
+                                <button class="btn-icon btn-resume" @onclick:stopPropagation="true" @onclick="() => ResumeEntry(entry.Id)" title="Resume from next chunk">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                        <path d="M8 5v14l11-7z"/>
                                     </svg>
                                 </button>
                             }
@@ -545,6 +557,15 @@ else
     .btn-icon.btn-stop:hover {
         background: #374151;
         color: #ef4444;
+    }
+
+    .btn-icon.btn-resume {
+        color: #10b981;
+    }
+
+    .btn-icon.btn-resume:hover {
+        background: #374151;
+        color: #34d399;
     }
 
     .btn-stop-detail {
@@ -880,6 +901,26 @@ else
         }
     }
 
+    private async Task ResumeEntry(int searchId)
+    {
+        try
+        {
+            var resumed = await SearchService.ResumeDiskSearchAsync(searchId);
+            if (resumed?.SearchId > 0)
+            {
+                selectedDetail = null;
+                selectedResult = null;
+                currentPage = 1;
+                await LoadHistory();
+                await ViewDetails(resumed.SearchId);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to resume DISK search {SearchId}", searchId);
+        }
+    }
+
     private async Task DeleteEntry(int searchId)
     {
         if (await SearchService.DeleteSearchHistoryAsync(searchId))
@@ -935,6 +976,22 @@ else
             _ when searchType.Contains("Text") => "text",
             _ => ""
         };
+    }
+
+    private static bool IsResumableDisk(SearchHistoryEntry entry)
+    {
+        return entry != null &&
+               !entry.IsInProgress &&
+               entry.SearchType.Contains("DISK", StringComparison.OrdinalIgnoreCase) &&
+               (entry.Status == "stopped" || entry.Status == "failed");
+    }
+
+    private static bool IsResumableDisk(SearchHistoryDetail detail)
+    {
+        return detail != null &&
+               !detail.IsInProgress &&
+               detail.SearchType.Contains("DISK", StringComparison.OrdinalIgnoreCase) &&
+               (detail.Status == "stopped" || detail.Status == "failed");
     }
 
     private string FormatDate(DateTime date)

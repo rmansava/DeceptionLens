@@ -20,6 +20,7 @@ public interface ISearchService
 
     // DISK keypoint search (queued job with history polling)
     Task<DiskSearchStartResponse?> DiskSearchAsync(Stream imageStream, string fileName, int topK = 50, string collection = "all");
+    Task<DiskSearchStartResponse?> ResumeDiskSearchAsync(int sourceSearchId, int topK = 50, int k = 5, double threshold = 0.7);
 
     // Visualization methods
     Task<byte[]?> GetVisualizationAsync(Stream queryImageStream, string fileName, string matchPath);

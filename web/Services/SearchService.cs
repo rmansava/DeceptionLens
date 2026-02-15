@@ -295,6 +295,37 @@ public class SearchService : ISearchService
         }
     }
 
+    public async Task<DiskSearchStartResponse?> ResumeDiskSearchAsync(
+        int sourceSearchId,
+        int topK = 50,
+        int k = 5,
+        double threshold = 0.7)
+    {
+        try
+        {
+            var thresholdText = threshold.ToString(CultureInfo.InvariantCulture);
+            var url = $"/disk/resume/{sourceSearchId}?top_k={topK}&k={k}&threshold={Uri.EscapeDataString(thresholdText)}";
+
+            _logger.LogInformation(
+                "Resuming DISK search from source {SourceSearchId}, topK: {TopK}, k: {K}, threshold: {Threshold}",
+                sourceSearchId, topK, k, threshold
+            );
+
+            var response = await _httpClient.PostAsync(url, null);
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            var queued = JsonSerializer.Deserialize<DiskSearchStartResponse>(json);
+            _logger.LogInformation("Resumed DISK search queued as search_id={SearchId}", queued?.SearchId);
+            return queued;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to resume DISK search from {SourceSearchId}", sourceSearchId);
+            throw;
+        }
+    }
+
     public async Task<byte[]?> GetVisualizationAsync(
         Stream queryImageStream,
         string fileName,

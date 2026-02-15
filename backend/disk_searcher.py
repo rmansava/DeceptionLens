@@ -15,6 +15,7 @@ import numpy as np
 import json
 import os
 import shutil
+import pickle
 from glob import glob
 from collections import Counter
 import logging
@@ -31,6 +32,11 @@ logger = logging.getLogger(__name__)
 
 # Local SSD buffer for streaming chunks during search (shared across all categories)
 LOCAL_CHUNK_BUFFER = "D:/faiss/disk_retrieval/chunk_buffer"
+SEARCH_CHECKPOINT_DIR = os.environ.get(
+    "DISK_SEARCH_CHECKPOINT_DIR",
+    "D:/faiss/disk_retrieval/search_checkpoints"
+)
+SEARCH_CHECKPOINT_INTERVAL = max(1, int(os.environ.get("DISK_SEARCH_CHECKPOINT_INTERVAL", "5")))
 
 # Cached path lookups per category IDs dir
 _id_to_path_cache = {}
@@ -266,6 +272,62 @@ def resolve_path(paths_or_ids, id_to_path, idx):
         return paths_or_ids[idx]
 
 
+def _checkpoint_path(search_id: int) -> str:
+    return os.path.join(SEARCH_CHECKPOINT_DIR, f"search_{search_id}.pkl")
+
+
+def save_search_checkpoint(search_id: int, current_chunk: int, total_chunks: int, votes: Counter):
+    """Persist DISK search state for resume support."""
+    if not search_id:
+        return
+
+    try:
+        os.makedirs(SEARCH_CHECKPOINT_DIR, exist_ok=True)
+        payload = {
+            "search_id": int(search_id),
+            "current_chunk": int(current_chunk),
+            "total_chunks": int(total_chunks),
+            "votes": dict(votes),
+            "saved_at": time.time()
+        }
+        path = _checkpoint_path(search_id)
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning(f"Failed to save DISK checkpoint for search #{search_id}: {e}")
+
+
+def load_search_checkpoint(search_id: int):
+    """Load persisted DISK search state."""
+    if not search_id:
+        return None
+
+    path = _checkpoint_path(search_id)
+    if not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load DISK checkpoint for search #{search_id}: {e}")
+        return None
+
+
+def clear_search_checkpoint(search_id: int):
+    """Remove persisted DISK search state."""
+    if not search_id:
+        return
+    path = _checkpoint_path(search_id)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        logger.warning(f"Failed to clear DISK checkpoint for search #{search_id}: {e}")
+
+
 def _accumulate_votes_vectorized(votes: Counter, distances, indices, threshold, paths_or_ids, id_to_path):
     """
     Vectorized vote accumulation from kNN results.
@@ -378,7 +440,19 @@ def _collect_chunks(categories=None):
     return all_chunks, category_counts
 
 
-def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 0.7, top_n: int = 50, specific_chunks: list = None, categories: list = None, search_id: int = None, progress_callback=None, check_stopped=None):
+def search_chunks(
+    query_descriptors: np.ndarray,
+    k: int = 5,
+    threshold: float = 0.7,
+    top_n: int = 50,
+    specific_chunks: list = None,
+    categories: list = None,
+    search_id: int = None,
+    progress_callback=None,
+    check_stopped=None,
+    start_chunk: int = 1,
+    initial_votes: dict = None
+):
     """
     Search consolidated chunks for matching images using streaming mode.
 
@@ -391,6 +465,8 @@ def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 
         categories: Optional list of categories to search (None = all)
         search_id: Optional search session ID for live tracking
         progress_callback: Optional callback for progress updates
+        start_chunk: Optional global chunk position (1-based) to resume from
+        initial_votes: Optional existing vote counts to seed resume
 
     Returns:
         List of (path, votes) tuples sorted by votes descending
@@ -417,7 +493,19 @@ def search_chunks(query_descriptors: np.ndarray, k: int = 5, threshold: float = 
 
     if all_chunks:
         logger.info(f"Searching {len(all_chunks)} total chunks across {len(category_counts)} categories")
-        return _search_chunks_rolling_buffer(query_descriptors, all_chunks, k, threshold, top_n, buffer_size=5, search_id=search_id, progress_callback=progress_callback, check_stopped=check_stopped)
+        return _search_chunks_rolling_buffer(
+            query_descriptors,
+            all_chunks,
+            k,
+            threshold,
+            top_n,
+            buffer_size=5,
+            search_id=search_id,
+            progress_callback=progress_callback,
+            check_stopped=check_stopped,
+            start_chunk=start_chunk,
+            initial_votes=initial_votes
+        )
     else:
         logger.warning("No chunks found for any selected category")
         return []
@@ -464,7 +552,19 @@ def _copy_chunk_worker(copy_queue: Queue, chunk_list: list, start_idx: int, coun
         copy_queue.put((i, local_chunk_file))
 
 
-def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, search_id: int = None, progress_callback=None, check_stopped=None):
+def _search_chunks_rolling_buffer(
+    query_descriptors: np.ndarray,
+    chunk_list: list,
+    k: int,
+    threshold: float,
+    top_n: int,
+    buffer_size: int = 5,
+    search_id: int = None,
+    progress_callback=None,
+    check_stopped=None,
+    start_chunk: int = 1,
+    initial_votes: dict = None
+):
     """
     Search using rolling buffer: maintain chunks in local buffer, copy next chunk while searching current.
 
@@ -473,9 +573,15 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
         search_id: Optional search session ID for live progress tracking
         progress_callback: Optional callback(chunk_idx, total_chunks, top_results, elapsed_ms)
     """
-    all_votes = Counter()
+    all_votes = Counter(initial_votes or {})
     total_chunks = len(chunk_list)
+    start_idx = max(0, min(total_chunks, int(start_chunk) - 1))
     use_gpu = _check_gpu_search()
+    last_completed_chunk = start_idx
+    stopped = False
+
+    if start_idx > 0:
+        logger.info(f"Resuming DISK search from chunk {start_idx + 1}/{total_chunks}")
 
     # Clean buffer of any stale files from previous searches
     if os.path.exists(LOCAL_CHUNK_BUFFER):
@@ -491,14 +597,18 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
     copy_queue = Queue()
 
     logger.info(f"Starting rolling buffer search (buffer size: {buffer_size} chunks, GPU: {use_gpu})")
-    copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, 0, total_chunks, buffer_size))
+    copy_thread = Thread(
+        target=_copy_chunk_worker,
+        args=(copy_queue, chunk_list, start_idx, total_chunks - start_idx, buffer_size)
+    )
     copy_thread.daemon = True
     copy_thread.start()
 
-    for chunk_idx in range(total_chunks):
+    for chunk_idx in range(start_idx, total_chunks):
         # Check if search was stopped
         if check_stopped and check_stopped():
             logger.info(f"Search stopped by user at chunk {chunk_idx}/{total_chunks}")
+            stopped = True
             break
 
         nas_chunk_file, chunk_ids_dir = chunk_list[chunk_idx]
@@ -510,6 +620,7 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
         ready = False
         while not ready:
             if check_stopped and check_stopped():
+                stopped = True
                 break
             try:
                 ready_idx, _ = copy_queue.get(timeout=1)
@@ -522,6 +633,7 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
 
         if check_stopped and check_stopped():
             logger.info(f"Search stopped by user while waiting for chunk")
+            stopped = True
             break
 
         # Load and search
@@ -555,6 +667,7 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
         _accumulate_votes_vectorized(
             all_votes, distances, indices, threshold, paths_or_ids, id_to_path
         )
+        last_completed_chunk = chunk_idx + 1
 
         # Free memory
         del index, paths_or_ids
@@ -568,7 +681,8 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
 
         # Progress update
         elapsed = time.time() - search_start
-        avg_per_chunk = elapsed / (chunk_idx + 1)
+        chunks_done_this_run = (chunk_idx - start_idx) + 1
+        avg_per_chunk = elapsed / chunks_done_this_run
         remaining = (total_chunks - chunk_idx - 1) * avg_per_chunk
         logger.info(f"  Progress: {chunk_idx + 1}/{total_chunks} chunks | "
                    f"ETA: {remaining/60:.1f}m | Top vote: {all_votes.most_common(1)[0][1] if all_votes else 0}")
@@ -581,13 +695,37 @@ def _search_chunks_rolling_buffer(query_descriptors: np.ndarray, chunk_list: lis
             ]
             progress_callback(chunk_idx + 1, total_chunks, top_results, int(elapsed * 1000))
 
+        if search_id and (
+            last_completed_chunk == total_chunks or
+            last_completed_chunk % SEARCH_CHECKPOINT_INTERVAL == 0
+        ):
+            save_search_checkpoint(search_id, last_completed_chunk, total_chunks, all_votes)
+
     total_time = time.time() - search_start
     logger.info(f"Search complete: {total_chunks} chunks in {total_time/60:.1f}m")
+
+    if search_id:
+        if not stopped and last_completed_chunk >= total_chunks:
+            clear_search_checkpoint(search_id)
+        else:
+            save_search_checkpoint(search_id, last_completed_chunk, total_chunks, all_votes)
 
     return all_votes.most_common(top_n)
 
 
-def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: float = 0.7, specific_chunks: list = None, categories: list = None, progress_callback=None, check_stopped=None):
+def search_disk(
+    image_bytes: bytes,
+    top_k: int = 50,
+    k: int = 5,
+    threshold: float = 0.7,
+    specific_chunks: list = None,
+    categories: list = None,
+    progress_callback=None,
+    check_stopped=None,
+    search_id: int = None,
+    start_chunk: int = 1,
+    initial_votes: dict = None
+):
     """
     Main entry point for DISK search.
 
@@ -599,6 +737,9 @@ def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: floa
         specific_chunks: Optional list of chunk numbers to search (e.g., [142])
         categories: Optional list of categories to search (None = all)
         progress_callback: Optional callback for live progress updates
+        search_id: Optional search session ID for checkpointing
+        start_chunk: Optional global chunk position (1-based) to resume from
+        initial_votes: Optional existing vote counts to seed resume
 
     Returns:
         List of dicts with 'path', 'votes', 'score' keys
@@ -612,7 +753,19 @@ def search_disk(image_bytes: bytes, top_k: int = 50, k: int = 5, threshold: floa
         return []
 
     # Search
-    results = search_chunks(descriptors, k=k, threshold=threshold, top_n=top_k, specific_chunks=specific_chunks, categories=categories, progress_callback=progress_callback, check_stopped=check_stopped)
+    results = search_chunks(
+        descriptors,
+        k=k,
+        threshold=threshold,
+        top_n=top_k,
+        specific_chunks=specific_chunks,
+        categories=categories,
+        search_id=search_id,
+        progress_callback=progress_callback,
+        check_stopped=check_stopped,
+        start_chunk=start_chunk,
+        initial_votes=initial_votes
+    )
 
     # Format results
     formatted = []

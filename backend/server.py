@@ -13,6 +13,7 @@ import logging
 import time
 from typing import List, Optional
 from contextlib import asynccontextmanager
+import re
 
 # Configure logging with timestamps
 logging.basicConfig(
@@ -178,6 +179,19 @@ class DiskSearchStartResponse(BaseModel):
     queue_position: int
     total_chunks: int
     message: str
+
+
+def _parse_progress_chunk(progress_text: Optional[str]) -> Optional[int]:
+    """Parse 'Searching chunk X/Y' and return X."""
+    if not progress_text:
+        return None
+    m = re.search(r"(\d+)\s*/\s*(\d+)", progress_text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -1109,7 +1123,8 @@ async def disk_search_image(
                     specific_chunks=specific_chunks,
                     categories=categories,
                     progress_callback=progress_callback,
-                    check_stopped=check_stopped
+                    check_stopped=check_stopped,
+                    search_id=search_id
                 )
                 if not (check_stopped and check_stopped()):
                     duration_ms = int((time.time() - run_start) * 1000)
@@ -1164,6 +1179,176 @@ async def disk_search_image(
         logger.error(f"DISK search failed: {e}")
         import traceback
         traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/disk/resume/{source_search_id}", response_model=DiskSearchStartResponse)
+async def resume_disk_search(
+    source_search_id: int,
+    top_k: int = Query(default=50, ge=1, le=500),
+    k: int = Query(default=5, ge=1, le=20, description="Nearest neighbors per keypoint"),
+    threshold: float = Query(default=0.7, ge=0.0, le=1.0, description="Minimum similarity for voting"),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Resume a previously interrupted DISK search from the next chunk.
+
+    Creates a new search session and seeds vote counts from checkpoint data
+    when available. If no checkpoint exists, falls back to current DB results.
+    """
+    try:
+        from db_helper import (
+            get_search_details,
+            get_search_query_image,
+            create_search_session,
+            update_search_progress,
+            complete_search_session,
+            fail_search_session,
+            add_search_note
+        )
+        from disk_searcher import search_disk, load_search_checkpoint, get_total_chunks
+        from disk_queue import get_disk_queue
+
+        source = get_search_details(source_search_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source search not found")
+
+        source_type = source.get("SearchType", "")
+        if "DISK" not in source_type:
+            raise HTTPException(status_code=400, detail="Only DISK searches can be resumed")
+
+        source_status = (source.get("Status") or "").lower()
+        if source_status not in ("stopped", "failed"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Search status is '{source_status or 'unknown'}'; only stopped/failed searches can be resumed"
+            )
+
+        image_bytes = get_search_query_image(source_search_id)
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="Source query image is not available for resume")
+
+        source_collection = source.get("Collection") or "all"
+        categories = None
+        if source_collection and source_collection != "all":
+            categories = [c.strip() for c in source_collection.split(",") if c.strip()]
+            if not categories:
+                categories = None
+
+        total_chunks = source.get("TotalChunks")
+        if not total_chunks:
+            total_chunks = get_total_chunks(categories)
+
+        checkpoint = load_search_checkpoint(source_search_id)
+        initial_votes = {}
+        if checkpoint and isinstance(checkpoint.get("votes"), dict):
+            initial_votes = checkpoint["votes"]
+            resume_from = int(checkpoint.get("current_chunk", 0)) + 1
+        else:
+            resume_from = (_parse_progress_chunk(source.get("CurrentProgress")) or 0) + 1
+            for r in source.get("Results", []):
+                path = r.get("ImagePath")
+                votes = r.get("VerifiedMatches")
+                if path and isinstance(votes, int) and votes > 0:
+                    initial_votes[path] = votes
+
+        resume_from = max(1, resume_from)
+        if resume_from > total_chunks:
+            raise HTTPException(status_code=400, detail="Search already reached the last chunk; nothing to resume")
+
+        image_name = source.get("QueryImageName")
+        new_search_id = create_search_session(
+            search_type="DISK Keypoint",
+            query_image=image_bytes,
+            query_image_name=image_name,
+            collection=source_collection,
+            total_chunks=total_chunks
+        )
+
+        add_search_note(
+            new_search_id,
+            f"Resumed from search #{source_search_id} at chunk {resume_from}/{total_chunks}"
+        )
+
+        def progress_callback(current_chunk, total_chunks, top_results, elapsed_ms):
+            try:
+                update_search_progress(new_search_id, current_chunk, total_chunks, top_results, elapsed_ms)
+            except Exception as e:
+                logger.error(f"Failed to update resumed search progress: {e}")
+
+        def run_search(image_bytes, top_k, k, threshold, specific_chunks, progress_callback, check_stopped=None):
+            run_start = time.time()
+            try:
+                matches = search_disk(
+                    image_bytes,
+                    top_k=top_k,
+                    k=k,
+                    threshold=threshold,
+                    specific_chunks=None,
+                    categories=categories,
+                    progress_callback=progress_callback,
+                    check_stopped=check_stopped,
+                    search_id=new_search_id,
+                    start_chunk=resume_from,
+                    initial_votes=initial_votes
+                )
+                if not (check_stopped and check_stopped()):
+                    duration_ms = int((time.time() - run_start) * 1000)
+                    update_search_progress(
+                        new_search_id,
+                        total_chunks,
+                        total_chunks,
+                        matches,
+                        duration_ms,
+                        max_results=100
+                    )
+                    complete_search_session(new_search_id, duration_ms)
+                return matches
+            except Exception as e:
+                fail_search_session(new_search_id, str(e))
+                raise
+
+        queue = get_disk_queue()
+        queue_position = await queue.add_search(
+            search_id=new_search_id,
+            image_bytes=image_bytes,
+            top_k=top_k,
+            k=k,
+            threshold=threshold,
+            specific_chunks=None,
+            progress_callback=progress_callback,
+            search_function=run_search
+        )
+
+        status = await queue.get_status(new_search_id)
+        status_label = status["status"] if status else "queued"
+        queue_pos = status.get("position", queue_position) if status else queue_position
+
+        if status_label == "queued":
+            add_search_note(
+                new_search_id,
+                f"Resumed from #{source_search_id}. Waiting in queue (position: {queue_pos})"
+            )
+            message = f"Resumed from chunk {resume_from}. Queued at position {queue_pos}"
+        else:
+            message = f"Resumed from chunk {resume_from}. Search started"
+
+        logger.info(
+            f"Resumed DISK search #{source_search_id} -> #{new_search_id} "
+            f"(from chunk {resume_from}/{total_chunks})"
+        )
+        return DiskSearchStartResponse(
+            search_id=new_search_id,
+            status=status_label,
+            queue_position=queue_pos,
+            total_chunks=total_chunks,
+            message=message
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to resume DISK search #{source_search_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
