@@ -19,6 +19,7 @@ DB_NAME = os.environ.get("DB_NAME", "trivia")
 DB_TRUSTED = os.environ.get("DB_TRUSTED", "yes").lower() == "yes"
 DB_USER = os.environ.get("DB_USER", "")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
+LIVE_PROGRESS_TOP_N = int(os.environ.get("LIVE_PROGRESS_TOP_N", "20"))
 
 
 def get_connection_string() -> str:
@@ -34,10 +35,12 @@ def get_connection() -> pyodbc.Connection:
     return pyodbc.connect(get_connection_string())
 
 
-def _build_result_rows(search_id: int, top_results: List[Dict[str, Any]]) -> List[tuple]:
+def _build_result_rows(search_id: int, top_results: List[Dict[str, Any]], max_results: int = 100) -> List[tuple]:
     """Build INSERT rows for top results."""
     rows = []
-    for rank, result in enumerate(top_results[:100], 1):  # Top 100
+    if max_results <= 0:
+        return rows
+    for rank, result in enumerate(top_results[:max_results], 1):
         rows.append((
             search_id,
             rank,
@@ -108,7 +111,8 @@ def update_search_progress(
     current_chunk: int,
     total_chunks: int,
     top_results: List[Dict[str, Any]],
-    elapsed_ms: Optional[int] = None
+    elapsed_ms: Optional[int] = None,
+    max_results: int = LIVE_PROGRESS_TOP_N
 ):
     """Update search progress with current top results."""
     conn = get_connection()
@@ -128,7 +132,7 @@ def update_search_progress(
         # Delete old results and bulk-insert new ones
         cursor.execute("DELETE FROM ImageSearchResults WHERE SearchHistoryId = ?", (search_id,))
 
-        rows = _build_result_rows(search_id, top_results)
+        rows = _build_result_rows(search_id, top_results, max_results=max_results)
         if rows:
             cursor.fast_executemany = True
             cursor.executemany("""
@@ -153,7 +157,8 @@ def update_search_progress_batch(
     progress_updates: List[Dict[str, Any]],
     current_chunk: int,
     total_chunks: int,
-    elapsed_ms: Optional[int] = None
+    elapsed_ms: Optional[int] = None,
+    max_results: int = LIVE_PROGRESS_TOP_N
 ):
     """
     Update progress for multiple search sessions in one DB transaction.
@@ -196,7 +201,9 @@ def update_search_progress_batch(
 
         insert_rows = []
         for update in progress_updates:
-            insert_rows.extend(_build_result_rows(update['search_id'], update.get('top_results', [])))
+            insert_rows.extend(
+                _build_result_rows(update['search_id'], update.get('top_results', []), max_results=max_results)
+            )
 
         if insert_rows:
             cursor.executemany("""

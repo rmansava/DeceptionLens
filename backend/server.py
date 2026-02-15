@@ -1019,6 +1019,8 @@ async def disk_search_image(
 
     Best for finding the source of cropped images. Client should poll
     `/history/{search_id}` for progress and results.
+    In-progress updates store a trimmed leaderboard (default top 20);
+    final completion writes the full leaderboard.
 
     IMPORTANT: Uses a queue to ensure only one search runs at a time.
     Other requests will wait in queue to prevent GPU/memory issues.
@@ -1100,6 +1102,15 @@ async def disk_search_image(
                 )
                 if not (check_stopped and check_stopped()):
                     duration_ms = int((time.time() - run_start) * 1000)
+                    # Keep progress writes small, but store the full final leaderboard.
+                    update_search_progress(
+                        search_id,
+                        total_chunks,
+                        total_chunks,
+                        matches,
+                        duration_ms,
+                        max_results=100
+                    )
                     complete_search_session(search_id, duration_ms)
                 return matches
             except Exception as e:

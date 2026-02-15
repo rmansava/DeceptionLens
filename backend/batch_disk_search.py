@@ -215,7 +215,13 @@ def main():
                     "search_id": search_id,
                     "top_results": image_results
                 })
-        update_search_progress_batch(final_updates, total_chunks, total_chunks, duration_ms)
+        update_search_progress_batch(
+            final_updates,
+            total_chunks,
+            total_chunks,
+            duration_ms,
+            max_results=100
+        )
     except Exception:
         pass
 
