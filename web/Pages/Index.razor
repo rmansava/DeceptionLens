@@ -7,7 +7,7 @@
 
 <PageTitle>Deception Lens - An Image Finder</PageTitle>
 
-<div class="search-container">
+<div class="search-container" @onkeydown:window="HandleGlobalKeyDown">
     <!-- Left Panel: Search Controls -->
     <aside class="search-panel">
         <!-- Shared Settings -->
@@ -1200,6 +1200,14 @@
     {
         showImagePopup = false;
         popupImageUrl = null;
+    }
+
+    private void HandleGlobalKeyDown(KeyboardEventArgs e)
+    {
+        if (showImagePopup && string.Equals(e.Key, "Escape", StringComparison.Ordinal))
+        {
+            CloseImagePopup();
+        }
     }
 
     private void HandleImageError()
