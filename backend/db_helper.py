@@ -383,7 +383,7 @@ def save_search_history(
     Save a search to history with its results.
 
     Args:
-        search_type: Type of search ('DINOv2', 'CLIP', 'Deep Search', 'Face', 'Text')
+        search_type: Type of search ('DINOv2', 'CLIP', 'DISK', 'Face', 'Text')
         query_image: The uploaded query image bytes
         query_image_name: Original filename
         query_text: Text query (for text searches)

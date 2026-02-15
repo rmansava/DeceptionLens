@@ -354,41 +354,6 @@ public class SearchService : ISearchService
         }
     }
 
-    public async Task<List<SearchResult>> DeepSearchAsync(
-        Stream imageStream,
-        string fileName,
-        int topK = 50,
-        int retrievalK = 20000,
-        int rerankK = 1000)
-    {
-        try
-        {
-            using var content = new MultipartFormDataContent();
-            using var streamContent = new StreamContent(imageStream);
-            streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
-            content.Add(streamContent, "file", fileName);
-
-            var url = $"/search/deep?top_k={topK}&retrieval_k={retrievalK}&rerank_k={rerankK}";
-
-            _logger.LogInformation("Deep search: {FileName}, topK: {TopK}, retrievalK: {RetrievalK}, rerankK: {RerankK}",
-                fileName, topK, retrievalK, rerankK);
-
-            var response = await _httpClient.PostAsync(url, content);
-            response.EnsureSuccessStatusCode();
-
-            var json = await response.Content.ReadAsStringAsync();
-            var results = JsonSerializer.Deserialize<List<SearchResult>>(json) ?? new List<SearchResult>();
-
-            _logger.LogInformation("Deep search found {Count} results", results.Count);
-            return results;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Deep search failed");
-            throw;
-        }
-    }
-
     public async Task<SearchProgressResponse?> GetSearchProgressAsync()
     {
         try

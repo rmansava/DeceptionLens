@@ -25,9 +25,6 @@ public interface ISearchService
     // Visualization methods
     Task<byte[]?> GetVisualizationAsync(Stream queryImageStream, string fileName, string matchPath);
 
-    // Deep search (parallel CLIP + DINOv2 with reranking)
-    Task<List<SearchResult>> DeepSearchAsync(Stream imageStream, string fileName, int topK = 50, int retrievalK = 20000, int rerankK = 1000);
-
     // Progress tracking for long-running searches
     Task<SearchProgressResponse?> GetSearchProgressAsync();
 
