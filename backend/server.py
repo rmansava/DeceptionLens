@@ -4,7 +4,7 @@ FastAPI backend for the web application.
 """
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import shutil
 import os
@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Deception Lens API",
-    description="Visual similarity search using CLIP and DINOv2",
+    description="Image search API using DISK keypoints, CLIP, and face search",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -64,10 +64,8 @@ app.add_middleware(
 )
 
 # Initialize Searchers (lazy loading)
-searcher = None
 clip_searcher = None
-opensearch_visual_searcher = None
-DB_PATH = os.environ.get("CHROMA_DB_PATH", "./chroma_db")
+opensearch_face_searcher = None
 CLIP_INDEX_PATH = os.environ.get("CLIP_INDEX_PATH", "D:/faiss/books/index.faiss")
 CLIP_PATHS_PATH = os.environ.get("CLIP_PATHS_PATH", "D:/faiss/books/paths.json")
 UPLOAD_DIR = "temp_uploads"
@@ -85,28 +83,18 @@ search_progress = {
     "eta_seconds": 0
 }
 
-# Collections that use OpenSearch for visual search
-OPENSEARCH_VISUAL_COLLECTIONS = {"books", "print_ads", "board_games"}
+# Collections that use OpenSearch for face search
+OPENSEARCH_FACE_COLLECTIONS = {"books", "print_ads", "board_games"}
 
 
-def get_searcher():
-    """Lazy-load the DINOv2 searcher (used for geometric verification with DISK+LightGlue)."""
-    global searcher
-    if searcher is None:
-        from searcher import DinoSearcher
-        logger.info(f"Initializing DINOv2 searcher for geometric verification")
-        searcher = DinoSearcher(db_path=DB_PATH)
-    return searcher
-
-
-def get_opensearch_visual_searcher():
-    """Lazy-load the OpenSearch visual searcher (for books collection)."""
-    global opensearch_visual_searcher
-    if opensearch_visual_searcher is None:
+def get_opensearch_face_searcher():
+    """Lazy-load the OpenSearch face searcher."""
+    global opensearch_face_searcher
+    if opensearch_face_searcher is None:
         from opensearch_searcher import OpenSearchSearcher
-        logger.info("Initializing OpenSearch visual searcher")
-        opensearch_visual_searcher = OpenSearchSearcher(visual_index="dinov2-books")
-    return opensearch_visual_searcher
+        logger.info("Initializing OpenSearch face searcher")
+        opensearch_face_searcher = OpenSearchSearcher(faces_index="faces-books")
+    return opensearch_face_searcher
 
 
 def get_clip_searcher(collection: str = "books"):
@@ -157,7 +145,7 @@ class StatsResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     searcher_loaded: bool
-    db_path: str
+    db_path: str = ""
     lightglue_ready: bool = False
     disk_cache_ready: bool = False
 
@@ -197,17 +185,9 @@ def _parse_progress_chunk(progress_text: Optional[str]) -> Optional[int]:
 @app.get("/health", response_model=HealthResponse)
 def health_check():
     """Check if the API is healthy."""
-    lightglue_ready = False
-    disk_cache_ready = False
-    if searcher is not None:
-        lightglue_ready = searcher.extractor is not None and searcher.matcher is not None
-        disk_cache_ready = searcher.disk_file_cache is not None or searcher.disk_cache is not None
     return HealthResponse(
         status="ok",
-        searcher_loaded=searcher is not None,
-        db_path=DB_PATH,
-        lightglue_ready=lightglue_ready,
-        disk_cache_ready=disk_cache_ready
+        searcher_loaded=opensearch_face_searcher is not None
     )
 
 
@@ -225,12 +205,12 @@ def get_stats(collection: str = "books"):
         if collection == "all":
             return StatsResponse(visual_count=0, face_count=0)
 
-        if collection in OPENSEARCH_VISUAL_COLLECTIONS:
-            # Use OpenSearch for stats
-            os_searcher = get_opensearch_visual_searcher()
+        if collection in OPENSEARCH_FACE_COLLECTIONS:
+            # Use OpenSearch face index stats. Visual index stats are deprecated.
+            os_searcher = get_opensearch_face_searcher()
             counts = os_searcher.get_counts(collection)
             return StatsResponse(
-                visual_count=counts.get("visual", 0),
+                visual_count=0,
                 face_count=counts.get("faces", 0)
             )
         else:
@@ -249,174 +229,10 @@ async def search_image(
     verify: bool = Query(default=False),
     background_tasks: BackgroundTasks = None
 ):
-    """
-    Search for similar images.
-
-    - **file**: Query image to search for
-    - **top_k**: Number of results to return (1-500)
-    - **collection**: Collection name to search in (use CLIP search for "all" collections)
-    - **verify**: Whether to perform geometric verification
-    """
-    # DINOv2/OpenSearch doesn't support "all" - use CLIP search-all for that
-    if collection == "all":
-        raise HTTPException(
-            status_code=400,
-            detail="DINOv2 search doesn't support 'all' collections. Use CLIP search for multi-collection search, or select a specific collection."
-        )
-
-    start_time = time.time()
-
-    # Use OpenSearch for specified collections (more robust)
-    use_opensearch = collection in OPENSEARCH_VISUAL_COLLECTIONS
-
-    # Read image bytes for history before consuming file
-    image_bytes = await file.read()
-    image_filename = file.filename
-
-    # Save uploaded file temporarily
-    file_ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
-    temp_filename = f"{uuid.uuid4()}{file_ext}"
-    temp_path = os.path.join(UPLOAD_DIR, temp_filename)
-
-    try:
-        with open(temp_path, "wb") as buffer:
-            buffer.write(image_bytes)
-
-        logger.info(f"Searching with query: {temp_path} (OpenSearch: {use_opensearch})")
-
-        # Progress callback for updating global state
-        def update_progress(stage, message, current, total, cache_hits, cache_misses, rate, eta):
-            global search_progress
-            search_progress = {
-                "stage": stage,
-                "message": message,
-                "current": current,
-                "total": total,
-                "cache_hits": cache_hits,
-                "cache_misses": cache_misses,
-                "rate": round(rate, 1),
-                "eta_seconds": eta
-            }
-
-        if use_opensearch:
-            # Use OpenSearch for visual search
-            os_searcher = get_opensearch_visual_searcher()
-            if verify:
-                # Reset progress
-                update_progress("searching", f"Searching {collection} with DINOv2...", 0, 0, 0, 0, 0, 0)
-
-                # When verifying, fetch MANY more candidates from OpenSearch
-                # Crops have low global similarity but high keypoint matches
-                # Need large pool for LightGlue to find the right page
-                fetch_k = 5000
-                matches = os_searcher.search(temp_path, top_k=fetch_k, collection=collection)
-
-                update_progress("searching", f"Found {len(matches)} candidates", len(matches), len(matches), 0, 0, 0, 0)
-
-                # Show progress during model loading (can take a while on first search)
-                update_progress("loading_models", "Loading DINOv2 + DISK + LightGlue models...", 0, len(matches), 0, 0, 0, 0)
-
-                # Use DinoSearcher's geometric verification with progress callback
-                # require_verification=True ensures search fails if LightGlue is not available
-                dino_searcher = get_searcher()
-                matches = dino_searcher._verify_matches(
-                    temp_path, matches,
-                    progress_callback=update_progress,
-                    require_verification=True  # Fail loudly if verification not available
-                )
-                matches.sort(key=lambda x: (x['verified_matches'], x['score']), reverse=True)
-                matches = matches[:top_k]
-
-                # Reset progress to idle
-                update_progress("idle", "", 0, 0, 0, 0, 0, 0)
-            else:
-                matches = os_searcher.search(temp_path, top_k=top_k, collection=collection)
-        else:
-            # Collection not in OpenSearch - return error
-            s = get_searcher()
-            if s is None:
-                raise HTTPException(status_code=503, detail="Searcher not initialized")
-            matches = s.search(
-                temp_path,
-                top_k=top_k,
-                verify=verify,
-                collection_name=collection
-            )
-
-        results = []
-        for m in matches:
-            results.append(SearchResult(
-                path=m['path'],
-                score=m['score'],
-                verified_matches=m.get('verified_matches', 0),
-                metadata=m.get('metadata', {})
-            ))
-
-        # Save to history in background
-        duration_ms = int((time.time() - start_time) * 1000)
-        history_results = [{'path': m['path'], 'score': m['score'], 'verified_matches': m.get('verified_matches', 0)} for m in matches]
-        if background_tasks:
-            background_tasks.add_task(
-                save_search_to_history,
-                search_type="DINOv2 Visual",
-                results=history_results,
-                search_duration_ms=duration_ms,
-                query_image=image_bytes,
-                query_image_name=image_filename,
-                collection=collection
-            )
-
-        return results
-
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        # Cleanup temp file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-@app.post("/search/bytes", response_model=List[SearchResult])
-async def search_image_bytes(
-    file: UploadFile = File(...),
-    top_k: int = Query(default=50, ge=1, le=500),
-    collection: str = Query(default="books"),
-    verify: bool = Query(default=False)
-):
-    """
-    Search using image bytes directly (alternative endpoint).
-    """
-    s = get_searcher()
-    if s is None:
-        raise HTTPException(status_code=503, detail="Searcher not initialized")
-
-    try:
-        image_bytes = await file.read()
-        logger.info(f"Searching with {len(image_bytes)} bytes")
-
-        matches = s.search_by_bytes(
-            image_bytes,
-            top_k=top_k,
-            verify=verify,
-            collection_name=collection
-        )
-
-        results = []
-        for m in matches:
-            results.append(SearchResult(
-                path=m['path'],
-                score=m['score'],
-                verified_matches=m.get('verified_matches', 0),
-                metadata=m.get('metadata', {})
-            ))
-
-        return results
-
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(
+        status_code=410,
+        detail="Visual search endpoint was removed. Use /disk/search for snippet lookup or /clip/search for global similarity."
+    )
 
 
 @app.get("/image")
@@ -486,7 +302,7 @@ async def search_faces(
     start_time = time.time()
 
     # Face search currently supported for collections with OpenSearch face indexes.
-    use_opensearch = collection in OPENSEARCH_VISUAL_COLLECTIONS
+    use_opensearch = collection in OPENSEARCH_FACE_COLLECTIONS
 
     try:
         image_bytes = await file.read()
@@ -499,10 +315,10 @@ async def search_faces(
         if not use_opensearch:
             raise HTTPException(
                 status_code=400,
-                detail=f"Face search is only available for: {', '.join(sorted(OPENSEARCH_VISUAL_COLLECTIONS))}."
+                detail=f"Face search is only available for: {', '.join(sorted(OPENSEARCH_FACE_COLLECTIONS))}."
             )
 
-        os_searcher = get_opensearch_visual_searcher()
+        os_searcher = get_opensearch_face_searcher()
         matches = os_searcher.search_faces_by_bytes(
             image_bytes,
             top_k=top_k,
@@ -550,34 +366,10 @@ async def visualize_match(
     file: UploadFile = File(...),
     match_path: str = Query(..., description="Path to the matched image")
 ):
-    """
-    Generate a visualization showing where the query matches on the result image.
-
-    - **file**: Query image
-    - **match_path**: Path to the matched result image
-
-    Returns: PNG image with the matched region highlighted
-    """
-    s = get_searcher()
-    if s is None:
-        raise HTTPException(status_code=503, detail="Searcher not initialized")
-
-    try:
-        query_bytes = await file.read()
-        logger.info(f"Generating visualization for match: {match_path}")
-
-        vis_bytes = s.generate_visualization_image(query_bytes, match_path)
-
-        if vis_bytes is None:
-            raise HTTPException(status_code=404, detail="Could not generate visualization")
-
-        return Response(content=vis_bytes, media_type="image/png")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Visualization failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(
+        status_code=410,
+        detail="Visualization endpoint was removed. Use DISK search result thumbnails in history/results."
+    )
 
 
 # ============== CLIP Search Endpoints ==============
@@ -1450,7 +1242,7 @@ def get_history(
 
     - **page**: Page number (1-based)
     - **page_size**: Results per page (1-100)
-    - **search_type**: Filter by type (DINOv2, CLIP, DISK, Face, Text)
+    - **search_type**: Filter by type (CLIP, DISK, Face, Text)
     """
     try:
         from db_helper import get_search_history as db_get_history, get_search_history_count

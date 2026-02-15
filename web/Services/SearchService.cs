@@ -24,40 +24,6 @@ public class SearchService : ISearchService
         }
     }
 
-    public async Task<List<SearchResult>> SearchAsync(
-        Stream imageStream,
-        string fileName,
-        int topK = 50,
-        string collection = "images",
-        bool verify = false)
-    {
-        try
-        {
-            using var content = new MultipartFormDataContent();
-            using var streamContent = new StreamContent(imageStream);
-            streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
-            content.Add(streamContent, "file", fileName);
-
-            var url = $"/search?top_k={topK}&collection={Uri.EscapeDataString(collection)}&verify={verify.ToString().ToLower()}";
-
-            _logger.LogInformation("Searching with file: {FileName}, topK: {TopK}, collection: {Collection}", fileName, topK, collection);
-
-            var response = await _httpClient.PostAsync(url, content);
-            response.EnsureSuccessStatusCode();
-
-            var json = await response.Content.ReadAsStringAsync();
-            var results = JsonSerializer.Deserialize<List<SearchResult>>(json) ?? new List<SearchResult>();
-
-            _logger.LogInformation("Found {Count} results", results.Count);
-            return results;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Search failed");
-            throw;
-        }
-    }
-
     public async Task<StatsResponse?> GetStatsAsync(string collection = "images")
     {
         try
@@ -323,34 +289,6 @@ public class SearchService : ISearchService
         {
             _logger.LogError(ex, "Failed to resume DISK search from {SourceSearchId}", sourceSearchId);
             throw;
-        }
-    }
-
-    public async Task<byte[]?> GetVisualizationAsync(
-        Stream queryImageStream,
-        string fileName,
-        string matchPath)
-    {
-        try
-        {
-            using var content = new MultipartFormDataContent();
-            using var streamContent = new StreamContent(queryImageStream);
-            streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
-            content.Add(streamContent, "file", fileName);
-
-            var url = $"/visualize?match_path={Uri.EscapeDataString(matchPath)}";
-
-            _logger.LogInformation("Getting visualization for: {MatchPath}", matchPath);
-
-            var response = await _httpClient.PostAsync(url, content);
-            response.EnsureSuccessStatusCode();
-
-            return await response.Content.ReadAsByteArrayAsync();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Visualization failed for {MatchPath}", matchPath);
-            return null;
         }
     }
 

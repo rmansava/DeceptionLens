@@ -11,7 +11,7 @@ Syncs to:
 - T:\archive\books\pdf-tesseract-text
 - D:\disk-features\books, T:\disk-features\books
 - T:\archive\books\pdf-full-file-text (text files)
-- OpenSearch indexes (dinov2-books, faces-books)
+- OpenSearch indexes (faces-books)
 - FAISS paths.json
 - Disk progress files
 

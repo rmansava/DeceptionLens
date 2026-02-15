@@ -164,7 +164,6 @@ else
             <div class="filter-controls">
                 <select @bind="selectedType" @bind:after="LoadHistory" class="form-select">
                     <option value="">All Types</option>
-                    <option value="DINOv2 Visual">DINOv2</option>
                     <option value="CLIP Visual">CLIP</option>
                     <option value="Face Search">Face</option>
                     <option value="DISK Keypoint">DISK Keypoint</option>
@@ -500,9 +499,7 @@ else
         font-weight: 600;
     }
 
-    .search-type-badge.dino { background: #7c3aed; color: white; }
     .search-type-badge.clip { background: #3b82f6; color: white; }
-    .search-type-badge.deep { background: linear-gradient(135deg, #8b5cf6, #3b82f6); color: white; }
     .search-type-badge.face { background: #10b981; color: white; }
     .search-type-badge.disk { background: #e11d48; color: white; }
     .search-type-badge.text { background: #f59e0b; color: black; }
@@ -967,9 +964,7 @@ else
     {
         return searchType switch
         {
-            "DINOv2 Visual" => "dino",
             "CLIP Visual" => "clip",
-            "Deep Search" => "deep",
             "Face Search" => "face",
             _ when searchType.Contains("DISK") => "disk",
             _ when searchType.Contains("Text") => "text",

@@ -5,7 +5,7 @@ Defines paths and settings for different content categories (books, print_ads, e
 import os
 
 # Collection definitions
-# Each collection has CLIP (FAISS), DINOv2 (OpenSearch), and DISK (file) indexes
+# Each collection has CLIP (FAISS), face (OpenSearch), and DISK (file) indexes
 COLLECTIONS = {
     "books": {
         "name": "Books",
@@ -13,8 +13,7 @@ COLLECTIONS = {
         # CLIP FAISS index paths
         "clip_index": "D:/faiss/books/index.faiss",
         "clip_paths": "D:/faiss/books/paths.json",
-        # OpenSearch index names
-        "opensearch_visual": "dinov2-books",
+        # OpenSearch face index name
         "opensearch_faces": "faces-books",
         # DISK features path
         "disk_features": "T:/disk-features/books",
@@ -30,8 +29,7 @@ COLLECTIONS = {
         # CLIP FAISS index paths
         "clip_index": "D:/faiss/printads/index.faiss",
         "clip_paths": "D:/faiss/printads/paths.json",
-        # OpenSearch index names
-        "opensearch_visual": "dinov2-print_ads",
+        # OpenSearch face index name
         "opensearch_faces": "faces-print_ads",
         # DISK features path
         "disk_features": "T:/disk-features/print_ads",
@@ -47,8 +45,7 @@ COLLECTIONS = {
         # CLIP FAISS index paths
         "clip_index": "D:/faiss/board_games/index.faiss",
         "clip_paths": "D:/faiss/board_games/paths.json",
-        # OpenSearch index names
-        "opensearch_visual": "dinov2-board_games",
+        # OpenSearch face index name
         "opensearch_faces": "faces-board_games",
         # DISK features path
         "disk_features": "T:/disk-features/board_games",

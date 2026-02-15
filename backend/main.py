@@ -9,7 +9,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DinoDeceptionLens: Visual similarity search using DINOv2 and InsightFace"
+        description="DinoDeceptionLens indexing utility"
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -43,7 +43,7 @@ def main():
         "--mode",
         choices=['all', 'visual_only', 'faces_only'],
         default='all',
-        help="Indexing mode: 'all', 'visual_only' (DINOv2), or 'faces_only' (InsightFace)"
+        help="Indexing mode: 'all', 'visual_only', or 'faces_only' (InsightFace)"
     )
     index_parser.add_argument(
         "--batch-size", type=int, default=10,

@@ -1,19 +1,15 @@
 """
-OpenSearch-based searcher for DINOv2 visual and InsightFace face embeddings.
+OpenSearch-based searcher for InsightFace face embeddings.
 
 This is the runtime module imported by server.py.
 """
 
 import logging
-from io import BytesIO
 from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-import torch
 from opensearchpy import OpenSearch
-from PIL import Image
-from transformers import AutoImageProcessor, AutoModel
 
 try:
     from insightface.app import FaceAnalysis
@@ -26,33 +22,22 @@ logger = logging.getLogger(__name__)
 
 OPENSEARCH_HOST = "localhost"
 OPENSEARCH_PORT = 9200
-VISUAL_INDEX = "dinov2-books"
 FACES_INDEX = "faces-books"
 
 
 class OpenSearchSearcher:
-    """Search images using DINOv2 and InsightFace embeddings stored in OpenSearch."""
+    """Search images using InsightFace embeddings stored in OpenSearch."""
 
     def __init__(
         self,
-        visual_index: str = VISUAL_INDEX,
         faces_index: str = FACES_INDEX
     ):
-        self.visual_index = visual_index
         self.faces_index = faces_index
         self.client = OpenSearch(
             hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
             http_compress=True,
             timeout=86400  # 24 hours
         )
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"OpenSearch searcher using device: {self.device}")
-
-        # DINOv2 model for visual search.
-        self.processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
-        self.model = AutoModel.from_pretrained("facebook/dinov2-base").to(self.device)
-        self.model.eval()
 
         # InsightFace is lazy-loaded for face search.
         self.face_app = None
@@ -86,39 +71,10 @@ class OpenSearchSearcher:
             return embedding / norm
         return embedding
 
-    def _get_visual_index(self, collection: Optional[str] = None) -> str:
-        if collection:
-            return f"dinov2-{collection}"
-        return self.visual_index
-
     def _get_faces_index(self, collection: Optional[str] = None) -> str:
         if collection:
             return f"faces-{collection}"
         return self.faces_index
-
-    def get_visual_embedding(self, image_path: str) -> Optional[np.ndarray]:
-        try:
-            image = Image.open(image_path).convert("RGB")
-            inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()[0]
-            return self._normalize_embedding(embedding)
-        except Exception as e:
-            logger.error(f"Error getting visual embedding for {image_path}: {e}")
-            return None
-
-    def get_visual_embedding_from_bytes(self, image_bytes: bytes) -> Optional[np.ndarray]:
-        try:
-            image = Image.open(BytesIO(image_bytes)).convert("RGB")
-            inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()[0]
-            return self._normalize_embedding(embedding)
-        except Exception as e:
-            logger.error(f"Error getting visual embedding from bytes: {e}")
-            return None
 
     def get_face_embedding_from_bytes(self, image_bytes: bytes) -> List[np.ndarray]:
         if not self._load_face_app():
@@ -133,52 +89,6 @@ class OpenSearchSearcher:
             return [face.embedding for face in faces]
         except Exception as e:
             logger.error(f"Error extracting faces from bytes: {e}")
-            return []
-
-    def search(self, query_path: str, top_k: int = 50, collection: Optional[str] = None) -> List[Dict]:
-        embedding = self.get_visual_embedding(query_path)
-        if embedding is None:
-            return []
-        return self._search_visual(embedding, top_k, collection)
-
-    def search_by_bytes(self, image_bytes: bytes, top_k: int = 50, collection: Optional[str] = None) -> List[Dict]:
-        embedding = self.get_visual_embedding_from_bytes(image_bytes)
-        if embedding is None:
-            return []
-        return self._search_visual(embedding, top_k, collection)
-
-    def _search_visual(self, embedding: np.ndarray, top_k: int, collection: Optional[str] = None) -> List[Dict]:
-        index_name = self._get_visual_index(collection)
-        capped_k = min(top_k, 10000)
-        query = {
-            "size": capped_k,
-            "query": {
-                "knn": {
-                    "embedding": {
-                        "vector": embedding.tolist(),
-                        "k": capped_k
-                    }
-                }
-            }
-        }
-        try:
-            response = self.client.search(index=index_name, body=query)
-            results = []
-            for hit in response["hits"]["hits"]:
-                results.append({
-                    "path": hit["_source"]["path"],
-                    "score": hit["_score"],
-                    "metadata": {
-                        "filename": hit["_source"].get("filename", ""),
-                        "book": hit["_source"].get("book", ""),
-                        "path": hit["_source"]["path"],
-                        "collection": collection
-                    },
-                    "verified_matches": 0
-                })
-            return results
-        except Exception as e:
-            logger.error(f"OpenSearch visual search error: {e}")
             return []
 
     def _search_faces(self, embedding: np.ndarray, top_k: int, collection: Optional[str] = None) -> List[Dict]:
@@ -306,12 +216,7 @@ class OpenSearchSearcher:
 
     def get_counts(self, collection: Optional[str] = None) -> Dict[str, int]:
         counts = {"visual": 0, "faces": 0}
-        visual_index = self._get_visual_index(collection)
         faces_index = self._get_faces_index(collection)
-        try:
-            counts["visual"] = self.client.count(index=visual_index)["count"]
-        except Exception:
-            pass
         try:
             counts["faces"] = self.client.count(index=faces_index)["count"]
         except Exception:
