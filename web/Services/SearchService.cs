@@ -1,5 +1,6 @@
 using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Globalization;
 using DinoDeceptionLens.Web.Models;
 
 namespace DinoDeceptionLens.Web.Services;
@@ -223,7 +224,8 @@ public class SearchService : ISearchService
         Stream imageStream,
         string fileName,
         int topK = 50,
-        string collection = "images")
+        string collection = "images",
+        double minScore = 0.0)
     {
         try
         {
@@ -232,9 +234,13 @@ public class SearchService : ISearchService
             streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
             content.Add(streamContent, "file", fileName);
 
-            var url = $"/search/faces?top_k={topK}&collection={Uri.EscapeDataString(collection)}";
+            var minScoreText = minScore.ToString(CultureInfo.InvariantCulture);
+            var url = $"/search/faces?top_k={topK}&collection={Uri.EscapeDataString(collection)}&min_score={Uri.EscapeDataString(minScoreText)}";
 
-            _logger.LogInformation("Face search: {FileName}, topK: {TopK}, collection: {Collection}", fileName, topK, collection);
+            _logger.LogInformation(
+                "Face search: {FileName}, topK: {TopK}, collection: {Collection}, minScore: {MinScore}",
+                fileName, topK, collection, minScore
+            );
 
             var response = await _httpClient.PostAsync(url, content);
             response.EnsureSuccessStatusCode();

@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown events."""
+    # Startup: Ensure DB indexes exist
+    from db_helper import ensure_indexes
+    logger.info("Ensuring DB indexes...")
+    ensure_indexes()
+
     # Startup: Initialize DISK search queue
     from disk_queue import initialize_disk_queue
     logger.info("Initializing DISK search queue...")
@@ -560,6 +565,7 @@ def delete_collection(collection_name: str):
 async def search_faces(
     file: UploadFile = File(...),
     top_k: int = Query(default=50, ge=1, le=500),
+    min_score: float = Query(default=0.0, ge=0.0, description="Minimum face similarity score"),
     collection: str = Query(default="books"),
     background_tasks: BackgroundTasks = None
 ):
@@ -568,6 +574,7 @@ async def search_faces(
 
     - **file**: Query image containing face(s)
     - **top_k**: Number of results to return (1-500)
+    - **min_score**: Minimum score to keep a match
     - **collection**: Collection name to search in (select a specific collection)
     """
     # Face search doesn't support "all" collections
@@ -579,26 +586,30 @@ async def search_faces(
 
     start_time = time.time()
 
-    # Use OpenSearch for specified collections
+    # Face search currently supported for collections with OpenSearch face indexes.
     use_opensearch = collection in OPENSEARCH_VISUAL_COLLECTIONS
 
     try:
         image_bytes = await file.read()
         image_filename = file.filename
-        logger.info(f"Face searching with {len(image_bytes)} bytes (OpenSearch: {use_opensearch})")
+        logger.info(
+            f"Face searching with {len(image_bytes)} bytes "
+            f"(OpenSearch: {use_opensearch}, min_score={min_score}, collection={collection})"
+        )
 
-        if use_opensearch:
-            os_searcher = get_opensearch_visual_searcher()
-            matches = os_searcher.search_faces_by_bytes(image_bytes, top_k=top_k, collection=collection)
-        else:
-            s = get_searcher()
-            if s is None:
-                raise HTTPException(status_code=503, detail="Searcher not initialized")
-            matches = s.search_faces_by_bytes(
-                image_bytes,
-                top_k=top_k,
-                collection_name=collection
+        if not use_opensearch:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Face search is only available for: {', '.join(sorted(OPENSEARCH_VISUAL_COLLECTIONS))}."
             )
+
+        os_searcher = get_opensearch_visual_searcher()
+        matches = os_searcher.search_faces_by_bytes(
+            image_bytes,
+            top_k=top_k,
+            collection=collection,
+            min_score=min_score
+        )
 
         if not matches:
             logger.info("No faces detected or no matches found")

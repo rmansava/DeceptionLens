@@ -1,5 +1,6 @@
 @page "/"
 @implements IDisposable
+@using System.Text.Json
 @inject ISearchService SearchService
 @inject ILogger<Index> Logger
 @inject NavigationManager Navigation
@@ -115,6 +116,10 @@
         <div class="panel-section">
             <h2 class="section-title">Face Search</h2>
             <p class="search-info">Find matching faces using ArcFace recognition. Upload a photo with a face to find similar faces.</p>
+            <div class="form-group">
+                <label>Min Face Score</label>
+                <input type="number" @bind="faceMinScore" min="0" step="0.01" class="form-input" />
+            </div>
 
             <div id="face-upload-area" class="upload-area">
 
@@ -281,6 +286,22 @@
                                 @if (selectedCollection == "all" && !string.IsNullOrEmpty(GetResultCollection(result)))
                                 {
                                     <span class="verified-badge">@GetResultCollection(result)</span>
+                                }
+                                @if (lastSearchType == "Face Search")
+                                {
+                                    var matchedFaces = GetMetadataInt(result, "matched_query_faces");
+                                    var detectedFaces = GetMetadataInt(result, "detected_query_faces");
+                                    var sourceImage = GetMetadataString(result, "source_image");
+                                    if (matchedFaces.HasValue)
+                                    {
+                                        <span class="verified-badge">
+                                            Faces: @matchedFaces/@(detectedFaces ?? matchedFaces.Value)
+                                        </span>
+                                    }
+                                    if (!string.IsNullOrEmpty(sourceImage))
+                                    {
+                                        <span class="verified-badge" title="@sourceImage">@System.IO.Path.GetFileName(sourceImage)</span>
+                                    }
                                 }
                                 @if (lastSearchType == "DINOv2 Visual" && result.VerifiedMatches > 0)
                                 {
@@ -786,6 +807,7 @@
     private string? facePreviewUrl;
     private IBrowserFile? faceSelectedFile;
     private byte[]? faceFileBytes;
+    private double faceMinScore = 0.0;
 
     // DISK file state
     private string? diskPreviewUrl;
@@ -1003,7 +1025,8 @@
                 ms,
                 faceSelectedFile.Name,
                 topK,
-                selectedCollection
+                selectedCollection,
+                faceMinScore
             );
 
             if (results.Count == 0)
@@ -1255,6 +1278,54 @@
         if (path.Contains("\\albums\\") || path.Contains("/albums/")) return "albums";
         if (path.Contains("\\comics\\") || path.Contains("/comics/")) return "comics";
         return null;
+    }
+
+    private string? GetMetadataString(SearchResult result, string key)
+    {
+        if (result.Metadata == null || !result.Metadata.TryGetValue(key, out var raw) || raw == null)
+        {
+            return null;
+        }
+
+        if (raw is JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.String)
+            {
+                return element.GetString();
+            }
+            return element.ToString();
+        }
+
+        var value = raw.ToString();
+        return string.IsNullOrWhiteSpace(value) ? null : value;
+    }
+
+    private int? GetMetadataInt(SearchResult result, string key)
+    {
+        if (result.Metadata == null || !result.Metadata.TryGetValue(key, out var raw) || raw == null)
+        {
+            return null;
+        }
+
+        if (raw is JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out var asInt))
+            {
+                return asInt;
+            }
+            if (element.ValueKind == JsonValueKind.String && int.TryParse(element.GetString(), out asInt))
+            {
+                return asInt;
+            }
+            return null;
+        }
+
+        if (raw is int i)
+        {
+            return i;
+        }
+
+        return int.TryParse(raw.ToString(), out var parsed) ? parsed : null;
     }
 
     private bool CanDeepSearch()

@@ -16,7 +16,7 @@ public interface ISearchService
     Task<ClipStatsResponse?> GetClipStatsAsync();
 
     // Face search methods
-    Task<List<SearchResult>> FaceSearchAsync(Stream imageStream, string fileName, int topK = 50, string collection = "images");
+    Task<List<SearchResult>> FaceSearchAsync(Stream imageStream, string fileName, int topK = 50, string collection = "images", double minScore = 0.0);
 
     // DISK keypoint search (queued job with history polling)
     Task<DiskSearchStartResponse?> DiskSearchAsync(Stream imageStream, string fileName, int topK = 50, string collection = "all");

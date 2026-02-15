@@ -35,6 +35,61 @@ def get_connection() -> pyodbc.Connection:
     return pyodbc.connect(get_connection_string())
 
 
+def ensure_indexes():
+    """Create performance indexes if they don't already exist.
+
+    Indexes target the hot-path queries used by the history list, detail
+    view, and live-progress polling.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    indexes = [
+        # History list: ORDER BY SearchDate DESC with pagination
+        (
+            "IX_ImageSearchHistory_SearchDate",
+            "ImageSearchHistory",
+            "CREATE NONCLUSTERED INDEX IX_ImageSearchHistory_SearchDate "
+            "ON ImageSearchHistory (SearchDate DESC)"
+        ),
+        # History list filtered by SearchType
+        (
+            "IX_ImageSearchHistory_SearchType_SearchDate",
+            "ImageSearchHistory",
+            "CREATE NONCLUSTERED INDEX IX_ImageSearchHistory_SearchType_SearchDate "
+            "ON ImageSearchHistory (SearchType, SearchDate DESC)"
+        ),
+        # Join for top result (Rank=1) and detail view ORDER BY Rank
+        (
+            "IX_ImageSearchResults_SearchHistoryId_Rank",
+            "ImageSearchResults",
+            "CREATE NONCLUSTERED INDEX IX_ImageSearchResults_SearchHistoryId_Rank "
+            "ON ImageSearchResults (SearchHistoryId, Rank) "
+            "INCLUDE (ImagePath, Score, VerifiedMatches)"
+        ),
+    ]
+
+    try:
+        for idx_name, table_name, ddl in indexes:
+            cursor.execute(
+                "SELECT 1 FROM sys.indexes WHERE name = ? AND object_id = OBJECT_ID(?)",
+                (idx_name, table_name)
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(ddl)
+                logger.info(f"Created index {idx_name} on {table_name}")
+            else:
+                logger.debug(f"Index {idx_name} already exists")
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to ensure indexes: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
 def _build_result_rows(search_id: int, top_results: List[Dict[str, Any]], max_results: int = 100) -> List[tuple]:
     """Build INSERT rows for top results."""
     rows = []
