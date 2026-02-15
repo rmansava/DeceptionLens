@@ -1,0 +1,63 @@
+/* Shared result grid / thumbnail controls for Index and History pages. */
+
+.thumbnail-size-selector {
+    display: flex;
+    gap: 4px;
+    background: #1f2937;
+    padding: 4px;
+    border-radius: 6px;
+}
+
+.size-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: #9ca3af;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.size-btn:hover {
+    background: #374151;
+    color: #e5e7eb;
+}
+
+.size-btn.active {
+    background: #3b82f6;
+    color: white;
+}
+
+.results-grid-small {
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)) !important;
+}
+
+.results-grid-medium {
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)) !important;
+}
+
+.results-grid-large {
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)) !important;
+}
+
+.results-grid-small .result-info {
+    padding: 0.5rem;
+}
+
+.results-grid-small .result-filename {
+    font-size: 0.65rem;
+}
+
+.results-grid-small .result-stats {
+    font-size: 0.6rem;
+}
+
+.results-grid-small .rank-badge {
+    font-size: 0.6rem;
+    width: 24px;
+    height: 24px;
+}

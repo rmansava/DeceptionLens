@@ -188,7 +188,7 @@
                         {
                             @:CLIP + DINOv2 + Template Matching
                         }
-                        else if (lastSearchType == "DINOv2 Visual" && verify)
+                        else if (lastSearchType == "DINOv2 Visual")
                         {
                             @:Sorted by verified matches
                         }
@@ -254,29 +254,6 @@
                         Cancel DISK Search
                     </button>
                 }
-                else if (lastSearchType == "DINOv2 Visual" && currentProgress != null)
-                {
-                    <div class="progress-details">
-                        @if (currentProgress.Total > 0)
-                        {
-                            <div class="progress-bar-container">
-                                <div class="progress-bar" style="width: @(Math.Min(100, (currentProgress.Current * 100.0 / currentProgress.Total)))%"></div>
-                            </div>
-                        }
-                        @if (currentProgress.CacheHits > 0 || currentProgress.CacheMisses > 0)
-                        {
-                            <p class="progress-cache">Cache: @currentProgress.CacheHits hits, @currentProgress.CacheMisses misses</p>
-                        }
-                        @if (currentProgress.Rate > 0)
-                        {
-                            <p class="progress-rate">@currentProgress.Rate.ToString("F1")/s • ETA: @FormatEta(currentProgress.EtaSeconds)</p>
-                        }
-                    </div>
-                }
-                else if (lastSearchType == "DINOv2 Visual")
-                {
-                    <p class="search-progress-hint">This may take a long time...</p>
-                }
             </div>
         }
         else if (!results.Any() && hasSearched)
@@ -305,7 +282,7 @@
                                 {
                                     <span class="verified-badge">@GetResultCollection(result)</span>
                                 }
-                                @if (lastSearchType == "DINOv2 Visual" && verify && result.VerifiedMatches > 0)
+                                @if (lastSearchType == "DINOv2 Visual" && result.VerifiedMatches > 0)
                                 {
                                     <span class="verified-badge verified-positive">
                                         @result.VerifiedMatches verified
@@ -416,18 +393,10 @@
         cursor: not-allowed;
     }
 
-    .dino-search-btn, .clip-search-btn {
+    .clip-search-btn {
         width: 100%;
         margin-top: 10px;
         padding: 10px 16px;
-    }
-
-    .dino-search-btn {
-        background: linear-gradient(135deg, #8b5cf6, #6d28d9);
-    }
-
-    .dino-search-btn:hover:not(:disabled) {
-        background: linear-gradient(135deg, #7c3aed, #5b21b6);
     }
 
     .clip-search-btn {
@@ -459,12 +428,6 @@
         border-left: 2px solid #f59e0b;
     }
 
-    .search-progress-hint {
-        font-size: 0.85rem;
-        color: #9ca3af;
-        margin-top: 8px;
-    }
-
     .progress-main {
         font-size: 1rem;
         color: #e5e7eb;
@@ -492,16 +455,6 @@
         background: linear-gradient(90deg, #3b82f6, #60a5fa);
         border-radius: 3px;
         transition: width 0.3s ease;
-    }
-
-    .progress-cache, .progress-rate {
-        font-size: 0.8rem;
-        color: #9ca3af;
-        margin: 4px 0;
-    }
-
-    .progress-cache {
-        color: #f59e0b;
     }
 
     .divider-text {
@@ -537,75 +490,7 @@
         gap: 12px;
     }
 
-    /* Thumbnail size selector */
-    .thumbnail-size-selector {
-        display: flex;
-        gap: 4px;
-        background: #1f2937;
-        padding: 4px;
-        border-radius: 6px;
-    }
-
-    .size-btn {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 32px;
-        height: 32px;
-        background: transparent;
-        border: none;
-        border-radius: 4px;
-        color: #9ca3af;
-        cursor: pointer;
-        transition: all 0.15s;
-    }
-
-    .size-btn:hover {
-        background: #374151;
-        color: #e5e7eb;
-    }
-
-    .size-btn.active {
-        background: #3b82f6;
-        color: white;
-    }
-
-    /* Grid size variations */
-    .results-grid-small {
-        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)) !important;
-    }
-
-    .results-grid-medium {
-        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)) !important;
-    }
-
-    .results-grid-large {
-        grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)) !important;
-    }
-
-    /* Adjust card info for small size */
-    .results-grid-small .result-info {
-        padding: 0.5rem;
-    }
-
-    .results-grid-small .result-filename {
-        font-size: 0.65rem;
-    }
-
-    .results-grid-small .result-stats {
-        font-size: 0.6rem;
-    }
-
-    .results-grid-small .open-btn {
-        font-size: 0.65rem;
-        padding: 4px 8px;
-    }
-
-    .results-grid-small .rank-badge {
-        font-size: 0.6rem;
-        width: 24px;
-        height: 24px;
-    }
+    /* Thumbnail grid styles are in wwwroot/css/results-shared.css */
 
     /* Deep Search button */
     .deep-search-btn {
@@ -881,7 +766,6 @@
     private List<string> collections = new() { "books" };
     private string selectedCollection = "books";
     private int topK = 50;
-    private bool verify = true;
     private string textQuery = "";
     private string lastSearchType = "";
     private string thumbnailSize = "medium";
@@ -891,18 +775,12 @@
     private ClipStatsResponse? clipStats;
     private string? errorMessage;
     private string searchProgressMessage = "Searching...";
-    private SearchProgressResponse? currentProgress;
     private bool isSearching = false;
     private bool hasSearched = false;
     // CLIP file state
     private string? clipPreviewUrl;
     private IBrowserFile? clipSelectedFile;
     private byte[]? clipFileBytes;
-
-    // DINOv2 file state
-    private string? dinoPreviewUrl;
-    private IBrowserFile? dinoSelectedFile;
-    private byte[]? dinoFileBytes;
 
     // Face file state
     private string? facePreviewUrl;
@@ -1049,19 +927,6 @@
         // Don't auto-search - wait for user to click Search button
     }
 
-    private async Task HandleDinoFileSelected(InputFileChangeEventArgs e)
-    {
-        dinoSelectedFile = e.File;
-
-        using var ms = new MemoryStream();
-        await dinoSelectedFile.OpenReadStream(maxAllowedSize: 100 * 1024 * 1024).CopyToAsync(ms);
-        dinoFileBytes = ms.ToArray();
-
-        dinoPreviewUrl = $"data:{dinoSelectedFile.ContentType};base64,{Convert.ToBase64String(dinoFileBytes)}";
-        StateHasChanged();
-        // Don't auto-search - wait for user to click Search button
-    }
-
     private async Task PerformClipImageSearch()
     {
         if (clipSelectedFile == null || clipFileBytes == null || clipFileBytes.Length == 0) return;
@@ -1093,129 +958,11 @@
         }
     }
 
-    private async Task PerformDinoImageSearch()
-    {
-        if (dinoSelectedFile == null || dinoFileBytes == null || dinoFileBytes.Length == 0) return;
-
-        // DINOv2 doesn't support "all" collections
-        if (selectedCollection == "all")
-        {
-            errorMessage = "DINOv2 search doesn't support 'All Collections'. Please select a specific collection, or use CLIP search for multi-collection search.";
-            hasSearched = true;
-            StateHasChanged();
-            return;
-        }
-
-        isSearching = true;
-        hasSearched = true;
-        errorMessage = null;
-        lastSearchType = "DINOv2 Visual";
-        searchProgressMessage = verify
-            ? "Searching with DINOv2 + geometric verification..."
-            : "Searching with DINOv2...";
-        StateHasChanged();
-
-        // Start progress polling if verification is enabled
-        CancellationTokenSource? progressCts = null;
-        if (verify)
-        {
-            progressCts = new CancellationTokenSource();
-            _ = PollSearchProgressAsync(progressCts.Token);
-        }
-
-        try
-        {
-            using var ms = new MemoryStream(dinoFileBytes);
-            results = await SearchService.SearchAsync(
-                ms,
-                dinoSelectedFile.Name,
-                topK,
-                selectedCollection,
-                verify
-            );
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "DINOv2 image search failed");
-            errorMessage = $"Search failed: {ex.Message}";
-            results = new List<SearchResult>();
-        }
-        finally
-        {
-            // Stop progress polling
-            progressCts?.Cancel();
-            progressCts?.Dispose();
-
-            isSearching = false;
-            StateHasChanged();
-        }
-    }
-
     private void ClearClipQuery()
     {
         clipSelectedFile = null;
         clipFileBytes = null;
         clipPreviewUrl = null;
-    }
-
-    private void ClearDinoQuery()
-    {
-        dinoSelectedFile = null;
-        dinoFileBytes = null;
-        dinoPreviewUrl = null;
-    }
-
-    private async Task PollSearchProgressAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                await Task.Delay(500, cancellationToken); // Poll every 500ms
-
-                var progress = await SearchService.GetSearchProgressAsync();
-                if (progress != null && progress.Stage != "idle")
-                {
-                    currentProgress = progress;
-
-                    // Build progress message based on stage
-                    if (progress.Stage == "searching")
-                    {
-                        searchProgressMessage = progress.Message;
-                    }
-                    else if (progress.Stage == "loading_models")
-                    {
-                        searchProgressMessage = "Loading DISK + LightGlue models...";
-                    }
-                    else if (progress.Stage == "loading_cache")
-                    {
-                        searchProgressMessage = $"Loading cached features ({progress.CacheHits} cached, {progress.CacheMisses} to compute)...";
-                    }
-                    else if (progress.Stage == "verifying")
-                    {
-                        searchProgressMessage = $"Verifying {progress.Current}/{progress.Total} with LightGlue...";
-                    }
-                    else if (progress.Stage == "complete")
-                    {
-                        searchProgressMessage = progress.Message;
-                    }
-
-                    await InvokeAsync(StateHasChanged);
-                }
-                else
-                {
-                    currentProgress = null;
-                }
-            }
-        }
-        catch (TaskCanceledException)
-        {
-            // Expected when search completes
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Progress polling error");
-        }
     }
 
     private async Task HandleFaceFileSelected(InputFileChangeEventArgs e)
@@ -1504,36 +1251,36 @@
 
     private bool CanDeepSearch()
     {
-        // Can do deep search if we have an image loaded (from dino or clip)
-        return (dinoFileBytes != null && dinoFileBytes.Length > 0) ||
-               (clipFileBytes != null && clipFileBytes.Length > 0);
+        // Can do deep search if we have an image loaded from CLIP or DISK query.
+        return (clipFileBytes != null && clipFileBytes.Length > 0) ||
+               (diskFileBytes != null && diskFileBytes.Length > 0);
     }
 
     private async Task PerformDeepSearch()
     {
         // Use whichever image is available (prefer the one used for last search)
         byte[]? imageBytes = null;
-        string? fileName = null;
+        string fileName = "query.jpg";
 
-        if (lastSearchType == "DINOv2 Visual" && dinoFileBytes != null)
-        {
-            imageBytes = dinoFileBytes;
-            fileName = dinoSelectedFile?.Name ?? "query.jpg";
-        }
-        else if (lastSearchType == "CLIP Visual" && clipFileBytes != null)
+        if (lastSearchType.Contains("CLIP", StringComparison.OrdinalIgnoreCase) && clipFileBytes != null)
         {
             imageBytes = clipFileBytes;
             fileName = clipSelectedFile?.Name ?? "query.jpg";
         }
-        else if (dinoFileBytes != null)
+        else if (lastSearchType == "Keypoint" && diskFileBytes != null)
         {
-            imageBytes = dinoFileBytes;
-            fileName = dinoSelectedFile?.Name ?? "query.jpg";
+            imageBytes = diskFileBytes;
+            fileName = diskSelectedFile?.Name ?? "query.jpg";
         }
         else if (clipFileBytes != null)
         {
             imageBytes = clipFileBytes;
             fileName = clipSelectedFile?.Name ?? "query.jpg";
+        }
+        else if (diskFileBytes != null)
+        {
+            imageBytes = diskFileBytes;
+            fileName = diskSelectedFile?.Name ?? "query.jpg";
         }
 
         if (imageBytes == null || imageBytes.Length == 0) return;
@@ -1574,14 +1321,6 @@
         {
             await LoadHistoryEntries();
         }
-    }
-
-    private string FormatEta(int seconds)
-    {
-        if (seconds <= 0) return "calculating...";
-        if (seconds < 60) return $"{seconds}s";
-        if (seconds < 3600) return $"{seconds / 60}m {seconds % 60}s";
-        return $"{seconds / 3600}h {(seconds % 3600) / 60}m";
     }
 
     private async Task LoadHistoryEntries()
@@ -1634,10 +1373,6 @@
                     if (detail.SearchType.Contains("CLIP"))
                     {
                         clipPreviewUrl = imageUrl;
-                    }
-                    else if (detail.SearchType.Contains("DINOv2"))
-                    {
-                        dinoPreviewUrl = imageUrl;
                     }
                     else if (detail.SearchType.Contains("Face"))
                     {
