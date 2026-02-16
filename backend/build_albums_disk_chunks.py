@@ -427,7 +427,7 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
     _nas_copy_thread.daemon = True
     _nas_copy_thread.start()
 
-    del all_desc, all_descriptors, all_ids, ids_array, index
+    del ids_array, index
     gc.collect()
     return num_vectors
 
@@ -577,7 +577,10 @@ def main():
                             feats = extractor(tensor)[0]
                         except torch.cuda.OutOfMemoryError:
                             del tensor
-                            torch.cuda.empty_cache()
+                            try:
+                                torch.cuda.empty_cache()
+                            except RuntimeError:
+                                pass
                             gc.collect()
                             tensor = preprocess_image(image_path, max_dim=2048)
                             if tensor is None:
@@ -611,7 +614,10 @@ def main():
                 if total_images % 200 == 0:
                     gc.collect()
                     if device.type == 'cuda':
-                        torch.cuda.empty_cache()
+                        try:
+                            torch.cuda.empty_cache()
+                        except RuntimeError:
+                            pass
 
                 # Flush chunk
                 if chunk_vector_count >= MAX_VECTORS_PER_CHUNK:

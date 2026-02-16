@@ -489,9 +489,11 @@ def get_search_history(
                     h.Status,
                     h.CurrentProgress,
                     h.TotalChunks,
-                    r.VerifiedMatches AS TopResultVotes
+                    r.VerifiedMatches AS TopResultVotes,
+                    r2.VerifiedMatches AS SecondResultVotes
                 FROM ImageSearchHistory h
                 LEFT JOIN ImageSearchResults r ON h.Id = r.SearchHistoryId AND r.Rank = 1
+                LEFT JOIN ImageSearchResults r2 ON h.Id = r2.SearchHistoryId AND r2.Rank = 2
                 WHERE h.SearchType = ?
                 ORDER BY h.SearchDate DESC
                 OFFSET ? ROWS
@@ -513,9 +515,11 @@ def get_search_history(
                     h.Status,
                     h.CurrentProgress,
                     h.TotalChunks,
-                    r.VerifiedMatches AS TopResultVotes
+                    r.VerifiedMatches AS TopResultVotes,
+                    r2.VerifiedMatches AS SecondResultVotes
                 FROM ImageSearchHistory h
                 LEFT JOIN ImageSearchResults r ON h.Id = r.SearchHistoryId AND r.Rank = 1
+                LEFT JOIN ImageSearchResults r2 ON h.Id = r2.SearchHistoryId AND r2.Rank = 2
                 ORDER BY h.SearchDate DESC
                 OFFSET ? ROWS
                 FETCH NEXT ? ROWS ONLY

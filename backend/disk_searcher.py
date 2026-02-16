@@ -332,7 +332,7 @@ def _accumulate_votes_vectorized(votes: Counter, distances, indices, threshold, 
     """
     Vectorized vote accumulation from kNN results.
 
-    Returns the number of matched keypoint-neighbor pairs that passed threshold.
+    Returns the number of unique (query keypoint, page) votes that were counted.
     """
     if distances.size == 0 or indices.size == 0 or len(paths_or_ids) == 0:
         return 0
@@ -341,10 +341,15 @@ def _accumulate_votes_vectorized(votes: Counter, distances, indices, threshold, 
     if not np.any(mask):
         return 0
 
-    valid_indices = indices[mask].astype(np.int64, copy=False)
+    row_idx, col_idx = np.nonzero(mask)
+    if row_idx.size == 0:
+        return 0
+
+    valid_indices = indices[row_idx, col_idx].astype(np.int64, copy=False)
     in_range = (valid_indices >= 0) & (valid_indices < len(paths_or_ids))
     if not np.any(in_range):
         return 0
+    row_idx = row_idx[in_range]
     valid_indices = valid_indices[in_range]
 
     if id_to_path is not None and len(id_to_path) > 0:
@@ -352,18 +357,37 @@ def _accumulate_votes_vectorized(votes: Counter, distances, indices, threshold, 
         compact_in_range = (compact_ids >= 0) & (compact_ids < len(id_to_path))
         if not np.any(compact_in_range):
             return 0
+        row_idx = row_idx[compact_in_range]
         compact_ids = compact_ids[compact_in_range]
-        unique_ids, counts = np.unique(compact_ids, return_counts=True)
+
+        # Deduplicate repeated neighbors from the same query keypoint that hit the same page.
+        # Without this, one keypoint can cast up to k votes for one page in dense "hub" pages.
+        keypoint_page_pairs = np.empty((compact_ids.size, 2), dtype=np.int64)
+        keypoint_page_pairs[:, 0] = row_idx.astype(np.int64, copy=False)
+        keypoint_page_pairs[:, 1] = compact_ids
+        unique_pairs = np.unique(keypoint_page_pairs, axis=0)
+
+        unique_ids, counts = np.unique(unique_pairs[:, 1], return_counts=True)
         for compact_id, count in zip(unique_ids.tolist(), counts.tolist()):
             votes[id_to_path[compact_id]] += int(count)
-        return int(compact_ids.size)
+        return int(unique_pairs.shape[0])
 
-    unique_indices, counts = np.unique(valid_indices, return_counts=True)
-    for vector_idx, count in zip(unique_indices.tolist(), counts.tolist()):
+    # Fallback mode (paths.json): dedupe in Python because paths are strings.
+    seen = set()
+    page_counts = Counter()
+    for q_row, vector_idx in zip(row_idx.tolist(), valid_indices.tolist()):
         path = paths_or_ids[vector_idx]
-        if path is not None:
-            votes[path] += int(count)
-    return int(valid_indices.size)
+        if path is None:
+            continue
+        key = (int(q_row), path)
+        if key in seen:
+            continue
+        seen.add(key)
+        page_counts[path] += 1
+
+    for path, count in page_counts.items():
+        votes[path] += int(count)
+    return int(len(seen))
 
 
 def extract_disk_features(image_bytes: bytes) -> np.ndarray:

@@ -8,7 +8,7 @@ Key optimization: loads each ~10GB chunk ONCE and searches ALL query images
 against it. Total time ≈ single-image search time.
 
 Usage:
-    python batch_disk_search.py <directory> [--top_k 50] [--k 5] [--threshold 0.7] [--collections books,print_ads]
+    python batch_disk_search.py <directory> [--top_k 1000] [--k 5] [--threshold 0.7] [--collections books,print_ads]
 """
 
 import os
@@ -58,7 +58,7 @@ def find_images(directory):
 def main():
     parser = argparse.ArgumentParser(description="Batch DISK keypoint search")
     parser.add_argument("directory", help="Directory containing query images")
-    parser.add_argument("--top_k", type=int, default=50, help="Results per image (default: 50)")
+    parser.add_argument("--top_k", type=int, default=1000, help="Results per image (default: 1000)")
     parser.add_argument("--k", type=int, default=5, help="Nearest neighbors per keypoint (default: 5)")
     parser.add_argument("--threshold", type=float, default=0.7, help="Minimum similarity (default: 0.7)")
     parser.add_argument("--collections", type=str, default=None, help="Comma-separated collections (default: all)")
@@ -220,7 +220,7 @@ def main():
             total_chunks,
             total_chunks,
             duration_ms,
-            max_results=100
+            max_results=args.top_k
         )
     except Exception:
         pass

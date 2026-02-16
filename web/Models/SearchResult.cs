@@ -104,9 +104,36 @@ public class SearchHistoryEntry
     [JsonPropertyName("TopResultVotes")]
     public int? TopResultVotes { get; set; }
 
+    [JsonPropertyName("SecondResultVotes")]
+    public int? SecondResultVotes { get; set; }
+
     public bool IsInProgress => Status == "in_progress";
 
-    public bool HasPossibleHit => TopResultVotes.HasValue && TopResultVotes.Value >= 60;
+    public bool HasPossibleHit
+    {
+        get
+        {
+            if (!SearchType.Contains("DISK", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (!TopResultVotes.HasValue || !SecondResultVotes.HasValue)
+                return false;
+
+            var top = TopResultVotes.Value;
+            var second = Math.Max(SecondResultVotes.Value, 1);
+
+            if (top < 120)
+                return false;
+
+            // Avoid early noise for long-running searches.
+            if (IsInProgress && ProgressPercent < 10)
+                return false;
+
+            var ratio = (double)top / second;
+            var margin = top - second;
+            return ratio >= 1.5 && margin >= 50;
+        }
+    }
 
     public double ProgressPercent
     {

@@ -4,7 +4,7 @@ FastAPI backend for the web application.
 """
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import shutil
 import os
@@ -1191,6 +1191,7 @@ class SearchHistoryEntry(BaseModel):
     CurrentProgress: Optional[str] = None
     TotalChunks: Optional[int] = None
     TopResultVotes: Optional[int] = None
+    SecondResultVotes: Optional[int] = None
 
 
 class SearchHistoryListResponse(BaseModel):
