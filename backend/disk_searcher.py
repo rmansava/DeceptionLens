@@ -16,6 +16,8 @@ import json
 import os
 import shutil
 import pickle
+import re
+from pathlib import Path
 from glob import glob
 from collections import Counter
 import logging
@@ -25,8 +27,9 @@ import kornia.feature as KF
 import kornia as K
 from threading import Thread
 from queue import Queue, Empty
+from heapq import nlargest
 
-from collections_config import get_disk_collections
+from collections_config import COLLECTIONS, get_disk_collections
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,94 @@ _gpu_search_available = None  # None = not checked, True/False after check
 GPU_SEARCH_BATCH_SIZE = int(os.environ.get("DISK_GPU_BATCH_SIZE", "4000000"))
 GPU_SEARCH_USE_FP16 = os.environ.get("DISK_GPU_FP16", "1") != "0"
 GPU_SEARCH_MAX_SCORES_BYTES = int(float(os.environ.get("DISK_GPU_MAX_SCORES_GB", "4")) * (1024 ** 3))
+DISK_PAGE0_DEBOOST = float(os.environ.get("DISK_PAGE0_DEBOOST", "0.5"))
+DISK_PAGE0_DEBOOST = min(1.0, max(0.0, DISK_PAGE0_DEBOOST))
+_PAGE0_BASENAME_RE = re.compile(r"(^|[-_])page0\.[a-z0-9]+$", re.IGNORECASE)
+DISK_LOCALIZE_MIN_MATCHES = max(4, int(os.environ.get("DISK_LOCALIZE_MIN_MATCHES", "8")))
+DISK_LOCALIZE_SIM_THRESHOLD = float(os.environ.get("DISK_LOCALIZE_SIM_THRESHOLD", "0.7"))
+DISK_LOCALIZE_SIM_THRESHOLD = min(1.0, max(0.0, DISK_LOCALIZE_SIM_THRESHOLD))
+DISK_LOCALIZE_RANSAC_REPROJ = float(os.environ.get("DISK_LOCALIZE_RANSAC_REPROJ", "8.0"))
+DISK_LOCALIZE_TOP_N = max(1, int(os.environ.get("DISK_LOCALIZE_TOP_N", "1000")))
+DISK_RERANK_ENABLED_DEFAULT = os.environ.get("DISK_RERANK_ENABLED_DEFAULT", "0") == "1"
+DISK_RERANK_INLIER_WEIGHT = float(os.environ.get("DISK_RERANK_INLIER_WEIGHT", "1000"))
+DISK_RERANK_MATCH_WEIGHT = float(os.environ.get("DISK_RERANK_MATCH_WEIGHT", "10"))
+DISK_FEATURE_ROOTS = [
+    root.strip().replace("\\", "/").rstrip("/")
+    for root in os.environ.get("DISK_FEATURE_ROOTS", "T:/disk-features,S:/disk-features").split(",")
+    if root.strip()
+]
+
+
+def _is_page0_result(path: str) -> bool:
+    if not path:
+        return False
+    base = os.path.basename(path.replace("\\", "/"))
+    return _PAGE0_BASENAME_RE.search(base) is not None
+
+
+def _adjusted_vote(path: str, raw_votes: int) -> float:
+    if DISK_PAGE0_DEBOOST < 1.0 and _is_page0_result(path):
+        return float(raw_votes) * DISK_PAGE0_DEBOOST
+    return float(raw_votes)
+
+
+def _rank_vote_counter(votes: Counter, top_n: int, excluded_paths: set = None) -> list:
+    """
+    Rank vote results with optional page-0 deboosting.
+
+    Returns list of (path, raw_votes, adjusted_votes), sorted descending by adjusted score.
+    """
+    if top_n <= 0 or not votes:
+        return []
+    excluded_paths = excluded_paths or set()
+    candidate_items = votes.items()
+    if excluded_paths:
+        candidate_items = (
+            (path, raw_votes)
+            for path, raw_votes in votes.items()
+            if _normalize_result_path(path) not in excluded_paths
+        )
+
+    top_items = nlargest(
+        top_n,
+        candidate_items,
+        key=lambda item: (_adjusted_vote(item[0], item[1]), item[1])
+    )
+    return [(path, int(raw), _adjusted_vote(path, int(raw))) for path, raw in top_items]
+
+
+def _normalize_result_path(path: str) -> str:
+    return (path or "").replace("\\", "/").rstrip("/").lower()
+
+
+def _build_disk_feature_roots() -> dict:
+    """
+    Build collection -> list of disk-features roots, including S:/ fallback.
+    """
+    roots = {}
+    for collection, cfg in COLLECTIONS.items():
+        base = cfg.get("disk_features")
+        if not base:
+            continue
+        candidates = [Path(base)]
+        base_name = Path(base).name
+        for root in DISK_FEATURE_ROOTS:
+            candidates.append(Path(root) / base_name)
+
+        # Preserve order, drop duplicates.
+        seen = set()
+        uniq = []
+        for p in candidates:
+            norm = str(p).replace("\\", "/").lower()
+            if norm in seen:
+                continue
+            seen.add(norm)
+            uniq.append(p)
+        roots[collection] = uniq
+    return roots
+
+
+_DISK_FEATURE_ROOTS_BY_COLLECTION = _build_disk_feature_roots()
 
 def _check_gpu_search():
     """Check if GPU search via PyTorch is available."""
@@ -390,9 +481,8 @@ def _accumulate_votes_vectorized(votes: Counter, distances, indices, threshold, 
     return int(len(seen))
 
 
-def extract_disk_features(image_bytes: bytes) -> np.ndarray:
-    """Extract DISK keypoint descriptors from image bytes."""
-    import cv2
+def extract_disk_features_bundle(image_bytes: bytes):
+    """Extract DISK keypoints/descriptors and image size from image bytes."""
     from PIL import Image
     import io
 
@@ -424,13 +514,306 @@ def extract_disk_features(image_bytes: bytes) -> np.ndarray:
         descriptors = feats.descriptors.cpu().numpy()  # (N, 128)
 
     if len(descriptors) == 0:
-        return np.array([]).reshape(0, 128)
+        return {
+            "descriptors": np.array([]).reshape(0, 128).astype('float32'),
+            "keypoints": np.array([]).reshape(0, 2).astype('float32'),
+            "image_size": (w, h),
+        }
 
     # Normalize descriptors
     norms = np.linalg.norm(descriptors, axis=1, keepdims=True)
     descriptors = descriptors / (norms + 1e-8)
 
-    return descriptors.astype('float32')
+    return {
+        "descriptors": descriptors.astype('float32'),
+        "keypoints": keypoints.astype('float32'),
+        "image_size": (w, h),
+    }
+
+
+def extract_disk_features(image_bytes: bytes) -> np.ndarray:
+    """Extract DISK keypoint descriptors from image bytes."""
+    return extract_disk_features_bundle(image_bytes)["descriptors"]
+
+
+def _normalize_slashes(path: str) -> str:
+    return (path or "").replace("\\", "/").rstrip("/")
+
+
+def _collection_source_prefixes(collection: str, config: dict) -> list:
+    prefixes = []
+    source_path = _normalize_slashes(config.get("source_path", ""))
+    if source_path:
+        prefixes.append(source_path)
+        if source_path.startswith("T:/"):
+            prefixes.append("S:/" + source_path[3:])
+        if source_path.startswith("S:/"):
+            prefixes.append("T:/" + source_path[3:])
+
+    if collection == "books":
+        prefixes.extend([
+            "D:/books",
+            "D:/books/pdf-images",
+            "T:/archiverelated/books/pdf-images",
+            "S:/archiverelated/books/pdf-images",
+        ])
+
+    seen = set()
+    uniq = []
+    for p in prefixes:
+        norm = p.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        uniq.append(p)
+    return uniq
+
+
+def _image_path_to_disk_npz_path(image_path: str):
+    """
+    Map a source image path to a DISK feature .npz path.
+
+    Returns:
+        (npz_path, collection) or (None, None)
+    """
+    normalized_path = _normalize_slashes(image_path)
+    normalized_lower = normalized_path.lower()
+
+    for collection, config in COLLECTIONS.items():
+        roots = _DISK_FEATURE_ROOTS_BY_COLLECTION.get(collection)
+        if not roots:
+            continue
+
+        rel = None
+        for prefix in _collection_source_prefixes(collection, config):
+            pfx = prefix.lower()
+            if normalized_lower == pfx:
+                rel = ""
+                break
+            if normalized_lower.startswith(pfx + "/"):
+                rel = normalized_path[len(prefix):].lstrip("/\\")
+                break
+
+        if rel is None:
+            continue
+
+        rel = _normalize_slashes(rel)
+        if collection == "books" and rel.lower().startswith("pdf-images/"):
+            rel = rel[len("pdf-images/"):]
+        if not rel:
+            continue
+
+        rel_npz = str(Path(rel).with_suffix(".npz")).replace("\\", "/")
+
+        for root in roots:
+            candidate = root / rel_npz
+            if candidate.exists():
+                return str(candidate), collection
+
+    return None, None
+
+
+def _load_disk_npz(npz_path: str):
+    try:
+        with np.load(npz_path, allow_pickle=False) as npz:
+            if "descriptors" not in npz or "keypoints" not in npz:
+                return None
+
+            descriptors = np.asarray(npz["descriptors"], dtype=np.float32)
+            keypoints = np.asarray(npz["keypoints"], dtype=np.float32)
+
+            if descriptors.ndim != 2 or descriptors.shape[1] != 128:
+                return None
+            if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+                return None
+
+            norms = np.linalg.norm(descriptors, axis=1, keepdims=True)
+            descriptors = descriptors / (norms + 1e-8)
+
+            width = 0
+            height = 0
+            if "image_size" in npz:
+                size = np.asarray(npz["image_size"]).reshape(-1)
+                if size.size >= 2:
+                    # Stored as [height, width]
+                    height = int(size[0])
+                    width = int(size[1])
+    except Exception:
+        return None
+
+    if width <= 0:
+        width = int(np.ceil(np.max(keypoints[:, 0])) + 1) if len(keypoints) else 0
+    if height <= 0:
+        height = int(np.ceil(np.max(keypoints[:, 1])) + 1) if len(keypoints) else 0
+
+    return {
+        "descriptors": descriptors,
+        "keypoints": keypoints,
+        "image_size": (max(width, 1), max(height, 1)),
+    }
+
+
+def _estimate_match_box(query_features: dict, candidate_features: dict):
+    """
+    Estimate where query appears in candidate image.
+
+    Returns dict with normalized box coordinates and match stats, or None.
+    """
+    try:
+        import cv2
+    except Exception:
+        return None
+
+    q_desc = query_features["descriptors"]
+    q_kp = query_features["keypoints"]
+    qw, qh = query_features["image_size"]
+
+    c_desc = candidate_features["descriptors"]
+    c_kp = candidate_features["keypoints"]
+    cw, ch = candidate_features["image_size"]
+
+    if len(q_desc) < 4 or len(c_desc) < 4:
+        return None
+
+    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    raw_matches = matcher.match(q_desc, c_desc)
+    if not raw_matches:
+        return None
+
+    max_l2_distance = float(np.sqrt(max(0.0, 2.0 - (2.0 * DISK_LOCALIZE_SIM_THRESHOLD))))
+    good = [m for m in raw_matches if m.distance <= max_l2_distance]
+    if len(good) < DISK_LOCALIZE_MIN_MATCHES:
+        return None
+
+    src_pts = np.float32([q_kp[m.queryIdx] for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([c_kp[m.trainIdx] for m in good]).reshape(-1, 1, 2)
+
+    H, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, DISK_LOCALIZE_RANSAC_REPROJ)
+    inlier_count = int(inlier_mask.sum()) if inlier_mask is not None else 0
+
+    if H is not None and inlier_count >= 4:
+        corners = np.float32([[0, 0], [qw - 1, 0], [qw - 1, qh - 1], [0, qh - 1]]).reshape(-1, 1, 2)
+        projected = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+    else:
+        if inlier_mask is not None and inlier_count > 0:
+            projected = dst_pts[inlier_mask.ravel().astype(bool)].reshape(-1, 2)
+        else:
+            projected = dst_pts.reshape(-1, 2)
+
+    if projected.size == 0:
+        return None
+
+    x1 = float(np.min(projected[:, 0]))
+    y1 = float(np.min(projected[:, 1]))
+    x2 = float(np.max(projected[:, 0]))
+    y2 = float(np.max(projected[:, 1]))
+
+    x1 = max(0.0, min(float(cw - 1), x1))
+    y1 = max(0.0, min(float(ch - 1), y1))
+    x2 = max(0.0, min(float(cw - 1), x2))
+    y2 = max(0.0, min(float(ch - 1), y2))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    return {
+        "match_x1": x1 / float(cw),
+        "match_y1": y1 / float(ch),
+        "match_x2": x2 / float(cw),
+        "match_y2": y2 / float(ch),
+        "match_inliers": inlier_count,
+        "match_total": int(len(good)),
+    }
+
+
+def localize_disk_results(image_bytes: bytes, results: list, top_n: int = None):
+    """
+    Secondary pass: estimate highlight regions for top DISK candidates.
+
+    Args:
+        image_bytes: Query image bytes.
+        results: DISK result rows (mutated in place).
+        top_n: Max number of candidates to localize (defaults to DISK_LOCALIZE_TOP_N).
+    """
+    if not results:
+        return results
+
+    limit = min(len(results), top_n or DISK_LOCALIZE_TOP_N)
+    if limit <= 0:
+        return results
+
+    query_features = extract_disk_features_bundle(image_bytes)
+    if len(query_features["descriptors"]) == 0:
+        return results
+
+    start = time.time()
+    localized = 0
+    for i in range(limit):
+        path = results[i].get("path")
+        if not path:
+            continue
+
+        npz_path, _ = _image_path_to_disk_npz_path(path)
+        if not npz_path:
+            continue
+
+        candidate = _load_disk_npz(npz_path)
+        if not candidate:
+            continue
+
+        match_box = _estimate_match_box(query_features, candidate)
+        if not match_box:
+            continue
+
+        results[i].update(match_box)
+        localized += 1
+
+    elapsed = time.time() - start
+    logger.info(
+        f"Secondary localization: {localized}/{limit} candidates in {elapsed:.1f}s "
+        f"({(elapsed / max(limit, 1)):.3f}s each)"
+    )
+    return results
+
+
+def rerank_disk_results(results: list) -> list:
+    """
+    Re-rank DISK results using geometric verification signals when available.
+
+    This is a post-search rerank. Votes remain as fallback for rows without
+    localization fields.
+    """
+    if not results:
+        return results
+
+    ranked = []
+    for idx, row in enumerate(results):
+        inliers = int(row.get("match_inliers") or 0)
+        total = int(row.get("match_total") or 0)
+        votes = int(row.get("votes") or row.get("verified_matches") or 0)
+        adjusted_votes = _adjusted_vote(row.get("path", ""), votes)
+
+        if inliers >= 20:
+            tier = 3
+        elif inliers >= 10:
+            tier = 2
+        elif inliers >= 5:
+            tier = 1
+        else:
+            tier = 0
+
+        rerank_score = (
+            (tier * 1_000_000_000.0) +
+            (inliers * DISK_RERANK_INLIER_WEIGHT) +
+            (total * DISK_RERANK_MATCH_WEIGHT) +
+            adjusted_votes
+        )
+        item = dict(row)
+        item["rerank_score"] = float(rerank_score)
+        ranked.append((rerank_score, idx, item))
+
+    ranked.sort(key=lambda t: (t[0], -t[1]), reverse=True)
+    return [item for _, _, item in ranked]
 
 
 def _collect_chunks(categories=None):
@@ -475,7 +858,8 @@ def search_chunks(
     progress_callback=None,
     check_stopped=None,
     start_chunk: int = 1,
-    initial_votes: dict = None
+    initial_votes: dict = None,
+    excluded_paths: set = None
 ):
     """
     Search consolidated chunks for matching images using streaming mode.
@@ -498,6 +882,8 @@ def search_chunks(
     if len(query_descriptors) == 0:
         logger.warning("No keypoints extracted from query image")
         return []
+
+    excluded_paths = {_normalize_result_path(p) for p in (excluded_paths or set()) if p}
 
     # Collect chunks from all selected categories
     cat_label = ",".join(categories) if categories else "all"
@@ -528,7 +914,8 @@ def search_chunks(
             progress_callback=progress_callback,
             check_stopped=check_stopped,
             start_chunk=start_chunk,
-            initial_votes=initial_votes
+            initial_votes=initial_votes,
+            excluded_paths=excluded_paths
         )
     else:
         logger.warning("No chunks found for any selected category")
@@ -587,7 +974,8 @@ def _search_chunks_rolling_buffer(
     progress_callback=None,
     check_stopped=None,
     start_chunk: int = 1,
-    initial_votes: dict = None
+    initial_votes: dict = None,
+    excluded_paths: set = None
 ):
     """
     Search using rolling buffer: maintain chunks in local buffer, copy next chunk while searching current.
@@ -598,6 +986,7 @@ def _search_chunks_rolling_buffer(
         progress_callback: Optional callback(chunk_idx, total_chunks, top_results, elapsed_ms)
     """
     all_votes = Counter(initial_votes or {})
+    excluded_paths = excluded_paths or set()
     total_chunks = len(chunk_list)
     start_idx = max(0, min(total_chunks, int(start_chunk) - 1))
     use_gpu = _check_gpu_search()
@@ -708,14 +1097,25 @@ def _search_chunks_rolling_buffer(
         chunks_done_this_run = (chunk_idx - start_idx) + 1
         avg_per_chunk = elapsed / chunks_done_this_run
         remaining = (total_chunks - chunk_idx - 1) * avg_per_chunk
+        top_ranked = _rank_vote_counter(all_votes, 1, excluded_paths=excluded_paths)
+        top_raw = top_ranked[0][1] if top_ranked else 0
+        top_adjusted = top_ranked[0][2] if top_ranked else 0.0
         logger.info(f"  Progress: {chunk_idx + 1}/{total_chunks} chunks | "
-                   f"ETA: {remaining/60:.1f}m | Top vote: {all_votes.most_common(1)[0][1] if all_votes else 0}")
+                    f"ETA: {remaining/60:.1f}m | Top vote: {top_raw} (adj {top_adjusted:.1f})")
 
         # Call progress callback for live updates
         if progress_callback:
+            ranked_top = _rank_vote_counter(all_votes, 100, excluded_paths=excluded_paths)
+            max_adjusted = ranked_top[0][2] if ranked_top else 1.0
             top_results = [
-                {'path': path, 'votes': votes, 'score': votes / all_votes.most_common(1)[0][1] if all_votes else 0}
-                for path, votes in all_votes.most_common(100)
+                {
+                    'path': path,
+                    'votes': votes,
+                    'verified_matches': votes,
+                    'combined_score': adjusted,
+                    'score': adjusted / max_adjusted if max_adjusted > 0 else 0.0
+                }
+                for path, votes, adjusted in ranked_top
             ]
             progress_callback(chunk_idx + 1, total_chunks, top_results, int(elapsed * 1000))
 
@@ -734,7 +1134,8 @@ def _search_chunks_rolling_buffer(
         else:
             save_search_checkpoint(search_id, last_completed_chunk, total_chunks, all_votes)
 
-    return all_votes.most_common(top_n)
+    ranked_final = _rank_vote_counter(all_votes, top_n, excluded_paths=excluded_paths)
+    return [(path, votes) for path, votes, _ in ranked_final]
 
 
 def search_disk(
@@ -748,7 +1149,8 @@ def search_disk(
     check_stopped=None,
     search_id: int = None,
     start_chunk: int = 1,
-    initial_votes: dict = None
+    initial_votes: dict = None,
+    excluded_paths: set = None
 ):
     """
     Main entry point for DISK search.
@@ -788,19 +1190,22 @@ def search_disk(
         progress_callback=progress_callback,
         check_stopped=check_stopped,
         start_chunk=start_chunk,
-        initial_votes=initial_votes
+        initial_votes=initial_votes,
+        excluded_paths=excluded_paths
     )
 
     # Format results
     formatted = []
-    max_votes = results[0][1] if results else 1
+    max_adjusted = _adjusted_vote(results[0][0], results[0][1]) if results else 1.0
 
     for path, votes in results:
+        adjusted = _adjusted_vote(path, votes)
         formatted.append({
             'path': path,
             'votes': votes,
-            'score': votes / max_votes,  # Normalize to 0-1
-            'verified_matches': votes
+            'score': adjusted / max_adjusted if max_adjusted > 0 else 0.0,
+            'verified_matches': votes,
+            'combined_score': adjusted
         })
 
     return formatted
@@ -812,7 +1217,7 @@ def get_total_chunks(categories=None):
     return sum(category_counts.values())
 
 
-def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, progress_callback=None, check_stopped=None):
+def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, progress_callback=None, check_stopped=None, excluded_paths: set = None):
     """
     Search using rolling buffer with MULTIPLE query images at once.
 
@@ -829,6 +1234,7 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
         Dict of {image_name: Counter()} with vote counts per image
     """
     per_image_votes = {name: Counter() for name, _ in query_list}
+    excluded_paths = excluded_paths or set()
     total_chunks = len(chunk_list)
     use_gpu = _check_gpu_search()
 
@@ -947,10 +1353,17 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
             per_image_results = {}
             for name, votes in per_image_votes.items():
                 if votes:
-                    max_v = votes.most_common(1)[0][1]
+                    ranked_top = _rank_vote_counter(votes, 100, excluded_paths=excluded_paths)
+                    max_adjusted = ranked_top[0][2] if ranked_top else 1.0
                     per_image_results[name] = [
-                        {'path': p, 'votes': v, 'score': v / max_v}
-                        for p, v in votes.most_common(100)
+                        {
+                            'path': p,
+                            'votes': v,
+                            'verified_matches': v,
+                            'combined_score': adjusted,
+                            'score': adjusted / max_adjusted if max_adjusted > 0 else 0.0
+                        }
+                        for p, v, adjusted in ranked_top
                     ]
                 else:
                     per_image_results[name] = []
@@ -962,7 +1375,7 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
     return per_image_votes
 
 
-def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: float = 0.7, categories: list = None, progress_callback=None, check_stopped=None):
+def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: float = 0.7, categories: list = None, progress_callback=None, check_stopped=None, excluded_paths: set = None):
     """
     Batch DISK search: search multiple images in one pass through all chunks.
 
@@ -978,6 +1391,8 @@ def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: 
     Returns:
         Dict of {image_name: [{'path', 'votes', 'score'}, ...]}
     """
+    excluded_paths = {_normalize_result_path(p) for p in (excluded_paths or set()) if p}
+
     # Extract features for all images
     query_list = []
     for image_bytes, image_name in image_list:
@@ -1001,17 +1416,24 @@ def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: 
     per_image_votes = _search_chunks_rolling_buffer_batch(
         query_list, all_chunks, k, threshold, top_k,
         buffer_size=5, progress_callback=progress_callback,
-        check_stopped=check_stopped
+        check_stopped=check_stopped,
+        excluded_paths=excluded_paths
     )
 
     # Format results
     results = {}
     for name, votes in per_image_votes.items():
-        top = votes.most_common(top_k)
-        max_v = top[0][1] if top else 1
+        ranked_top = _rank_vote_counter(votes, top_k, excluded_paths=excluded_paths)
+        max_adjusted = ranked_top[0][2] if ranked_top else 1.0
         results[name] = [
-            {'path': p, 'votes': v, 'score': v / max_v, 'verified_matches': v}
-            for p, v in top
+            {
+                'path': p,
+                'votes': v,
+                'score': adjusted / max_adjusted if max_adjusted > 0 else 0.0,
+                'verified_matches': v,
+                'combined_score': adjusted
+            }
+            for p, v, adjusted in ranked_top
         ]
 
     return results

@@ -97,10 +97,46 @@
                 </div>
             </div>
 
-            <!-- CLIP Section -->
-            <div class="panel-section mode-tile clip-tile">
-                <h2 class="section-title">CLIP</h2>
-                <p class="search-info">Describe what you are searching for, or upload a reference image.</p>
+            <!-- Describe Section -->
+            <div class="panel-section mode-tile describe-tile">
+                <h2 class="section-title">Describe</h2>
+                <p class="search-info">Enter the search terms for the image you're looking for.</p>
+                <div class="mode-controls">
+                    <div class="form-group results-group">
+                        <label>Results</label>
+                        <input type="number" @bind="topK" min="1" max="500" class="form-input compact-input" />
+                    </div>
+                    <div class="form-group">
+                        <label>Category</label>
+                        <select @bind="selectedCollection" class="form-select compact-input">
+                            @foreach (var col in collections)
+                            {
+                                <option value="@col">@(col == "all" ? "All Collections" : col)</option>
+                            }
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Search Terms</label>
+                        <div class="text-search-row">
+                            <input type="text" @bind="textQuery" @bind:event="oninput"
+                                   @onkeydown="HandleTextKeyDown"
+                                   placeholder="red soda can..."
+                                   class="form-input text-search-input compact-input" />
+                            <button class="search-btn" @onclick="PerformTextSearch" disabled="@(string.IsNullOrWhiteSpace(textQuery) || isSearching)">
+                                Go
+                            </button>
+                        </div>
+                    </div>
+                    <button class="search-btn clip-search-btn" @onclick="PerformTextSearch" disabled="@(string.IsNullOrWhiteSpace(textQuery) || isSearching)">
+                        Search
+                    </button>
+                </div>
+            </div>
+
+            <!-- CLIP Image Section -->
+            <div class="panel-section mode-tile clip-image-tile">
+                <h2 class="section-title">Clip Image</h2>
+                <p class="search-info">Upload a reference image to find similar images.</p>
                 <div class="mode-ribbon-body">
                     <div class="mode-controls">
                         <div class="form-group results-group">
@@ -116,47 +152,30 @@
                                 }
                             </select>
                         </div>
-                        <div class="form-group">
-                            <label>Describe</label>
-                            <div class="text-search-row">
-                                <input type="text" @bind="textQuery" @bind:event="oninput"
-                                       @onkeydown="HandleTextKeyDown"
-                                       placeholder="red soda can..."
-                                       class="form-input text-search-input compact-input" />
-                                <button class="search-btn" @onclick="PerformTextSearch" disabled="@(string.IsNullOrWhiteSpace(textQuery) || isSearching)">
-                                    Go
-                                </button>
-                            </div>
-                        </div>
                         <button class="search-btn clip-search-btn" @onclick="PerformClipImageSearch"
                                 disabled="@(clipFileBytes == null || clipFileBytes.Length == 0 || isSearching)">
-                            Search with CLIP
+                            Search Image
                         </button>
                     </div>
 
-                    <div class="mode-thumb-col clip-thumb-col">
-                        <!-- CLIP Visual Search -->
-                        <div class="clip-upload-wrap">
-                            <p class="mode-or-label">OR upload image</p>
-                            <div id="clip-upload-area" class="upload-area">
+                    <div class="mode-thumb-col">
+                        <div id="clip-upload-area" class="upload-area">
+                            @if (clipPreviewUrl != null)
+                            {
+                                <img src="@clipPreviewUrl" alt="CLIP Query" class="preview-image" />
+                                <button class="clear-btn" @onclick="ClearClipQuery">Clear</button>
+                            }
+                            else
+                            {
+                                <div class="upload-prompt">
+                                    <svg class="upload-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                    </svg>
+                                    <p>Drop image here</p>
+                                </div>
+                            }
 
-                                @if (clipPreviewUrl != null)
-                                {
-                                    <img src="@clipPreviewUrl" alt="CLIP Query" class="preview-image" />
-                                    <button class="clear-btn" @onclick="ClearClipQuery">Clear</button>
-                                }
-                                else
-                                {
-                                    <div class="upload-prompt">
-                                        <svg class="upload-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                                        </svg>
-                                        <p>Drop image here</p>
-                                    </div>
-                                }
-
-                                <InputFile id="clip-file-input" OnChange="HandleClipFileSelected" accept="image/*" class="file-input" />
-                            </div>
+                            <InputFile id="clip-file-input" OnChange="HandleClipFileSelected" accept="image/*" class="file-input" />
                         </div>
                     </div>
                 </div>
@@ -458,9 +477,14 @@
         max-width: 420px;
     }
 
-    .clip-tile {
-        flex: 1.3 1 420px;
-        max-width: 540px;
+    .describe-tile {
+        flex: 1 1 320px;
+        max-width: 420px;
+    }
+
+    .clip-image-tile {
+        flex: 1.2 1 400px;
+        max-width: 520px;
     }
 
     .mode-tile .section-title {
@@ -534,40 +558,12 @@
         gap: 0.35rem;
     }
 
-    .clip-tile .mode-ribbon-body {
-        grid-template-columns: 185px minmax(0, 1fr);
+    .clip-image-tile .mode-ribbon-body {
+        grid-template-columns: 170px minmax(0, 1fr);
     }
 
-    .clip-tile .text-search-input {
+    .describe-tile .text-search-input {
         min-width: 0;
-    }
-
-    .clip-tile .clip-thumb-col {
-        min-width: 0;
-    }
-
-    .clip-tile .clip-upload-wrap {
-        position: relative;
-        width: 100%;
-        margin-top: 0.2rem;
-    }
-
-    .clip-tile .mode-or-label {
-        position: absolute;
-        top: -0.65rem;
-        left: 0;
-        transform: translateX(-50%);
-        margin: 0;
-        font-size: 0.66rem;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: #93c5fd;
-        font-weight: 700;
-        padding: 0 0.2rem;
-        line-height: 1;
-        background: #1e293b;
-        white-space: nowrap;
-        z-index: 1;
     }
 
     .mode-controls .text-search-row .search-btn {
@@ -1361,17 +1357,11 @@
                 }
 
                 currentDiskSearch = detail;
-                if (!string.IsNullOrWhiteSpace(detail.Notes))
-                {
-                    searchProgressMessage = detail.Notes;
-                }
-                else if (!string.IsNullOrWhiteSpace(detail.CurrentProgress))
-                {
-                    searchProgressMessage = detail.CurrentProgress;
-                }
+                searchProgressMessage = ResolveDiskProgressMessage(detail);
 
                 results = detail.Results
                     .OrderBy(r => r.Rank)
+                    .Take(topK)
                     .Select(r => new SearchResult
                     {
                         Path = r.ImagePath,
@@ -1487,6 +1477,27 @@
         }
 
         return Math.Clamp((double)current / detail.TotalChunks.Value * 100.0, 0, 100);
+    }
+
+    private string ResolveDiskProgressMessage(SearchHistoryDetail detail)
+    {
+        // Prefer live chunk progress while the search is active; queued note is only fallback.
+        if (detail.IsInProgress && !string.IsNullOrWhiteSpace(detail.CurrentProgress))
+        {
+            return detail.CurrentProgress;
+        }
+
+        if (!string.IsNullOrWhiteSpace(detail.Notes))
+        {
+            return detail.Notes;
+        }
+
+        if (!string.IsNullOrWhiteSpace(detail.CurrentProgress))
+        {
+            return detail.CurrentProgress;
+        }
+
+        return searchProgressMessage;
     }
 
     private string? GetResultCollection(SearchResult result)
@@ -1608,12 +1619,15 @@
             if (detail != null)
             {
                 lastSearchType = detail.SearchType;
-                results = detail.Results.Select(r => new SearchResult
-                {
-                    Path = r.ImagePath,
-                    Score = r.Score,
-                    VerifiedMatches = r.VerifiedMatches ?? 0
-                }).ToList();
+                results = detail.Results
+                    .OrderBy(r => r.Rank)
+                    .Take(topK)
+                    .Select(r => new SearchResult
+                    {
+                        Path = r.ImagePath,
+                        Score = r.Score,
+                        VerifiedMatches = r.VerifiedMatches ?? 0
+                    }).ToList();
 
                 // Load the query image if available
                 if (!string.IsNullOrEmpty(detail.QueryImageName))

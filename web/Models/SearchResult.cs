@@ -191,6 +191,30 @@ public class SearchHistoryDetailResult
     [JsonPropertyName("CombinedScore")]
     public double? CombinedScore { get; set; }
 
+    [JsonPropertyName("MatchX1")]
+    public double? MatchX1 { get; set; }
+
+    [JsonPropertyName("MatchY1")]
+    public double? MatchY1 { get; set; }
+
+    [JsonPropertyName("MatchX2")]
+    public double? MatchX2 { get; set; }
+
+    [JsonPropertyName("MatchY2")]
+    public double? MatchY2 { get; set; }
+
+    [JsonPropertyName("MatchInliers")]
+    public int? MatchInliers { get; set; }
+
+    [JsonPropertyName("MatchTotal")]
+    public int? MatchTotal { get; set; }
+
+    public bool HasHighlight =>
+        MatchX1.HasValue && MatchY1.HasValue &&
+        MatchX2.HasValue && MatchY2.HasValue &&
+        MatchX2.Value > MatchX1.Value &&
+        MatchY2.Value > MatchY1.Value;
+
     public string FileName => System.IO.Path.GetFileName(ImagePath);
 }
 
@@ -290,4 +314,25 @@ public class DiskSearchStartResponse
 
     [JsonPropertyName("message")]
     public string Message { get; set; } = string.Empty;
+}
+
+public class ExclusionEntry
+{
+    [JsonPropertyName("Id")]
+    public int Id { get; set; }
+
+    [JsonPropertyName("Path")]
+    public string Path { get; set; } = string.Empty;
+
+    [JsonPropertyName("PathNormalized")]
+    public string PathNormalized { get; set; } = string.Empty;
+
+    [JsonPropertyName("SearchType")]
+    public string SearchType { get; set; } = string.Empty;
+
+    [JsonPropertyName("Reason")]
+    public string? Reason { get; set; }
+
+    [JsonPropertyName("CreatedDate")]
+    public string CreatedDate { get; set; } = string.Empty;
 }

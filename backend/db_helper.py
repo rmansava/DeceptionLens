@@ -69,7 +69,40 @@ def ensure_indexes():
         ),
     ]
 
+    result_columns = [
+        ("MatchX1", "FLOAT NULL"),
+        ("MatchY1", "FLOAT NULL"),
+        ("MatchX2", "FLOAT NULL"),
+        ("MatchY2", "FLOAT NULL"),
+        ("MatchInliers", "INT NULL"),
+        ("MatchTotal", "INT NULL"),
+    ]
+
     try:
+        cursor.execute("""
+            IF OBJECT_ID('dbo.ImageSearchExclusions', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.ImageSearchExclusions (
+                    Id INT IDENTITY(1,1) PRIMARY KEY,
+                    Path NVARCHAR(2000) NOT NULL,
+                    PathNormalized NVARCHAR(2000) NOT NULL,
+                    SearchType NVARCHAR(100) NOT NULL,
+                    Reason NVARCHAR(400) NULL,
+                    CreatedDate DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+                );
+            END
+        """)
+
+        for column_name, column_type in result_columns:
+            cursor.execute("""
+                SELECT 1
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_NAME = 'ImageSearchResults' AND COLUMN_NAME = ?
+            """, (column_name,))
+            if cursor.fetchone() is None:
+                cursor.execute(f"ALTER TABLE ImageSearchResults ADD {column_name} {column_type}")
+                logger.info(f"Added ImageSearchResults.{column_name}")
+
         for idx_name, table_name, ddl in indexes:
             cursor.execute(
                 "SELECT 1 FROM sys.indexes WHERE name = ? AND object_id = OBJECT_ID(?)",
@@ -80,6 +113,17 @@ def ensure_indexes():
                 logger.info(f"Created index {idx_name} on {table_name}")
             else:
                 logger.debug(f"Index {idx_name} already exists")
+
+        cursor.execute(
+            "SELECT 1 FROM sys.indexes WHERE name = ? AND object_id = OBJECT_ID(?)",
+            ("IX_ImageSearchExclusions_SearchType_Path", "ImageSearchExclusions")
+        )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "CREATE NONCLUSTERED INDEX IX_ImageSearchExclusions_SearchType_Path "
+                "ON ImageSearchExclusions (SearchType, PathNormalized)"
+            )
+            logger.info("Created index IX_ImageSearchExclusions_SearchType_Path on ImageSearchExclusions")
 
         conn.commit()
     except Exception as e:
@@ -104,7 +148,13 @@ def _build_result_rows(search_id: int, top_results: List[Dict[str, Any]], max_re
             result.get('verified_matches', result.get('votes', None)),
             result.get('keypoint_matches', None),
             result.get('template_score', None),
-            result.get('combined_score', None)
+            result.get('combined_score', None),
+            result.get('match_x1', None),
+            result.get('match_y1', None),
+            result.get('match_x2', None),
+            result.get('match_y2', None),
+            result.get('match_inliers', None),
+            result.get('match_total', None),
         ))
     return rows
 
@@ -193,9 +243,10 @@ def update_search_progress(
             cursor.executemany("""
                 INSERT INTO ImageSearchResults (
                     SearchHistoryId, Rank, ImagePath, Score,
-                    VerifiedMatches, KeypointMatches, TemplateScore, CombinedScore
+                    VerifiedMatches, KeypointMatches, TemplateScore, CombinedScore,
+                    MatchX1, MatchY1, MatchX2, MatchY2, MatchInliers, MatchTotal
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
 
         conn.commit()
@@ -264,9 +315,10 @@ def update_search_progress_batch(
             cursor.executemany("""
                 INSERT INTO ImageSearchResults (
                     SearchHistoryId, Rank, ImagePath, Score,
-                    VerifiedMatches, KeypointMatches, TemplateScore, CombinedScore
+                    VerifiedMatches, KeypointMatches, TemplateScore, CombinedScore,
+                    MatchX1, MatchY1, MatchX2, MatchY2, MatchInliers, MatchTotal
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, insert_rows)
 
         conn.commit()
@@ -426,9 +478,10 @@ def save_search_history(
             cursor.execute("""
                 INSERT INTO ImageSearchResults (
                     SearchHistoryId, Rank, ImagePath, Score,
-                    VerifiedMatches, KeypointMatches, TemplateScore, CombinedScore
+                    VerifiedMatches, KeypointMatches, TemplateScore, CombinedScore,
+                    MatchX1, MatchY1, MatchX2, MatchY2, MatchInliers, MatchTotal
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 search_id,
                 rank,
@@ -437,7 +490,13 @@ def save_search_history(
                 result.get('verified_matches', None),
                 result.get('keypoint_matches', None),
                 result.get('template_score', None),
-                result.get('combined_score', None)
+                result.get('combined_score', None),
+                result.get('match_x1', None),
+                result.get('match_y1', None),
+                result.get('match_x2', None),
+                result.get('match_y2', None),
+                result.get('match_inliers', None),
+                result.get('match_total', None)
             ))
 
         conn.commit()
@@ -601,7 +660,8 @@ def get_search_details(search_id: int) -> Optional[Dict[str, Any]]:
         cursor.execute("""
             SELECT
                 Rank, ImagePath, Score, VerifiedMatches,
-                KeypointMatches, TemplateScore, CombinedScore
+                KeypointMatches, TemplateScore, CombinedScore,
+                MatchX1, MatchY1, MatchX2, MatchY2, MatchInliers, MatchTotal
             FROM ImageSearchResults
             WHERE SearchHistoryId = ?
             ORDER BY Rank
@@ -677,6 +737,126 @@ def add_search_note(search_id: int, note: str) -> bool:
         conn.rollback()
         logger.error(f"Failed to add note: {e}")
         raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def normalize_result_path(path: str) -> str:
+    """Normalize file path for case/sep-insensitive comparisons."""
+    return (path or "").replace("\\", "/").rstrip("/").lower()
+
+
+def add_excluded_result(
+    path: str,
+    search_type: str = "DISK",
+    reason: Optional[str] = None
+) -> bool:
+    """Add path to exclusion list (idempotent)."""
+    normalized = normalize_result_path(path)
+    if not normalized:
+        return False
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT TOP 1 Id
+            FROM ImageSearchExclusions
+            WHERE SearchType = ? AND PathNormalized = ?
+            """,
+            (search_type, normalized)
+        )
+        if cursor.fetchone():
+            return True
+
+        cursor.execute(
+            """
+            INSERT INTO ImageSearchExclusions (Path, PathNormalized, SearchType, Reason)
+            VALUES (?, ?, ?, ?)
+            """,
+            (path, normalized, search_type, reason)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to add excluded result: {e}")
+        return False
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def remove_excluded_result(path: str, search_type: str = "DISK") -> bool:
+    """Remove path from exclusion list."""
+    normalized = normalize_result_path(path)
+    if not normalized:
+        return False
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            DELETE FROM ImageSearchExclusions
+            WHERE SearchType = ? AND PathNormalized = ?
+            """,
+            (search_type, normalized)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to remove excluded result: {e}")
+        return False
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_excluded_results(search_type: str = "DISK") -> List[Dict[str, Any]]:
+    """Return exclusion entries for a search type."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT Id, Path, PathNormalized, SearchType, Reason, CreatedDate
+            FROM ImageSearchExclusions
+            WHERE SearchType = ?
+            ORDER BY CreatedDate DESC
+            """,
+            (search_type,)
+        )
+        columns = [col[0] for col in cursor.description]
+        entries = []
+        for row in cursor.fetchall():
+            entry = dict(zip(columns, row))
+            if entry.get("CreatedDate"):
+                entry["CreatedDate"] = entry["CreatedDate"].isoformat()
+            entries.append(entry)
+        return entries
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_excluded_paths(search_type: str = "DISK") -> set:
+    """Return normalized excluded paths for fast filtering."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT PathNormalized
+            FROM ImageSearchExclusions
+            WHERE SearchType = ?
+            """,
+            (search_type,)
+        )
+        return {row[0] for row in cursor.fetchall() if row[0]}
     finally:
         cursor.close()
         conn.close()

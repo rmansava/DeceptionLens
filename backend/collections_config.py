@@ -34,7 +34,7 @@ COLLECTIONS = {
         # DISK features path
         "disk_features": "T:/disk-features/print_ads",
         # DISK search chunks
-        "disk_chunks_dir": "S:/faiss/disk_retrieval/printads_chunks",
+        "disk_chunks_dir": "T:/faiss/disk_retrieval/printads_chunks",
         "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/printads_chunk_ids",
         # Source data
         "source_path": "T:/archiverelated/print ads",
@@ -59,7 +59,7 @@ COLLECTIONS = {
         "name": "Albums",
         "description": "Album art",
         # DISK search chunks
-        "disk_chunks_dir": "T:/faiss/disk_retrieval/albums_chunks",
+        "disk_chunks_dir": "U:/faiss/disk_retrieval/albums_chunks",
         "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/albums_chunk_ids",
         # Source data
         "source_path": "T:/albums",
@@ -68,7 +68,7 @@ COLLECTIONS = {
         "name": "Comics",
         "description": "Comic book pages",
         # DISK search chunks
-        "disk_chunks_dir": "T:/faiss/disk_retrieval/comics_chunks",
+        "disk_chunks_dir": "U:/faiss/disk_retrieval/comics_chunks",
         "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/comics_chunk_ids",
         # Source data
         "source_path": "T:/comics",

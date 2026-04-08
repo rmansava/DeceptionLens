@@ -35,3 +35,7 @@ python main.py search --query /path/to/query.jpg --top-k 20
 # View statistics
 python main.py stats --collection images
 ```
+
+## DISK Chunk Builder Docs
+
+- See `backend/CHUNK_BUILDERS.md` for how the category chunk batch files work (`run_build_*_chunks.bat`), including source modes, paths, resume behavior, and CUDA auto-restart handling.

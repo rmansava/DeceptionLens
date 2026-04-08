@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"IndexFlatIP\\\\|IndexPQ\\\\|IVF\" /c/Users/rmans/source/repos/DinoDeceptionLens/backend/*.py)"
+    ]
+  }
+}

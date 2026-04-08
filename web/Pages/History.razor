@@ -87,8 +87,14 @@
                             </div>
                             <div class="compare-card">
                                 <h4>Match - @(selectedResult.VerifiedMatches.HasValue ? $"{selectedResult.VerifiedMatches} votes" : selectedResult.Score.ToString("F4"))</h4>
-                                <img src="@SearchService.GetImageUrl(selectedResult.ImagePath)"
-                                     alt="Result" />
+                                <div class="compare-image-wrap">
+                                    <img src="@SearchService.GetImageUrl(selectedResult.ImagePath)"
+                                         alt="Result" />
+                                    @if (showHighlights && selectedResult.HasHighlight)
+                                    {
+                                        <div class="match-overlay" style="@GetHighlightStyle(selectedResult)"></div>
+                                    }
+                                </div>
                                 <p class="compare-path" title="@selectedResult.ImagePath">@selectedResult.ImagePath</p>
                             </div>
                         </div>
@@ -97,7 +103,12 @@
 
                 <div class="results-title-row">
                     <h2>Results @(selectedDetail.IsInProgress ? "(updating live)" : "")</h2>
-                    <div class="thumbnail-size-selector">
+                    <div class="results-toolbar">
+                        <button class="highlight-toggle-btn @(showHighlights ? "on" : "off")"
+                                @onclick="ToggleHighlights">
+                            Highlights: @(showHighlights ? "On" : "Off")
+                        </button>
+                        <div class="thumbnail-size-selector">
                         <button class="size-btn @(thumbnailSize == "small" ? "active" : "")" @onclick="@(() => thumbnailSize = "small")" title="Small thumbnails">
                             <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
                                 <rect x="1" y="1" width="3" height="3" /><rect x="6" y="1" width="3" height="3" /><rect x="11" y="1" width="3" height="3" />
@@ -117,6 +128,7 @@
                                 <rect x="1" y="9" width="14" height="6" />
                             </svg>
                         </button>
+                        </div>
                     </div>
                 </div>
 
@@ -128,6 +140,10 @@
                                 <img src="@SearchService.GetImageUrl(result.ImagePath)"
                                      alt="Result @result.Rank"
                                      loading="lazy" />
+                                @if (showHighlights && result.HasHighlight)
+                                {
+                                    <div class="match-overlay" style="@GetHighlightStyle(result)"></div>
+                                }
                                 <span class="rank-badge">#@result.Rank</span>
                             </div>
                             <div class="result-info">
@@ -139,6 +155,16 @@
                                     }
                                     <span class="score-badge">Score: @result.Score.ToString("F4")</span>
                                 </div>
+                                @if (selectedDetail.SearchType.Contains("DISK", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    <div class="result-actions-row">
+                                        <button class="exclude-btn @(IsExcludedPath(result.ImagePath) ? "excluded" : "")"
+                                                @onclick:stopPropagation="true"
+                                                @onclick="() => ToggleExcludeResult(result)">
+                                            @(IsExcludedPath(result.ImagePath) ? "Unexclude" : "Exclude")
+                                        </button>
+                                    </div>
+                                }
                             </div>
                         </div>
                     }
@@ -385,6 +411,32 @@ else
         align-items: center;
         justify-content: space-between;
         margin-bottom: 16px;
+    }
+
+    .results-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .highlight-toggle-btn {
+        border: 1px solid #475569;
+        border-radius: 6px;
+        background: #1e293b;
+        color: #cbd5e1;
+        padding: 6px 10px;
+        font-size: 0.78rem;
+        cursor: pointer;
+        min-width: 110px;
+    }
+
+    .highlight-toggle-btn.on {
+        border-color: #06b6d4;
+        color: #cffafe;
+    }
+
+    .highlight-toggle-btn:hover {
+        border-color: #06b6d4;
     }
 
     .results-title-row h2 {
@@ -754,6 +806,49 @@ else
         background: #000;
     }
 
+    .compare-image-wrap {
+        position: relative;
+        display: inline-block;
+        max-width: 100%;
+    }
+
+    .result-image-container {
+        position: relative;
+    }
+
+    .match-overlay {
+        position: absolute;
+        border: 2px solid #22d3ee;
+        background: rgba(34, 211, 238, 0.18);
+        box-shadow: 0 0 0 1px rgba(8, 145, 178, 0.6);
+        border-radius: 4px;
+        pointer-events: none;
+    }
+
+    .result-actions-row {
+        margin-top: 8px;
+    }
+
+    .exclude-btn {
+        border: 1px solid #475569;
+        background: #1e293b;
+        color: #cbd5e1;
+        border-radius: 5px;
+        padding: 3px 8px;
+        font-size: 0.72rem;
+        cursor: pointer;
+    }
+
+    .exclude-btn:hover {
+        border-color: #ef4444;
+        color: #fca5a5;
+    }
+
+    .exclude-btn.excluded {
+        border-color: #dc2626;
+        color: #fecaca;
+    }
+
     .compare-path {
         font-size: 0.65rem;
         color: #6b7280;
@@ -771,6 +866,8 @@ else
     private int pageSize = 20;
     private string selectedType = "";
     private string thumbnailSize = "medium";
+    private bool showHighlights = true;
+    private HashSet<string> excludedPathSet = new(StringComparer.Ordinal);
     private Timer? _refreshTimer;
 
     private int TotalPages => historyResponse != null
@@ -858,6 +955,7 @@ else
         try
         {
             selectedDetail = await SearchService.GetSearchHistoryDetailAsync(searchId);
+            await LoadExclusionsForDetail();
             selectedResult = null;
             StateHasChanged();
             StartAutoRefreshIfNeeded();
@@ -872,6 +970,7 @@ else
     {
         selectedDetail = null;
         selectedResult = null;
+        excludedPathSet.Clear();
     }
 
     private void SelectResult(SearchHistoryDetailResult result)
@@ -1016,6 +1115,70 @@ else
     private void HandleImageError()
     {
         // Handle broken images
+    }
+
+    private async Task LoadExclusionsForDetail()
+    {
+        excludedPathSet.Clear();
+        if (selectedDetail == null || !selectedDetail.SearchType.Contains("DISK", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var exclusions = await SearchService.GetExclusionsAsync("DISK");
+        foreach (var entry in exclusions)
+        {
+            if (!string.IsNullOrWhiteSpace(entry.PathNormalized))
+                excludedPathSet.Add(entry.PathNormalized);
+        }
+    }
+
+    private static string NormalizePath(string path)
+    {
+        return (path ?? string.Empty).Replace("\\", "/").TrimEnd('/').ToLowerInvariant();
+    }
+
+    private bool IsExcludedPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+        return excludedPathSet.Contains(NormalizePath(path));
+    }
+
+    private async Task ToggleExcludeResult(SearchHistoryDetailResult result)
+    {
+        var normalized = NormalizePath(result.ImagePath);
+        var isExcluded = excludedPathSet.Contains(normalized);
+        bool ok;
+        if (isExcluded)
+        {
+            ok = await SearchService.RemoveExclusionAsync(result.ImagePath, "DISK");
+            if (ok)
+                excludedPathSet.Remove(normalized);
+        }
+        else
+        {
+            ok = await SearchService.AddExclusionAsync(result.ImagePath, "DISK", "Added from history result");
+            if (ok)
+                excludedPathSet.Add(normalized);
+        }
+        if (ok)
+            StateHasChanged();
+    }
+
+    private void ToggleHighlights()
+    {
+        showHighlights = !showHighlights;
+    }
+
+    private string GetHighlightStyle(SearchHistoryDetailResult result)
+    {
+        if (!result.HasHighlight)
+            return string.Empty;
+
+        var left = Math.Clamp(result.MatchX1!.Value * 100.0, 0, 100);
+        var top = Math.Clamp(result.MatchY1!.Value * 100.0, 0, 100);
+        var width = Math.Clamp((result.MatchX2!.Value - result.MatchX1!.Value) * 100.0, 0, 100);
+        var height = Math.Clamp((result.MatchY2!.Value - result.MatchY1!.Value) * 100.0, 0, 100);
+        return $"left:{left:F2}%;top:{top:F2}%;width:{width:F2}%;height:{height:F2}%;";
     }
 
     public void Dispose()

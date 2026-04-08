@@ -20,10 +20,10 @@ from datetime import datetime
 
 OPENSEARCH_HOST = "http://localhost:9200"
 
-# Use repo mounted in Docker
+# Windows OpenSearch (no Docker)
 REPO_NAME = "songsearch-repo"
-REPO_PATH = "/songsearch-snapshots"  # Maps to D:\opensearch-songsearch in Docker
-SOURCE_PATH = r"D:\opensearch-songsearch"  # Windows path to same location
+REPO_PATH = r"D:\opensearch-songsearch"  # Must match path.repo in opensearch.yml
+SOURCE_PATH = r"D:\opensearch-songsearch"
 
 # Snapshot configuration
 INDEX_NAME = "songsearch"

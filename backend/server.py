@@ -85,6 +85,10 @@ search_progress = {
 
 # Collections that use OpenSearch for face search
 OPENSEARCH_FACE_COLLECTIONS = {"books", "print_ads", "board_games"}
+DISK_FINAL_STORE_TOP_K = max(1, int(os.environ.get("DISK_FINAL_STORE_TOP_K", "1000")))
+DISK_HIGHLIGHT_SECOND_PASS = os.environ.get("DISK_HIGHLIGHT_SECOND_PASS", "1") != "0"
+DISK_HIGHLIGHT_TOP_N = max(1, int(os.environ.get("DISK_HIGHLIGHT_TOP_N", str(DISK_FINAL_STORE_TOP_K))))
+DISK_RERANK_DEFAULT = os.environ.get("DISK_RERANK_DEFAULT", "1") != "0"
 
 
 def get_opensearch_face_searcher():
@@ -418,7 +422,7 @@ async def clip_search_image(
     file: UploadFile = File(...),
     top_k: int = Query(default=50, ge=1, le=500),
     collection: str = Query(default="books", description="Collection to search (books, print_ads)"),
-    rerank: bool = Query(default=False, description="Apply ORB + Template matching re-ranking"),
+    rerank: bool = Query(default=False, description="Apply DISK keypoint + Template matching re-ranking"),
     retrieval_k: int = Query(default=20000, ge=100, le=50000, description="CLIP candidates to retrieve (when rerank=true)"),
     rerank_k: int = Query(default=1000, ge=100, le=5000, description="Candidates for template matching (when rerank=true)"),
     background_tasks: BackgroundTasks = None
@@ -429,7 +433,7 @@ async def clip_search_image(
     - **file**: Query image to search for
     - **top_k**: Number of results to return (1-500)
     - **collection**: Collection to search (books, print_ads)
-    - **rerank**: If true, apply ORB keypoint + Template matching re-ranking (slower but more accurate for crops)
+    - **rerank**: If true, apply DISK keypoint + Template matching re-ranking (slower but more accurate for crops)
     - **retrieval_k**: Number of CLIP candidates to retrieve for re-ranking
     - **rerank_k**: Number of candidates to run template matching on
     """
@@ -711,6 +715,7 @@ async def disk_search_image(
     top_k: int = Query(default=50, ge=1, le=500),
     k: int = Query(default=5, ge=1, le=20, description="Nearest neighbors per keypoint"),
     threshold: float = Query(default=0.7, ge=0.0, le=1.0, description="Minimum similarity for voting"),
+    rerank: bool = Query(default=DISK_RERANK_DEFAULT, description="Apply geometric reranking after DISK vote search"),
     live_tracking: bool = Query(default=True, description="Enable live progress tracking"),
     chunk_ids: str = Query(default=None, description="Comma-separated chunk IDs for testing (e.g. '141,142,143')"),
     collections: str = Query(default=None, description="Comma-separated collections to search (e.g. 'books,print_ads'). Default: all"),
@@ -728,21 +733,23 @@ async def disk_search_image(
     Other requests will wait in queue to prevent GPU/memory issues.
 
     - **file**: Query image (cropped image to find source of)
-    - **top_k**: Number of results to return (1-500)
+    - **top_k**: Number of results to display in the UI (1-500). Backend stores up to DISK_FINAL_STORE_TOP_K.
     - **k**: Nearest neighbors per keypoint for voting
     - **threshold**: Minimum similarity score to count as vote
+    - **rerank**: Apply geometric rerank using DISK keypoint localization on top candidates
     - **live_tracking**: Enable live progress updates (default: true)
     - **chunk_ids**: Comma-separated chunk IDs for testing (e.g. '141,142,143')
     - **collections**: Comma-separated collections to search (e.g. 'books,print_ads'). Default: all
     """
     try:
-        from disk_searcher import search_disk, get_total_chunks
+        from disk_searcher import search_disk, get_total_chunks, localize_disk_results, rerank_disk_results
         from db_helper import (
             create_search_session,
             update_search_progress,
             complete_search_session,
             fail_search_session,
-            add_search_note
+            add_search_note,
+            get_excluded_paths
         )
         from disk_queue import get_disk_queue
 
@@ -762,8 +769,11 @@ async def disk_search_image(
             specific_chunks = [int(x.strip()) for x in chunk_ids.split(',')]
 
         cat_label = ",".join(categories) if categories else "all"
-        logger.info(f"DISK search: {len(image_bytes)} bytes, top_k={top_k}, collections={cat_label}, live_tracking={live_tracking}" +
+        logger.info(f"DISK search: {len(image_bytes)} bytes, display_top_k={top_k}, store_top_k={DISK_FINAL_STORE_TOP_K}, collections={cat_label}, rerank={rerank}, live_tracking={live_tracking}" +
                     (f", chunks={specific_chunks}" if specific_chunks else ""))
+        excluded_paths = get_excluded_paths(search_type="DISK")
+        if excluded_paths:
+            logger.info(f"Applying {len(excluded_paths)} DISK exclusions")
 
         # Count total chunks for progress tracking
         if specific_chunks:
@@ -792,17 +802,24 @@ async def disk_search_image(
         def run_search(image_bytes, top_k, k, threshold, specific_chunks, progress_callback, check_stopped=None):
             run_start = time.time()
             try:
+                store_top_k = max(top_k, DISK_FINAL_STORE_TOP_K)
                 matches = search_disk(
                     image_bytes,
-                    top_k=top_k,
+                    top_k=store_top_k,
                     k=k,
                     threshold=threshold,
                     specific_chunks=specific_chunks,
                     categories=categories,
                     progress_callback=progress_callback,
                     check_stopped=check_stopped,
-                    search_id=search_id
+                    search_id=search_id,
+                    excluded_paths=excluded_paths
                 )
+                if (DISK_HIGHLIGHT_SECOND_PASS or rerank) and matches:
+                    localize_limit = min(store_top_k, DISK_HIGHLIGHT_TOP_N)
+                    localize_disk_results(image_bytes, matches, top_n=localize_limit)
+                if rerank and matches:
+                    matches = rerank_disk_results(matches)
                 if not (check_stopped and check_stopped()):
                     duration_ms = int((time.time() - run_start) * 1000)
                     # Keep progress writes small, but store the full final leaderboard.
@@ -812,7 +829,7 @@ async def disk_search_image(
                         total_chunks,
                         matches,
                         duration_ms,
-                        max_results=100
+                        max_results=store_top_k
                     )
                     complete_search_session(search_id, duration_ms)
                 return matches
@@ -865,6 +882,7 @@ async def resume_disk_search(
     top_k: int = Query(default=50, ge=1, le=500),
     k: int = Query(default=5, ge=1, le=20, description="Nearest neighbors per keypoint"),
     threshold: float = Query(default=0.7, ge=0.0, le=1.0, description="Minimum similarity for voting"),
+    rerank: bool = Query(default=DISK_RERANK_DEFAULT, description="Apply geometric rerank on resumed completion"),
     background_tasks: BackgroundTasks = None
 ):
     """
@@ -881,9 +899,10 @@ async def resume_disk_search(
             update_search_progress,
             complete_search_session,
             fail_search_session,
-            add_search_note
+            add_search_note,
+            get_excluded_paths
         )
-        from disk_searcher import search_disk, load_search_checkpoint, get_total_chunks
+        from disk_searcher import search_disk, load_search_checkpoint, get_total_chunks, localize_disk_results, rerank_disk_results
         from disk_queue import get_disk_queue
 
         source = get_search_details(source_search_id)
@@ -915,6 +934,9 @@ async def resume_disk_search(
         total_chunks = source.get("TotalChunks")
         if not total_chunks:
             total_chunks = get_total_chunks(categories)
+        excluded_paths = get_excluded_paths(search_type="DISK")
+        if excluded_paths:
+            logger.info(f"Applying {len(excluded_paths)} DISK exclusions")
 
         checkpoint = load_search_checkpoint(source_search_id)
         initial_votes = {}
@@ -956,9 +978,10 @@ async def resume_disk_search(
         def run_search(image_bytes, top_k, k, threshold, specific_chunks, progress_callback, check_stopped=None):
             run_start = time.time()
             try:
+                store_top_k = max(top_k, DISK_FINAL_STORE_TOP_K)
                 matches = search_disk(
                     image_bytes,
-                    top_k=top_k,
+                    top_k=store_top_k,
                     k=k,
                     threshold=threshold,
                     specific_chunks=None,
@@ -967,8 +990,14 @@ async def resume_disk_search(
                     check_stopped=check_stopped,
                     search_id=new_search_id,
                     start_chunk=resume_from,
-                    initial_votes=initial_votes
+                    initial_votes=initial_votes,
+                    excluded_paths=excluded_paths
                 )
+                if (DISK_HIGHLIGHT_SECOND_PASS or rerank) and matches:
+                    localize_limit = min(store_top_k, DISK_HIGHLIGHT_TOP_N)
+                    localize_disk_results(image_bytes, matches, top_n=localize_limit)
+                if rerank and matches:
+                    matches = rerank_disk_results(matches)
                 if not (check_stopped and check_stopped()):
                     duration_ms = int((time.time() - run_start) * 1000)
                     update_search_progress(
@@ -977,7 +1006,7 @@ async def resume_disk_search(
                         total_chunks,
                         matches,
                         duration_ms,
-                        max_results=100
+                        max_results=store_top_k
                     )
                     complete_search_session(new_search_id, duration_ms)
                 return matches
@@ -1209,6 +1238,12 @@ class SearchHistoryDetailResult(BaseModel):
     KeypointMatches: Optional[int] = None
     TemplateScore: Optional[float] = None
     CombinedScore: Optional[float] = None
+    MatchX1: Optional[float] = None
+    MatchY1: Optional[float] = None
+    MatchX2: Optional[float] = None
+    MatchY2: Optional[float] = None
+    MatchInliers: Optional[int] = None
+    MatchTotal: Optional[int] = None
 
 
 class SearchHistoryDetail(BaseModel):
@@ -1230,6 +1265,21 @@ class SearchHistoryDetail(BaseModel):
 class SaveSearchResponse(BaseModel):
     id: int
     message: str
+
+
+class ExclusionEntry(BaseModel):
+    Id: int
+    Path: str
+    PathNormalized: str
+    SearchType: str
+    Reason: Optional[str] = None
+    CreatedDate: str
+
+
+class ExclusionRequest(BaseModel):
+    path: str
+    search_type: str = "DISK"
+    reason: Optional[str] = None
 
 
 @app.get("/history", response_model=SearchHistoryListResponse)
@@ -1432,6 +1482,57 @@ def update_history_note(search_id: int, note: str = Query(...)):
         raise
     except Exception as e:
         logger.error(f"Failed to update note: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/exclusions", response_model=List[ExclusionEntry])
+def list_exclusions(search_type: str = Query(default="DISK")):
+    """List excluded paths for a search type."""
+    try:
+        from db_helper import get_excluded_results
+        entries = get_excluded_results(search_type=search_type)
+        return [ExclusionEntry(**e) for e in entries]
+    except Exception as e:
+        logger.error(f"Failed to list exclusions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/exclusions")
+def add_exclusion(request: ExclusionRequest):
+    """Add a path to exclusion list."""
+    try:
+        from db_helper import add_excluded_result
+        ok = add_excluded_result(
+            path=request.path,
+            search_type=request.search_type,
+            reason=request.reason
+        )
+        if not ok:
+            raise HTTPException(status_code=400, detail="Invalid path")
+        return {"message": "Excluded"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to add exclusion: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/exclusions")
+def remove_exclusion(
+    path: str = Query(...),
+    search_type: str = Query(default="DISK")
+):
+    """Remove path from exclusion list."""
+    try:
+        from db_helper import remove_excluded_result
+        removed = remove_excluded_result(path=path, search_type=search_type)
+        if removed:
+            return {"message": "Removed"}
+        raise HTTPException(status_code=404, detail="Not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to remove exclusion: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

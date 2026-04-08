@@ -1,5 +1,5 @@
 @echo off
-title Building Albums DISK Chunks
+title Building Cereal DISK Chunks
 setlocal EnableDelayedExpansion
 
 set "CUDA_POISON_EXIT_CODE=86"
@@ -10,26 +10,26 @@ set "DISK_MAX_IMAGE_DIM=2048"
 set /a RESTART_COUNT=0
 
 echo ============================================
-echo  Albums DISK Chunk Builder
-echo  Mode A: C:\albums exists -> process local directly
+echo  Cereal DISK Chunk Builder
+echo  Mode A: C:\cereal exists -> process local directly
 echo  Mode B: otherwise NAS -> Local Buffer -> GPU -> Chunks
-echo  Chunks:  U:\faiss\disk_retrieval\albums_chunks\
-echo  IDs:     D:\faiss\disk_retrieval\albums_chunk_ids\
+echo  Chunks:  T:\faiss\disk_retrieval\cereal_chunks\
+echo  IDs:     D:\faiss\disk_retrieval\cereal_chunk_ids\
 echo  Resumable - safe to stop and restart
 echo ============================================
 echo.
-echo Local source: C:\albums (if present)
-echo NAS source:   T:\archiverelated\albums (fallback mode)
-echo Buffer: C:\albums_buffer (20 GB/batch, up to 100 GB buffered)
+echo Local source: C:\cereal (if present)
+echo NAS source:   T:\archiverelated\cereal (fallback mode)
+echo Buffer: C:\cereal_buffer (20 GB/batch, up to 100 GB buffered)
 echo Resize mode: images over %DISK_MAX_IMAGE_DIM% px are downscaled (aspect ratio preserved)
-echo Paths stored as: T:\archiverelated\albums
+echo Paths stored as: T:\archiverelated\cereal
 echo Chunk cap: %DISK_MAX_VECTORS_PER_CHUNK% vectors (~10 GB FAISS payload)
 echo.
 cd /d "%~dp0"
 set "DISK_CUDA_POISON_EXIT_CODE=%CUDA_POISON_EXIT_CODE%"
 
 :run_build
-python -u build_albums_disk_chunks.py
+python -u build_cereal_disk_chunks.py
 set "EXITCODE=%ERRORLEVEL%"
 
 if "!EXITCODE!"=="%CUDA_POISON_EXIT_CODE%" (

@@ -130,8 +130,11 @@ def main():
     print()
     print("  Step 2: Building new path_lookup.json...")
 
-    id_to_path = [''] * len(path_to_id)
+    max_pid = max(path_to_id.values(), default=-1)
+    id_to_path = [''] * (max_pid + 1)
     for path, pid in path_to_id.items():
+        if pid < 0:
+            raise ValueError(f"Negative path id for {path}: {pid}")
         id_to_path[pid] = path
 
     with open(lookup_file, 'w') as f:

@@ -20,11 +20,17 @@ import logging
 # Set up path so we can import from the backend
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from disk_searcher import search_disk_batch, get_total_chunks
+from disk_searcher import (
+    search_disk_batch,
+    get_total_chunks,
+    localize_disk_results,
+    rerank_disk_results
+)
 from db_helper import (
     create_search_session,
     update_search_progress_batch,
-    complete_search_session
+    complete_search_session,
+    get_excluded_paths
 )
 
 LOG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,7 +68,10 @@ def main():
     parser.add_argument("--k", type=int, default=5, help="Nearest neighbors per keypoint (default: 5)")
     parser.add_argument("--threshold", type=float, default=0.7, help="Minimum similarity (default: 0.7)")
     parser.add_argument("--collections", type=str, default=None, help="Comma-separated collections (default: all)")
+    parser.add_argument("--no-rerank", action="store_true", help="Disable geometric reranking secondary pass")
+    parser.add_argument("--rerank_top_n", type=int, default=1000, help="Top candidates per image to localize/rerank (default: 1000)")
     args = parser.parse_args()
+    rerank_enabled = not args.no_rerank
 
     directory = args.directory
     if not os.path.isdir(directory):
@@ -94,13 +103,14 @@ def main():
     print(f"  Images:       {len(image_paths)}")
     print(f"  Collections:  {cat_label}")
     print(f"  Total chunks: {total_chunks:,}")
-    print(f"  Parameters:   top_k={args.top_k}, k={args.k}, threshold={args.threshold}")
+    print(f"  Parameters:   top_k={args.top_k}, k={args.k}, threshold={args.threshold}, rerank={rerank_enabled}")
     print("=" * 70)
     print()
 
     # Read all images and create search sessions
     print("Reading images and creating search sessions...")
     image_list = []       # [(image_bytes, image_name), ...]
+    image_bytes_by_name = {}
     search_ids = {}       # {image_name: search_id}
 
     for i, image_path in enumerate(image_paths):
@@ -109,6 +119,7 @@ def main():
             image_bytes = f.read()
 
         image_list.append((image_bytes, image_name))
+        image_bytes_by_name[image_name] = image_bytes
 
         # Create search session in DB
         search_id = create_search_session(
@@ -185,6 +196,9 @@ def main():
 
     # Run batch search
     print("Searching...")
+    excluded_paths = get_excluded_paths(search_type="DISK")
+    if excluded_paths:
+        print(f"Applying {len(excluded_paths)} DISK exclusions...")
     results = search_disk_batch(
         image_list,
         top_k=args.top_k,
@@ -192,9 +206,21 @@ def main():
         threshold=args.threshold,
         categories=categories,
         progress_callback=progress_callback,
-        check_stopped=check_stopped
+        check_stopped=check_stopped,
+        excluded_paths=excluded_paths
     )
     print()  # Newline after progress
+
+    if rerank_enabled:
+        print("Applying geometric rerank...")
+        for idx, (image_name, image_results) in enumerate(results.items(), 1):
+            query_bytes = image_bytes_by_name.get(image_name)
+            if not query_bytes or not image_results:
+                continue
+            localize_limit = min(args.rerank_top_n, len(image_results))
+            localize_disk_results(query_bytes, image_results, top_n=localize_limit)
+            results[image_name] = rerank_disk_results(image_results)
+            print(f"  [{idx}/{len(results)}] {image_name}: reranked {len(image_results)} results")
 
     # Complete all search sessions
     duration_ms = int((time.time() - start_time) * 1000)

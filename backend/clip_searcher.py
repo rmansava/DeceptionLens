@@ -42,7 +42,8 @@ class ClipSearcher:
         index_path: str = "D:/faiss/books/index.faiss",
         paths_path: str = "D:/faiss/books/paths.json",
         model_name: str = "ViT-L/14",
-        use_mmap: bool = False
+        use_mmap: bool = False,
+        collection: str = "books"
     ):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"CLIP Searcher using device: {self.device}")
@@ -51,6 +52,7 @@ class ClipSearcher:
         self.paths_path = paths_path
         self.model_name = model_name
         self.use_mmap = use_mmap
+        self.collection = collection
 
         # Lazy load - don't load until first search
         self.model = None
@@ -206,11 +208,11 @@ class ClipSearcher:
         verbose: bool = True
     ) -> list:
         """
-        Search using CLIP + ORB keypoints + Template matching re-ranking.
+        Search using CLIP + DISK keypoints + Template matching re-ranking.
 
         Pipeline:
         1. CLIP semantic search -> get retrieval_k candidates
-        2. ORB keypoint filtering -> filter blanks, sort by matches
+        2. DISK keypoint filtering -> filter blanks, sort by matches
         3. Template matching on top rerank_k -> precise ranking
         4. Combined scoring -> final ranking
 
@@ -242,6 +244,7 @@ class ClipSearcher:
         reranked = rerank_with_orb_and_template(
             query_image_path=image_path,
             results=results,
+            collection=self.collection,
             top_for_template=rerank_k,
             verbose=verbose
         )
@@ -310,7 +313,8 @@ def get_clip_searcher(collection: str = "books") -> ClipSearcher:
     paths = COLLECTION_PATHS[collection]
     return ClipSearcher(
         index_path=paths["index"],
-        paths_path=paths["paths"]
+        paths_path=paths["paths"],
+        collection=collection
     )
 
 

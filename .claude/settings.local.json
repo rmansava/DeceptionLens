@@ -24,7 +24,12 @@
       "Bash(cmd /c:*)",
       "Bash(nvidia-smi:*)",
       "Bash(tasklist:*)",
-      "Bash(powershell -NoProfile -Command:*)"
+      "Bash(powershell -NoProfile -Command:*)",
+      "Bash(find:*)",
+      "Bash(git commit:*)",
+      "Bash(findstr:*)",
+      "Bash(python3:*)",
+      "Bash(.venv/Scripts/python.exe:*)"
     ]
   }
 }

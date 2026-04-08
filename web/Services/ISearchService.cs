@@ -31,4 +31,9 @@ public interface ISearchService
     Task<SaveSearchResponse?> SaveSearchHistoryAsync(Stream? imageStream, string? fileName, string searchType, string? queryText, List<SearchResult> results, int? durationMs, string? collection);
     Task<bool> DeleteSearchHistoryAsync(int searchId);
     Task<bool> StopSearchAsync(int searchId);
+
+    // Exclusion list methods (for filtering future DISK results)
+    Task<List<ExclusionEntry>> GetExclusionsAsync(string searchType = "DISK");
+    Task<bool> AddExclusionAsync(string path, string searchType = "DISK", string? reason = null);
+    Task<bool> RemoveExclusionAsync(string path, string searchType = "DISK");
 }

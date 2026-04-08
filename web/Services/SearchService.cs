@@ -149,8 +149,8 @@ public class SearchService : ISearchService
             }
             else
             {
-                url = $"/clip/search?top_k={topK}&collection={Uri.EscapeDataString(collection)}";
-                _logger.LogInformation("CLIP image search: {FileName}, topK: {TopK}, collection: {Collection}", fileName, topK, collection);
+                url = $"/clip/search?top_k={topK}&collection={Uri.EscapeDataString(collection)}&rerank=true";
+                _logger.LogInformation("CLIP image search (rerank): {FileName}, topK: {TopK}, collection: {Collection}", fileName, topK, collection);
             }
 
             var response = await _httpClient.PostAsync(url, content);
@@ -237,7 +237,7 @@ public class SearchService : ISearchService
             streamContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
             content.Add(streamContent, "file", fileName);
 
-            var url = $"/disk/search?top_k={topK}";
+            var url = $"/disk/search?top_k={topK}&rerank=true";
             if (!string.IsNullOrWhiteSpace(collection) && !string.Equals(collection, "all", StringComparison.OrdinalIgnoreCase))
             {
                 url += $"&collections={Uri.EscapeDataString(collection)}";
@@ -270,7 +270,7 @@ public class SearchService : ISearchService
         try
         {
             var thresholdText = threshold.ToString(CultureInfo.InvariantCulture);
-            var url = $"/disk/resume/{sourceSearchId}?top_k={topK}&k={k}&threshold={Uri.EscapeDataString(thresholdText)}";
+            var url = $"/disk/resume/{sourceSearchId}?top_k={topK}&k={k}&threshold={Uri.EscapeDataString(thresholdText)}&rerank=true";
 
             _logger.LogInformation(
                 "Resuming DISK search from source {SourceSearchId}, topK: {TopK}, k: {K}, threshold: {Threshold}",
@@ -441,6 +441,64 @@ public class SearchService : ISearchService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to stop search {SearchId}", searchId);
+            return false;
+        }
+    }
+
+    public async Task<List<ExclusionEntry>> GetExclusionsAsync(string searchType = "DISK")
+    {
+        try
+        {
+            var url = $"/exclusions?search_type={Uri.EscapeDataString(searchType)}";
+            var response = await _httpClient.GetAsync(url);
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<List<ExclusionEntry>>(json) ?? new List<ExclusionEntry>();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to load exclusions");
+            return new List<ExclusionEntry>();
+        }
+    }
+
+    public async Task<bool> AddExclusionAsync(string path, string searchType = "DISK", string? reason = null)
+    {
+        try
+        {
+            var payload = new
+            {
+                path,
+                search_type = searchType,
+                reason
+            };
+            var content = new StringContent(
+                JsonSerializer.Serialize(payload),
+                System.Text.Encoding.UTF8,
+                "application/json"
+            );
+            var response = await _httpClient.PostAsync("/exclusions", content);
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to add exclusion for path {Path}", path);
+            return false;
+        }
+    }
+
+    public async Task<bool> RemoveExclusionAsync(string path, string searchType = "DISK")
+    {
+        try
+        {
+            var url = $"/exclusions?path={Uri.EscapeDataString(path)}&search_type={Uri.EscapeDataString(searchType)}";
+            var response = await _httpClient.DeleteAsync(url);
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to remove exclusion for path {Path}", path);
             return false;
         }
     }

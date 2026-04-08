@@ -1,17 +1,22 @@
 r"""
 Build DISK keypoint chunks for print ads - direct to chunks with compact IDs.
 
-Unlike books (which go through per-book shards then consolidation), print ads
-are individual images with no natural grouping. This script goes straight from
-images to search-ready chunks:
+Pipelined: copies batches of folders from NAS to local buffer, processes on GPU,
+deletes processed files. Keeps up to 5 batches buffered so GPU rarely waits for NAS I/O.
+Within each batch, a prefetch queue loads/preprocesses images on CPU threads so
+the GPU never waits for disk reads either.
 
-  1. List all images across all subfolders
-  2. Process in batches of IMAGES_PER_CHUNK (~5000)
-  3. Each batch: extract DISK features -> build FAISS index -> save chunk + compact IDs
-  4. Compact IDs from the start (no paths.json bloat)
+  1. List all subfolders on NAS
+  2. Copy batch of folders to local SSD buffer (sized by GB, not folder count)
+  3. Extract DISK features per image on GPU (prefetched by background threads)
+  4. Delete processed local files, copy next batch
+  5. Flush to chunk when hitting ~10 GB (19.5M vectors)
 
-Input:  Local copy of print ads (fast reads from SSD)
-Output: chunk_XXX.faiss  -> NAS (T:/faiss/disk_retrieval/printads_chunks/)
+Progress tracked per-image (via path_to_id). Adding new images to existing
+folders will be picked up on re-run.
+
+Input:  NAS print ads (T:/archiverelated/print ads)
+Output: chunk_XXX.faiss  -> NAS (S:/faiss/disk_retrieval/printads_chunks/)
         chunk_XXX_ids.npy -> local SSD (D:/faiss/disk_retrieval/printads_chunk_ids/)
         path_lookup.json  -> local SSD (same dir as IDs)
 
@@ -25,13 +30,17 @@ import gc
 import json
 import time
 import shutil
+import subprocess
+import traceback
 import numpy as np
 import faiss
 import torch
 import cv2
-from glob import glob
-from datetime import datetime
-from threading import Thread, Event
+import queue
+from collections import Counter
+from datetime import datetime, timedelta
+from threading import Thread, Lock, Event
+from collections import deque
 from disk_chunk_db import sync_chunk_to_db, sync_paths_to_db, create_tables
 
 try:
@@ -43,112 +52,646 @@ except ImportError:
 
 
 # ============================================================================
-# CONFIG - Edit these paths as needed
+# CONFIG
 # ============================================================================
 
-# Source: local copy of print ads for fast reading (scans all subfolders)
-LOCAL_IMAGES_DIR = r"C:\printads"
+# Source: NAS (read from here in batches)
+NAS_SOURCE_DIR = r"T:\archiverelated\print ads"
 
-# Path remapping: stored paths point to NAS originals
+# Local source candidates (if present, process directly without NAS staging)
+LOCAL_SOURCE_CANDIDATES = (
+    r"C:\printads",
+    r"C:\print ads",
+)
+
+# Local buffer: copy batches here for fast GPU reads
+LOCAL_BUFFER_DIR = r"C:\printads_buffer"
+
+# Path prefix stored in path_lookup (matches NAS source)
 NAS_IMAGES_DIR = r"T:\archiverelated\print ads"
 
-# Output: FAISS chunks go to NAS (searched via rolling buffer copy)
+# Output: FAISS chunks go to NAS
 NAS_CHUNKS_DIR = r"S:\faiss\disk_retrieval\printads_chunks"
-LOCAL_CHUNKS_BUFFER = r"D:\faiss\disk_retrieval\printads_chunks"  # Write here first, then copy to NAS
+LOCAL_CHUNKS_BUFFER = r"D:\faiss\disk_retrieval\printads_chunks"
 
-# Output: Compact IDs stay on local SSD (fast reads during search)
+# Output: Compact IDs stay on local SSD
 CHUNK_IDS_DIR = r"D:\faiss\disk_retrieval\printads_chunk_ids"
 
 # Progress tracking
 PROGRESS_DIR = CHUNK_IDS_DIR
 PROGRESS_FILE = os.path.join(PROGRESS_DIR, "build_progress.json")
 LOG_FILE = os.path.join(PROGRESS_DIR, "build_log.txt")
+CUDA_BAD_IMAGES_FILE = os.path.join(PROGRESS_DIR, "cuda_bad_images.txt")
+PREPROCESS_BAD_IMAGES_FILE = os.path.join(PROGRESS_DIR, "preprocess_bad_images.txt")
+BUFFER_MANIFEST_FILE = os.path.join(PROGRESS_DIR, "buffer_manifest.json")
 
-# Chunk sizing: target ~10GB per chunk for GPU FAISS (fits in 16GB VRAM with headroom)
-# 10GB = ~19.5M vectors at 128 dims * 4 bytes = 512 bytes/vector
-MAX_VECTORS_PER_CHUNK = 19_500_000  # ~10 GB
+# Chunk sizing
+MAX_VECTORS_PER_CHUNK = int(os.environ.get("DISK_MAX_VECTORS_PER_CHUNK", "19500000"))  # ~10 GB
 
 # Collection name for DB sync
 COLLECTION_NAME = "print_ads"
 
+# Buffer settings - sized by total file size, not folder count
+BATCH_SIZE_GB = 20          # Copy ~20 GB of folders per batch
+MAX_BUFFERED_BATCHES = 5    # Keep up to 5 batches on local SSD (~100 GB max)
+COPY_THREADS = max(1, int(os.environ.get("DISK_COPY_THREADS", "32")))
+CLEAN_BUFFER_ON_START = os.environ.get("DISK_CLEAN_BUFFER_ON_START", "0") == "1"
+
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'}
+
 # DISK extraction settings
-MAX_IMAGE_DIM = 4096  # Cap large scans (2.5x old 1600, prevents GPU hangs on huge images)
-GPU_BATCH_SIZE = 1    # Images per GPU batch (1 is safest for varied sizes)
+_max_dim_raw = os.environ.get("DISK_MAX_IMAGE_DIM", "4096").strip().lower()
+if _max_dim_raw in ("0", "none", ""):
+    MAX_IMAGE_DIM = None
+else:
+    MAX_IMAGE_DIM = int(_max_dim_raw)
+GPU_BATCH_SIZE = 1
+
+# Prefetch pipeline: load/preprocess images on CPU threads while GPU works
+PREFETCH_WORKERS = 4   # Background threads for image loading
+PREFETCH_QUEUE_SIZE = 16  # Max preprocessed tensors held in memory
+PROGRESS_HEARTBEAT_SEC = 120  # Periodic heartbeat log cadence
+CUDA_ERROR_STREAK_FOR_RECOVERY = max(5, int(os.environ.get("DISK_CUDA_ERROR_STREAK_FOR_RECOVERY", "32")))
+CUDA_MAX_RECOVERY_ATTEMPTS = max(0, int(os.environ.get("DISK_CUDA_MAX_RECOVERY_ATTEMPTS", "1")))
+CUDA_POISON_EXIT_CODE = int(os.environ.get("DISK_CUDA_POISON_EXIT_CODE", "86"))
+PATH_DB_SYNC_EVERY_CHUNKS = max(1, int(os.environ.get("DISK_PATH_DB_SYNC_EVERY_CHUNKS", "5")))
+SKIP_IF_MAX_DIM_OVER = max(0, int(os.environ.get("DISK_SKIP_IF_MAX_DIM_OVER", "0")))
+SKIPPED_LARGE_FILE = (
+    os.path.join(CHUNK_IDS_DIR, f"skipped_over_{SKIP_IF_MAX_DIM_OVER}.txt")
+    if SKIP_IF_MAX_DIM_OVER > 0 else None
+)
 
 # ============================================================================
+
+
+_console_lock = Lock()
+_progress_line_len = 0
+
+
+class CudaPoisonedError(RuntimeError):
+    """Raised when CUDA context is poisoned and the process should restart."""
+
+
+def _clear_progress_line_locked():
+    """Clear one-line in-place status output (call under _console_lock)."""
+    global _progress_line_len
+    if _progress_line_len > 0:
+        print('\r' + (' ' * _progress_line_len) + '\r', end='', flush=True)
+        _progress_line_len = 0
+
+
+def update_progress_line(message: str):
+    """Update a stable one-line status display."""
+    global _progress_line_len
+    with _console_lock:
+        padded = message
+        if len(padded) < _progress_line_len:
+            padded += ' ' * (_progress_line_len - len(padded))
+        print('\r' + padded, end='', flush=True)
+        _progress_line_len = max(_progress_line_len, len(message))
+
+
+def format_progress_line(folder_idx: int, folder_total: int, image_idx: int, image_total: int,
+                         chunk_num: int, chunk_vectors: int, chunk_images: int,
+                         keypoints_found: int, status_label: str, image_name: str) -> str:
+    """Compose single-line per-image status for console visibility."""
+    chunk_gb = (chunk_vectors * 512) / (1024 ** 3)
+    return (
+        f"Folder {folder_idx:,}/{folder_total:,} | image {image_idx:,}/{image_total:,} "
+        f"| chunk {chunk_num:03d} | chunk_img {chunk_images:,} "
+        f"| vec {chunk_vectors:,} ({chunk_gb:0.2f}GB) "
+        f"| kp {keypoints_found:,} | {status_label} | {image_name}"
+    )
+
+
+def format_eta(seconds: float) -> str:
+    """Human-readable ETA string in days/hours/minutes."""
+    if not np.isfinite(seconds) or seconds <= 0:
+        return "unknown"
+    secs = int(round(seconds))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def copy_folder_robocopy(src: str, dst: str) -> tuple[bool, str]:
+    """
+    Copy src -> dst using robocopy multithreaded engine.
+    Returns (ok, message). Robocopy exit codes < 8 are success states.
+    """
+    os.makedirs(dst, exist_ok=True)
+    cmd = [
+        "robocopy",
+        src,
+        dst,
+        "/E",
+        "/R:2",
+        "/W:1",
+        f"/MT:{COPY_THREADS}",
+        "/NP",
+        "/NFL",
+        "/NDL",
+        "/NJH",
+        "/NJS",
+        "/NC",
+        "/NS",
+    ]
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode < 8:
+        return True, ""
+
+    tail = ""
+    if proc.stdout:
+        lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+        tail = " | ".join(lines[-3:])
+    if not tail:
+        tail = f"robocopy exit {proc.returncode}"
+    return False, tail
 
 
 def log(msg):
     """Print and log to file."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line, flush=True)
+    with _console_lock:
+        _clear_progress_line_locked()
+        print(line, flush=True)
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(line + '\n')
 
 
-def remap_path(local_path):
-    """Convert local read path to NAS storage path."""
-    # Replace local prefix with NAS prefix
-    if local_path.startswith(LOCAL_IMAGES_DIR):
-        return NAS_IMAGES_DIR + local_path[len(LOCAL_IMAGES_DIR):]
-    # Try with normalized separators
-    local_norm = local_path.replace('\\', '/')
-    local_dir_norm = LOCAL_IMAGES_DIR.replace('\\', '/')
-    if local_norm.startswith(local_dir_norm):
-        return NAS_IMAGES_DIR + local_norm[len(local_dir_norm):]
-    return local_path
+def is_cuda_runtime_error(exc: Exception) -> bool:
+    """Detect CUDA runtime failures that can poison the context."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    msg = str(exc).lower()
+    return ("cuda error" in msg) or ("cudnn" in msg) or ("illegal memory access" in msg)
 
 
-def find_all_images():
-    """Find all images across all subfolders."""
-    extensions = ('*.jpg', '*.jpeg', '*.png', '*.webp', '*.gif', '*.bmp')
-    files = set()
-    for ext in extensions:
-        for f in glob(os.path.join(LOCAL_IMAGES_DIR, '**', ext), recursive=True):
-            files.add(os.path.normpath(f))
-        for f in glob(os.path.join(LOCAL_IMAGES_DIR, '**', ext.upper()), recursive=True):
-            files.add(os.path.normpath(f))
+def reload_disk_model(device):
+    """Best-effort CUDA recovery by rebuilding DISK model."""
+    if device.type == 'cuda':
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    gc.collect()
+    model = KF.DISK.from_pretrained('depth').to(device).eval()
+    return model
+
+
+def get_local_source_dir():
+    """Return local source directory if one exists, else None."""
+    for candidate in LOCAL_SOURCE_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def normalize_to_nas_path(path, local_source_dir=None):
+    """Normalize local/buffered paths to canonical NAS paths."""
+    p = os.path.normpath(path)
+    nas_base = os.path.normpath(NAS_IMAGES_DIR)
+
+    def remap_prefix(old_root, new_root):
+        old = os.path.normpath(old_root)
+        new = os.path.normpath(new_root)
+        p_cmp = os.path.normcase(p)
+        old_cmp = os.path.normcase(old)
+        if p_cmp == old_cmp:
+            return new
+        if p_cmp.startswith(old_cmp + os.sep):
+            return new + p[len(old):]
+        return None
+
+    remapped = remap_prefix(NAS_IMAGES_DIR + "_buffer", nas_base)
+    if remapped is not None:
+        return remapped
+
+    candidates = []
+    if local_source_dir:
+        candidates.append(os.path.normpath(local_source_dir))
+    candidates.extend(os.path.normpath(candidate) for candidate in LOCAL_SOURCE_CANDIDATES)
+
+    seen = set()
+    for local_root in candidates:
+        key = local_root.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        remapped = remap_prefix(local_root, nas_base)
+        if remapped is not None:
+            return remapped
+
+    buffer_norm = os.path.normpath(LOCAL_BUFFER_DIR)
+    remapped = remap_prefix(buffer_norm, nas_base)
+    if remapped is not None:
+        return remapped
+
+    return p
+
+
+def make_nas_path(local_path, local_source_dir=None):
+    """Convert local buffer path to NAS storage path."""
+    return normalize_to_nas_path(local_path, local_source_dir=local_source_dir)
+
+
+def find_images_recursive(directory):
+    """Find all images recursively in a directory."""
+    files = []
+    for root, dirs, filenames in os.walk(directory):
+        for f in filenames:
+            if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
+                files.append(os.path.join(root, f))
     return sorted(files)
 
 
+def collect_source_units(source_dir):
+    """
+    Collect copy/process units from source.
+
+    For print ads we prefer second-level units (e.g. ebay/Subfolder0) so staging
+    does not copy an entire giant top-level folder in one shot.
+    """
+    units = []
+    top_level = sorted(
+        d for d in os.listdir(source_dir)
+        if os.path.isdir(os.path.join(source_dir, d))
+    )
+
+    for top in top_level:
+        top_path = os.path.join(source_dir, top)
+        second_level = sorted(
+            d for d in os.listdir(top_path)
+            if os.path.isdir(os.path.join(top_path, d))
+        )
+        if second_level:
+            for child in second_level:
+                units.append(f"{top}/{child}")
+        else:
+            units.append(top)
+
+    return units
+
+
+def count_images_in_source(folder_name, source_dir):
+    """Count image files in a source folder (recursive)."""
+    count = 0
+    folder_path = os.path.join(source_dir, folder_name)
+    try:
+        for root, dirs, files in os.walk(folder_path):
+            for f in files:
+                if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
+                    count += 1
+    except Exception:
+        pass
+    return count
+
+
+def get_folder_size_bytes(folder_path):
+    """Get total size of a folder in bytes."""
+    total = 0
+    try:
+        for root, dirs, files in os.walk(folder_path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total
+
+
+class FolderBuffer:
+    """Manages pipelined copying of folders from NAS to local SSD, sized by GB."""
+
+    def __init__(self, all_folders, source_dir=NAS_SOURCE_DIR, manifest_state=None):
+        self.source_dir = source_dir
+        self.pending = deque()
+        self.ready = deque()        # (folder_name, size_bytes) copied and ready
+        self.processing = {}        # folder_name -> size_bytes (0 while copy is in-flight)
+        self.lock = Lock()
+        self.stop = Event()
+        self.thread = None
+        self.copied_count = 0
+        self.copied_bytes = 0
+        self.ready_bytes = 0
+        self.processing_bytes = 0
+        self.errors = []
+        self.copying_folder = None
+        self.copying_started = 0.0
+        self.copying_target = 0
+        self._restore_or_seed(all_folders, manifest_state)
+
+    def start(self):
+        self.thread = Thread(target=self._copy_worker, daemon=True)
+        self.thread.start()
+
+    def stop_copying(self):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=10)
+
+    def _restore_or_seed(self, all_folders, manifest_state):
+        restored = False
+        if manifest_state and manifest_has_work(manifest_state):
+            restored = self._restore_from_manifest(manifest_state)
+        if not restored:
+            self.pending = deque(all_folders)
+            self._persist_manifest_locked()
+
+    def _restore_from_manifest(self, manifest_state):
+        seen = set()
+
+        def restore_ready(folder):
+            if folder in seen:
+                return
+            local_dir = os.path.join(LOCAL_BUFFER_DIR, folder)
+            if os.path.isdir(local_dir):
+                folder_bytes = get_folder_size_bytes(local_dir)
+                if folder_bytes > 0:
+                    self.ready.append((folder, folder_bytes))
+                    self.ready_bytes += folder_bytes
+                    self.copied_count += 1
+                    self.copied_bytes += folder_bytes
+                    seen.add(folder)
+                    return
+            self.pending.append(folder)
+            seen.add(folder)
+
+        for folder in manifest_state.get('pending_units', []):
+            if folder not in seen:
+                self.pending.append(folder)
+                seen.add(folder)
+
+        for entry in manifest_state.get('ready_units', []):
+            folder = entry.get('folder')
+            if folder:
+                restore_ready(folder)
+
+        for entry in manifest_state.get('processing_units', []):
+            folder = entry.get('folder')
+            if folder:
+                restore_ready(folder)
+
+        self._persist_manifest_locked()
+        return bool(self.pending or self.ready or self.processing)
+
+    def _persist_manifest_locked(self):
+        save_buffer_manifest({
+            'source_dir': self.source_dir,
+            'pending_units': list(self.pending),
+            'ready_units': [
+                {'folder': folder, 'size_bytes': int(size)}
+                for folder, size in self.ready
+            ],
+            'processing_units': [
+                {'folder': folder, 'size_bytes': int(size)}
+                for folder, size in self.processing.items()
+            ],
+        })
+
+    def _set_copying(self, folder, target_bytes):
+        with self.lock:
+            self.copying_folder = folder
+            self.copying_started = time.time()
+            self.copying_target = max(0, int(target_bytes))
+
+    def _clear_copying(self):
+        with self.lock:
+            self.copying_folder = None
+            self.copying_started = 0.0
+            self.copying_target = 0
+
+    def _copy_worker(self):
+        """Background thread: copy folders from NAS to local buffer."""
+        batch_size_bytes = int(BATCH_SIZE_GB * 1024**3)
+        while not self.stop.is_set():
+            with self.lock:
+                buffered = self.ready_bytes + self.processing_bytes
+                need_more = buffered < MAX_BUFFERED_BATCHES * batch_size_bytes
+
+            if not need_more:
+                time.sleep(0.5)
+                continue
+
+            if not self.pending:
+                time.sleep(1)
+                with self.lock:
+                    if not self.pending:
+                        break
+                continue
+
+            # Copy folders until we hit the batch size target
+            batch_bytes = 0
+            while batch_bytes < batch_size_bytes:
+                with self.lock:
+                    if not self.pending:
+                        break
+                    folder = self.pending.popleft()
+                    self.processing[folder] = 0
+                    self._persist_manifest_locked()
+
+                if self.stop.is_set():
+                    break
+
+                src = os.path.join(self.source_dir, folder)
+                dst = os.path.join(LOCAL_BUFFER_DIR, folder)
+                self._set_copying(folder, 0)
+                copy_start = time.time()
+                log(f"  Staging unit: {folder}")
+
+                try:
+                    ok, copy_msg = copy_folder_robocopy(src, dst)
+                    if not ok:
+                        raise RuntimeError(copy_msg)
+                    folder_bytes = get_folder_size_bytes(dst)
+                    if folder_bytes <= 0:
+                        raise RuntimeError("copied folder is empty")
+                    batch_bytes += folder_bytes
+                    with self.lock:
+                        self.processing.pop(folder, None)
+                        self.ready.append((folder, folder_bytes))
+                        self.ready_bytes += folder_bytes
+                        self.copied_count += 1
+                        self.copied_bytes += folder_bytes
+                        self._persist_manifest_locked()
+                    log(
+                        f"  Staged unit ready: {folder} "
+                        f"({folder_bytes / (1024**3):.1f} GB in {time.time() - copy_start:.0f}s)"
+                    )
+                except Exception as e:
+                    with self.lock:
+                        self.processing.pop(folder, None)
+                        self._persist_manifest_locked()
+                    self.errors.append((folder, str(e)))
+                    log(f"  STAGE COPY FAIL: {folder} - {e}")
+                finally:
+                    self._clear_copying()
+
+    def get_next_batch(self, timeout=120):
+        """Get folders ready for processing (up to one batch worth)."""
+        batch_size_bytes = int(BATCH_SIZE_GB * 1024**3)
+        start = time.time()
+        batch = []
+        batch_bytes = 0
+        while time.time() - start < timeout:
+            with self.lock:
+                while self.ready and batch_bytes < batch_size_bytes:
+                    folder, size = self.ready.popleft()
+                    self.ready_bytes -= size
+                    self.processing[folder] = size
+                    self.processing_bytes += size
+                    batch.append((folder, size))
+                    batch_bytes += size
+                if batch:
+                    self._persist_manifest_locked()
+            if batch:
+                return batch
+            if not self.has_more():
+                return batch
+            time.sleep(0.5)
+        return batch
+
+    def mark_done(self, folder, size):
+        """Delete a processed folder from local buffer."""
+        with self.lock:
+            size = self.processing.pop(folder, size)
+            self.processing_bytes -= size
+            self._persist_manifest_locked()
+        local_dir = os.path.join(LOCAL_BUFFER_DIR, folder)
+        if os.path.exists(local_dir):
+            shutil.rmtree(local_dir, ignore_errors=True)
+        if not self.has_more():
+            clear_buffer_manifest()
+
+    def has_more(self):
+        with self.lock:
+            return bool(self.pending or self.ready or self.processing)
+
+    def status(self):
+        with self.lock:
+            copy_elapsed = 0.0
+            if self.copying_folder and self.copying_started:
+                copy_elapsed = max(0.0, time.time() - self.copying_started)
+            return {
+                'pending': len(self.pending),
+                'ready': len(self.ready),
+                'ready_gb': self.ready_bytes / (1024**3),
+                'processing': len(self.processing),
+                'copied': self.copied_count,
+                'copied_gb': self.copied_bytes / (1024**3),
+                'errors': len(self.errors),
+                'copying': self.copying_folder,
+                'copy_elapsed_s': copy_elapsed,
+                'copy_target_gb': self.copying_target / (1024**3),
+            }
+
+
+class LocalFolderBuffer:
+    """Local-mode folder iterator without copy/delete staging."""
+
+    def __init__(self, all_folders):
+        self.pending = deque(all_folders)
+        self.processing = set()
+        self.done = 0
+
+    def start(self):
+        return
+
+    def stop_copying(self):
+        return
+
+    def get_next_batch(self, timeout=120):
+        if not self.pending:
+            return []
+        folder = self.pending.popleft()
+        self.processing.add(folder)
+        return [(folder, 0)]
+
+    def mark_done(self, folder, size):
+        self.processing.discard(folder)
+        self.done += 1
+
+    def has_more(self):
+        return bool(self.pending or self.processing)
+
+    def status(self):
+        return {
+            'pending': len(self.pending),
+            'ready': 0,
+            'ready_gb': 0.0,
+            'processing': len(self.processing),
+            'copied': self.done,
+            'copied_gb': 0.0,
+            'errors': 0,
+            'copying': None,
+            'copy_elapsed_s': 0.0,
+            'copy_target_gb': 0.0,
+        }
+
+
 def load_progress():
-    """Load build progress. Returns (next_chunk_num, set of processed image paths, path_to_id dict, next_id)."""
+    """Load build progress. Image-level tracking via path_to_id."""
+    default = (1, {}, {}, 0)
     if not os.path.exists(PROGRESS_FILE):
-        return 1, set(), {}, 0
+        return default
 
     try:
         with open(PROGRESS_FILE, 'r') as f:
             state = json.load(f)
-        processed = set(state.get('processed_images', []))
         next_chunk = state.get('next_chunk', 1)
         next_id = state.get('next_id', 0)
+        # folder -> image count when last fully processed
+        scanned_counts = state.get('scanned_folder_counts', {})
 
-        # Load path_to_id from existing path_lookup
         path_to_id = {}
         lookup_file = os.path.join(CHUNK_IDS_DIR, "path_lookup.json")
         if os.path.exists(lookup_file):
             with open(lookup_file, 'r') as f:
                 id_to_path = json.load(f)
-            path_to_id = {p: i for i, p in enumerate(id_to_path)}
-            next_id = len(id_to_path)
+            path_to_id = {
+                normalize_to_nas_path(p): i
+                for i, p in enumerate(id_to_path)
+                if p
+            }
+            next_id = max(next_id, max(path_to_id.values(), default=-1) + 1)
 
-        return next_chunk, processed, path_to_id, next_id
+        return next_chunk, scanned_counts, path_to_id, next_id
     except Exception as e:
         log(f"Warning: Could not load progress: {e}")
-        return 1, set(), {}, 0
+        return default
 
 
-def save_progress(next_chunk, processed_images, next_id):
-    """Save build progress (image list stored separately to keep this small)."""
+def save_progress(next_chunk, scanned_counts, next_id):
+    """Save build progress."""
     os.makedirs(PROGRESS_DIR, exist_ok=True)
     state = {
         'next_chunk': next_chunk,
         'next_id': next_id,
-        'processed_count': len(processed_images),
+        'scanned_folder_count': len(scanned_counts),
         'last_updated': datetime.now().isoformat(),
-        'processed_images': list(processed_images)
+        'scanned_folder_counts': scanned_counts,
     }
     temp = PROGRESS_FILE + '.tmp'
     with open(temp, 'w') as f:
@@ -156,61 +699,184 @@ def save_progress(next_chunk, processed_images, next_id):
     shutil.move(temp, PROGRESS_FILE)
 
 
-def save_path_lookup(path_to_id):
-    """Save the global path lookup (both directions)."""
-    os.makedirs(CHUNK_IDS_DIR, exist_ok=True)
+def load_buffer_manifest():
+    """Load persisted NAS staging manifest, if any."""
+    if not os.path.exists(BUFFER_MANIFEST_FILE):
+        return None
+    try:
+        with open(BUFFER_MANIFEST_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"Warning: Could not load buffer manifest: {e}")
+        return None
 
-    # Save id_to_path (list indexed by ID) - used during search
-    id_to_path = [''] * len(path_to_id)
+
+def manifest_has_work(state):
+    """Return True if the manifest contains pending/staged units."""
+    if not state:
+        return False
+    return bool(
+        state.get('pending_units') or
+        state.get('ready_units') or
+        state.get('processing_units')
+    )
+
+
+def save_buffer_manifest(state):
+    """Persist current NAS staging state for resume without rescanning NAS."""
+    os.makedirs(PROGRESS_DIR, exist_ok=True)
+    temp = BUFFER_MANIFEST_FILE + '.tmp'
+    with open(temp, 'w', encoding='utf-8') as f:
+        json.dump(state, f)
+    shutil.move(temp, BUFFER_MANIFEST_FILE)
+
+
+def clear_buffer_manifest():
+    """Delete staging manifest after all queued NAS work is exhausted."""
+    try:
+        if os.path.exists(BUFFER_MANIFEST_FILE):
+            os.remove(BUFFER_MANIFEST_FILE)
+    except OSError:
+        pass
+
+
+def save_path_lookup(path_to_id, sync_db=True):
+    """Save the global path lookup."""
+    os.makedirs(CHUNK_IDS_DIR, exist_ok=True)
+    max_pid = max(path_to_id.values(), default=-1)
+    id_to_path = [''] * (max_pid + 1)
     for path, pid in path_to_id.items():
+        if pid < 0:
+            raise ValueError(f"Negative path id for {path}: {pid}")
         id_to_path[pid] = path
 
     lookup_file = os.path.join(CHUNK_IDS_DIR, "path_lookup.json")
     with open(lookup_file, 'w') as f:
         json.dump(id_to_path, f)
+    log(f"  Saved path_lookup.json: {len(path_to_id):,} unique paths "
+        f"({os.path.getsize(lookup_file) / 1e6:.1f} MB)")
 
-    log(f"  Saved path_lookup.json: {len(path_to_id):,} unique paths ({os.path.getsize(lookup_file) / 1e6:.1f} MB)")
+    # Sync new paths to DB (throttled at chunk boundaries)
+    if sync_db:
+        sync_paths_to_db(COLLECTION_NAME, path_to_id)
 
-    # Sync new paths to DB
-    sync_paths_to_db(COLLECTION_NAME, path_to_id)
+
+def load_bad_images_list(list_file, label):
+    """Load a persisted quarantine file into a normalized path set."""
+    if not os.path.exists(list_file):
+        return set()
+    bad = set()
+    try:
+        with open(list_file, 'r', encoding='utf-8') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                path = line.split('\t', 1)[0]
+                bad.add(normalize_to_nas_path(path))
+    except Exception as e:
+        log(f"Warning: Could not load {label} image list: {e}")
+    return bad
+
+
+def load_cuda_bad_images():
+    """Load image paths that previously poisoned CUDA and should be skipped."""
+    return load_bad_images_list(CUDA_BAD_IMAGES_FILE, "CUDA bad")
+
+
+def load_preprocess_bad_images():
+    """Load image paths that consistently fail CPU-side preprocessing."""
+    return load_bad_images_list(PREPROCESS_BAD_IMAGES_FILE, "preprocess bad")
+
+
+def record_bad_image(image_path, reason, bad_images, list_file, label):
+    """Append an image path to a quarantine list once."""
+    norm_path = normalize_to_nas_path(image_path)
+    if norm_path in bad_images:
+        return
+    os.makedirs(PROGRESS_DIR, exist_ok=True)
+    ts = datetime.now().isoformat(timespec='seconds')
+    with open(list_file, 'a', encoding='utf-8') as f:
+        f.write(f"{norm_path}\t{ts}\t{reason}\n")
+    bad_images.add(norm_path)
+    log(f"  Quarantined {label} image: {norm_path}")
+
+
+def record_cuda_bad_image(image_path, reason, bad_images):
+    """Append an image path to CUDA quarantine list once."""
+    record_bad_image(image_path, reason, bad_images, CUDA_BAD_IMAGES_FILE, "CUDA-poison")
+
+
+def record_preprocess_bad_image(image_path, reason, bad_images):
+    """Append an image path to preprocess quarantine list once."""
+    record_bad_image(image_path, reason, bad_images, PREPROCESS_BAD_IMAGES_FILE, "preprocess-fail")
+
+
+def load_skipped_large_paths():
+    """Load previously skipped-too-large paths (optional mode)."""
+    if not SKIPPED_LARGE_FILE or not os.path.exists(SKIPPED_LARGE_FILE):
+        return set()
+    try:
+        with open(SKIPPED_LARGE_FILE, "r", encoding="utf-8") as f:
+            return {normalize_to_nas_path(line.strip()) for line in f if line.strip()}
+    except Exception as e:
+        log(f"Warning: Could not load skipped-large file: {e}")
+        return set()
+
+
+def append_skipped_large_paths(paths):
+    """Append newly skipped-too-large paths to disk."""
+    if not SKIPPED_LARGE_FILE or not paths:
+        return
+    os.makedirs(os.path.dirname(SKIPPED_LARGE_FILE), exist_ok=True)
+    with open(SKIPPED_LARGE_FILE, "a", encoding="utf-8") as f:
+        for p in paths:
+            f.write(p + "\n")
 
 
 def preprocess_image(image_path, max_dim=MAX_IMAGE_DIM):
-    """Load and preprocess image for DISK extraction. Returns tensor or None."""
+    """Load and preprocess image for DISK extraction."""
     try:
         img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img is None:
-            return None
-
+            return None, "decode-fail"
         h, w = img.shape[:2]
-
-        # Resize only if max_dim is set (used for OOM retry)
+        if SKIP_IF_MAX_DIM_OVER > 0 and max(h, w) > SKIP_IF_MAX_DIM_OVER:
+            return None, f"too-large:{w}x{h}"
         if max_dim is not None and max(h, w) > max_dim:
             scale = max_dim / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
             h, w = img.shape[:2]
-
-        # Pad to multiples of 16 (required by DISK)
         new_h = ((h + 15) // 16) * 16
         new_w = ((w + 15) // 16) * 16
         if new_h != h or new_w != w:
             img = cv2.copyMakeBorder(img, 0, new_h - h, 0, new_w - w,
                                      cv2.BORDER_CONSTANT, value=[0, 0, 0])
-
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         tensor = K.image_to_tensor(img, False).float() / 255.0
-        return tensor
-    except Exception:
-        return None
+        return tensor, "ok"
+    except Exception as e:
+        return None, f"preprocess-exception:{type(e).__name__}"
 
 
-# Background NAS copy state
+def prefetch_worker(path_queue, result_queue):
+    """Background worker: load and preprocess images so GPU never waits for I/O."""
+    while True:
+        image_path = path_queue.get()
+        if image_path is None:  # poison pill
+            path_queue.task_done()
+            break
+        tensor, prep_status = preprocess_image(image_path)
+        result_queue.put((image_path, tensor, prep_status))
+        path_queue.task_done()
+
+
+# Background NAS chunk copy
 _nas_copy_thread = None
 _nas_copy_error = None
 
 
 def _nas_copy_worker(local_faiss, nas_faiss, chunk_num):
-    """Background worker to copy a chunk from local SSD to NAS."""
     global _nas_copy_error
     try:
         copy_start = time.time()
@@ -218,7 +884,6 @@ def _nas_copy_worker(local_faiss, nas_faiss, chunk_num):
         copy_time = time.time() - copy_start
         faiss_size = os.path.getsize(nas_faiss) / (1024**3)
         log(f"  NAS copy done: chunk {chunk_num:03d} ({faiss_size:.1f} GB in {copy_time:.0f}s)")
-        # Delete local buffer copy now that NAS has it
         try:
             os.remove(local_faiss)
         except Exception:
@@ -229,7 +894,6 @@ def _nas_copy_worker(local_faiss, nas_faiss, chunk_num):
 
 
 def wait_for_nas_copy():
-    """Wait for any pending NAS copy to finish. Call before starting a new one or at exit."""
     global _nas_copy_thread, _nas_copy_error
     if _nas_copy_thread is not None:
         _nas_copy_thread.join()
@@ -240,40 +904,46 @@ def wait_for_nas_copy():
 
 
 def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
-    """
-    Build FAISS index from accumulated descriptors and save chunk + IDs.
-    NAS copy runs in background so GPU extraction can continue immediately.
-
-    Returns:
-        num_vectors
-    """
     global _nas_copy_thread
-
     if not all_descriptors:
         return 0
 
-    # Wait for any previous NAS copy to finish before writing new local file
     wait_for_nas_copy()
 
-    # Build FAISS index
     log(f"  Building FAISS index for chunk {chunk_num}...")
-    all_desc = np.vstack(all_descriptors)
-    all_descriptors.clear()
-    gc.collect()
-    num_vectors = len(all_desc)
+    num_vectors = int(sum(desc.shape[0] for desc in all_descriptors))
+    if num_vectors != len(all_ids):
+        raise RuntimeError(
+            f"Chunk {chunk_num:03d} vector/id mismatch: vectors={num_vectors:,}, ids={len(all_ids):,}"
+        )
 
+    # Add descriptors incrementally to avoid a second full-size contiguous np.vstack()
+    # allocation that can trigger std::bad_alloc on long runs.
     index = faiss.IndexFlatIP(128)
-    index.add(all_desc)
-    del all_desc
-    gc.collect()
+    try:
+        for i, desc in enumerate(all_descriptors):
+            if desc is None or len(desc) == 0:
+                continue
+            if desc.dtype != np.float32 or not desc.flags['C_CONTIGUOUS']:
+                desc = np.ascontiguousarray(desc, dtype=np.float32)
+            index.add(desc)
+            all_descriptors[i] = None
+            if (i + 1) % 128 == 0:
+                gc.collect()
+    except MemoryError as e:
+        raise MemoryError(
+            "FAISS add failed with std::bad_alloc. "
+            "Restart with a lower DISK_MAX_VECTORS_PER_CHUNK (e.g. 18000000)."
+        ) from e
+    finally:
+        all_descriptors.clear()
+        gc.collect()
 
-    # Save chunk .faiss to local buffer first
     os.makedirs(LOCAL_CHUNKS_BUFFER, exist_ok=True)
     local_faiss = os.path.join(LOCAL_CHUNKS_BUFFER, f"chunk_{chunk_num:03d}.faiss")
     faiss.write_index(index, local_faiss)
     faiss_size = os.path.getsize(local_faiss) / (1024**3)
 
-    # Save compact IDs (stays on local SSD)
     os.makedirs(CHUNK_IDS_DIR, exist_ok=True)
     ids_array = np.array(all_ids, dtype=np.int32)
     ids_file = os.path.join(CHUNK_IDS_DIR, f"chunk_{chunk_num:03d}_ids.npy")
@@ -286,214 +956,645 @@ def save_chunk(chunk_num, all_descriptors, all_ids, num_images):
     log(f"  Chunk {chunk_num:03d}: {num_vectors:,} vectors from {num_images} images "
         f"({faiss_size:.1f} GB index, {ids_size:.0f} MB IDs)")
 
-    # Queue NAS copy in background - GPU extraction continues immediately
     os.makedirs(NAS_CHUNKS_DIR, exist_ok=True)
     nas_faiss = os.path.join(NAS_CHUNKS_DIR, f"chunk_{chunk_num:03d}.faiss")
     _nas_copy_thread = Thread(target=_nas_copy_worker, args=(local_faiss, nas_faiss, chunk_num))
     _nas_copy_thread.daemon = True
     _nas_copy_thread.start()
-    log(f"  NAS copy queued (background): {local_faiss} -> {nas_faiss}")
 
-    # Cleanup
     del ids_array, index
     gc.collect()
-
     return num_vectors
 
 
+def find_folders_with_new_images(all_folders, scanned_counts, path_to_id, source_dir,
+                                 skipped_large_paths=None, bad_images=None):
+    """Find folders that have unprocessed images."""
+    remaining = []
+    skipped = 0
+    skipped_large_paths = skipped_large_paths or set()
+    bad_images = bad_images or set()
+
+    # Count processed images per folder from path_to_id
+    known_per_folder = Counter()
+    prefix = NAS_IMAGES_DIR.replace('\\', '/').rstrip('/').lower() + '/'
+    folder_keys = {folder.replace('\\', '/').lower(): folder for folder in all_folders}
+
+    for nas_path in path_to_id:
+        norm_path = normalize_to_nas_path(nas_path).replace('\\', '/').lower()
+        if norm_path.startswith(prefix):
+            rel = norm_path[len(prefix):]
+            parts = rel.split('/')
+            folder = parts[0]
+            if len(parts) >= 2:
+                candidate = f"{parts[0]}/{parts[1]}"
+                if candidate in folder_keys:
+                    folder = candidate
+            known_per_folder[folder] += 1
+
+    for nas_path in skipped_large_paths:
+        norm_path = normalize_to_nas_path(nas_path).replace('\\', '/').lower()
+        if norm_path.startswith(prefix):
+            rel = norm_path[len(prefix):]
+            parts = rel.split('/')
+            folder = parts[0]
+            if len(parts) >= 2:
+                candidate = f"{parts[0]}/{parts[1]}"
+                if candidate in folder_keys:
+                    folder = candidate
+            known_per_folder[folder] += 1
+
+    for nas_path in bad_images:
+        norm_path = normalize_to_nas_path(nas_path).replace('\\', '/').lower()
+        if norm_path.startswith(prefix):
+            rel = norm_path[len(prefix):]
+            parts = rel.split('/')
+            folder = parts[0]
+            if len(parts) >= 2:
+                candidate = f"{parts[0]}/{parts[1]}"
+                if candidate in folder_keys:
+                    folder = candidate
+            known_per_folder[folder] += 1
+
+    for i, folder in enumerate(all_folders):
+        folder_key = folder.replace('\\', '/')
+        folder_key_lower = folder_key.lower()
+        if (i + 1) % 5000 == 0:
+            print(f"\r  Checking folders: {i+1:,}/{len(all_folders):,} "
+                  f"({skipped:,} skipped, {len(remaining):,} to process)...",
+                  end="", flush=True)
+
+        scanned_key = folder if folder in scanned_counts else folder_key
+        known_count = known_per_folder.get(folder_key_lower, 0)
+
+        # Standard path: if we previously scanned this folder and counts match both on-disk
+        # and indexed, we can skip with high confidence.
+        if scanned_key in scanned_counts:
+            current_count = count_images_in_source(folder, source_dir)
+            if current_count == scanned_counts[scanned_key] and known_count >= current_count:
+                skipped += 1
+                continue
+
+        # Recovery path: for older progress files that do not have scanned_counts populated,
+        # still skip if indexed count already covers current folder file count.
+        elif known_count > 0:
+            current_count = count_images_in_source(folder, source_dir)
+            if current_count > 0 and known_count >= current_count:
+                skipped += 1
+                continue
+
+        remaining.append(folder)
+
+    if len(all_folders) > 5000:
+        print()
+    return remaining, skipped
+
+
 def main():
+    local_source_dir = get_local_source_dir()
+    local_mode = local_source_dir is not None
+    source_dir = local_source_dir if local_mode else NAS_SOURCE_DIR
+
     log("=" * 70)
-    log("PRINT ADS DISK CHUNK BUILDER")
-    log(f"Source (local):  {LOCAL_IMAGES_DIR}")
+    log("PRINT ADS DISK CHUNK BUILDER (Pipelined NAS -> Local -> GPU)")
+    if local_mode:
+        log(f"Local source:    {local_source_dir}")
+    else:
+        log(f"NAS source:      {NAS_SOURCE_DIR}")
+        log(f"Local buffer:    {LOCAL_BUFFER_DIR}")
     log(f"Paths stored as: {NAS_IMAGES_DIR}")
     log(f"Chunks output:   {NAS_CHUNKS_DIR}")
     log(f"Compact IDs:     {CHUNK_IDS_DIR}")
     log(f"Target/chunk:    {MAX_VECTORS_PER_CHUNK:,} vectors (~10 GB)")
+    log(f"Image resize:    max_dim={MAX_IMAGE_DIM if MAX_IMAGE_DIM is not None else 'none'}")
+    if local_mode:
+        log("Source mode:     local_direct")
+    else:
+        log(
+            f"Source mode:     nas_buffer ({BATCH_SIZE_GB} GB/batch, "
+            f"{MAX_BUFFERED_BATCHES} batches max, copy MT={COPY_THREADS})"
+        )
+    if SKIP_IF_MAX_DIM_OVER > 0:
+        log(
+            f"Large-image mode: skip images with max dimension > {SKIP_IF_MAX_DIM_OVER}px "
+            f"(tracked in {os.path.basename(SKIPPED_LARGE_FILE)})"
+        )
     log("=" * 70)
 
-    # Check source exists
-    if not os.path.exists(LOCAL_IMAGES_DIR):
-        log(f"ERROR: Source directory not found: {LOCAL_IMAGES_DIR}")
-        log(f"Copy print ads from NAS to local drive first.")
-        log(f"  robocopy \"{NAS_IMAGES_DIR}\" \"{LOCAL_IMAGES_DIR}\" /E /R:2 /W:5")
-        sys.exit(1)
-
-    # Find all images
-    log("Scanning for images...")
-    all_images = find_all_images()
-    log(f"Found {len(all_images):,} images")
-
-    if not all_images:
-        log("No images found!")
-        sys.exit(1)
-
     # Load progress
-    next_chunk, processed, path_to_id, next_id = load_progress()
-    log(f"Resume: chunk {next_chunk}, {len(processed):,} images already done, {len(path_to_id):,} unique paths")
+    next_chunk, scanned_counts, path_to_id, next_id = load_progress()
+    cuda_bad_images = load_cuda_bad_images()
+    preprocess_bad_images = load_preprocess_bad_images()
+    known_bad_images = set(cuda_bad_images)
+    known_bad_images.update(preprocess_bad_images)
+    skipped_large_paths = load_skipped_large_paths()
+    skipped_large_pending_flush = []
+    log(f"Resume: chunk {next_chunk}, {len(path_to_id):,} images already processed, "
+        f"{len(scanned_counts):,} folders fully scanned")
+    if cuda_bad_images:
+        log(f"CUDA quarantine list: {len(cuda_bad_images):,} images")
+    if preprocess_bad_images:
+        log(f"Preprocess quarantine list: {len(preprocess_bad_images):,} images")
+    if SKIP_IF_MAX_DIM_OVER > 0:
+        log(f"Resume: {len(skipped_large_paths):,} previously skipped-too-large images")
 
-    # Filter out already processed
-    remaining = [f for f in all_images if f not in processed]
-    log(f"Remaining: {len(remaining):,} images")
+    manifest_state = None
+    if not local_mode:
+        manifest_state = load_buffer_manifest()
+
+    if not local_mode and manifest_has_work(manifest_state):
+        remaining = []
+        seen = set()
+        for folder in manifest_state.get('pending_units', []):
+            if folder not in seen:
+                remaining.append(folder)
+                seen.add(folder)
+        for entry in manifest_state.get('ready_units', []):
+            folder = entry.get('folder')
+            if folder and folder not in seen:
+                remaining.append(folder)
+                seen.add(folder)
+        for entry in manifest_state.get('processing_units', []):
+            folder = entry.get('folder')
+            if folder and folder not in seen:
+                remaining.append(folder)
+                seen.add(folder)
+        log(f"Resuming from buffer manifest: {len(remaining):,} queued/staged units")
+    else:
+        # List all folder units in selected source
+        if not os.path.exists(source_dir):
+            log(f"ERROR: Source directory not found: {source_dir}")
+            return
+        log(f"Scanning source for folder units: {source_dir}")
+        all_folders = collect_source_units(source_dir)
+        log(f"Found {len(all_folders):,} folder units in source")
+
+        # Find folders with new/unprocessed images
+        log("Checking for folders with new images...")
+        remaining, skipped = find_folders_with_new_images(
+            all_folders,
+            scanned_counts,
+            path_to_id,
+            source_dir,
+            skipped_large_paths=skipped_large_paths if SKIP_IF_MAX_DIM_OVER > 0 else None,
+            bad_images=known_bad_images,
+        )
+        log(f"Skipped {skipped:,} unchanged folders, {len(remaining):,} folders to process")
 
     if not remaining:
         log("All images already processed!")
+        if not local_mode:
+            clear_buffer_manifest()
         return
+
+    # Prepare local buffer (NAS-buffer mode only)
+    if not local_mode:
+        if manifest_has_work(manifest_state):
+            os.makedirs(LOCAL_BUFFER_DIR, exist_ok=True)
+            log("Reusing staged local buffer from manifest")
+        elif CLEAN_BUFFER_ON_START and os.path.exists(LOCAL_BUFFER_DIR):
+            log("Cleaning local buffer (DISK_CLEAN_BUFFER_ON_START=1)...")
+            shutil.rmtree(LOCAL_BUFFER_DIR, ignore_errors=True)
+            os.makedirs(LOCAL_BUFFER_DIR, exist_ok=True)
+        else:
+            os.makedirs(LOCAL_BUFFER_DIR, exist_ok=True)
 
     # Load DISK model
     log("Loading DISK model...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     extractor = KF.DISK.from_pretrained('depth').to(device).eval()
     log(f"DISK model loaded on {device}")
-
-    # Estimate chunks (rough, actual count depends on keypoints per image)
-    est_chunks = max(1, int(len(remaining) * 15000 / MAX_VECTORS_PER_CHUNK))
-    log(f"~{est_chunks} chunks estimated (10 GB target, actual depends on keypoints)")
     log("=" * 70)
+
+    # Start source buffer
+    if local_mode:
+        buffer = LocalFolderBuffer(remaining)
+    else:
+        buffer = FolderBuffer(remaining, source_dir=source_dir, manifest_state=manifest_state)
+    buffer.start()
+
+    # Start prefetch pipeline (local SSD -> preprocessed tensors)
+    path_queue = queue.Queue()
+    result_queue = queue.Queue(maxsize=PREFETCH_QUEUE_SIZE)
+    prefetch_threads = []
+    for _ in range(PREFETCH_WORKERS):
+        t = Thread(target=prefetch_worker, args=(path_queue, result_queue), daemon=True)
+        t.start()
+        prefetch_threads.append(t)
+    log(f"Prefetch pipeline started: {PREFETCH_WORKERS} workers, queue depth {PREFETCH_QUEUE_SIZE}")
+
+    # Wait for first staged batch (NAS mode only)
+    if not local_mode:
+        log("Waiting for first batch to copy...")
+        while True:
+            s = buffer.status()
+            if s['ready'] > 0:
+                break
+            # Fail fast if copy worker drained pending units but produced nothing.
+            if s['pending'] == 0 and s['ready'] == 0 and s['processing'] == 0 and s['errors'] > 0:
+                sample = buffer.errors[0] if buffer.errors else ("unknown", "unknown copy error")
+                raise RuntimeError(
+                    f"Staging failed: no units copied; errors={s['errors']}. "
+                    f"First error: {sample[0]} -> {sample[1]}"
+                )
+            copy_label = s['copying'] if s['copying'] else "idle"
+            copy_elapsed = f"{s['copy_elapsed_s']:.0f}s" if s['copying'] else "-"
+            print(
+                f"\r    Copied {s['copied']:,} units ({s['copied_gb']:.1f} GB), "
+                f"ready {s['ready']:,}, pending {s['pending']:,}, "
+                f"copying {copy_label} ({copy_elapsed}), errors {s['errors']:,}...",
+                  end="", flush=True)
+            time.sleep(1)
+        print()
 
     start_time = time.time()
     total_vectors = 0
     total_ok = 0
+    total_skipped = 0
+    total_skipped_large = 0
     total_failed = 0
+    total_images = 0
     chunk_num = next_chunk
-    images_processed = 0
+    folders_done = 0
 
-    # Accumulator for current chunk
+    # Chunk accumulator
     chunk_descriptors = []
     chunk_ids = []
     chunk_vector_count = 0
     chunk_image_count = 0
     chunk_start = time.time()
+    last_heartbeat = time.time()
+    cuda_error_streak = 0
+    cuda_recovery_attempts = 0
+    path_db_unsynced_chunks = 0
 
-    for i, image_path in enumerate(remaining):
-        if (i + 1) % 500 == 0 or i == 0:
-            print(f"    Image {i+1}/{len(remaining)} (chunk {chunk_num:03d}, "
-                  f"{chunk_vector_count:,} vectors)...", end='\r', flush=True)
+    def save_restart_checkpoint():
+        save_progress(chunk_num, scanned_counts, next_id)
+        if skipped_large_pending_flush:
+            append_skipped_large_paths(skipped_large_pending_flush)
+            skipped_large_pending_flush.clear()
 
-        # Preprocess
-        tensor = preprocess_image(image_path)
-        if tensor is None:
-            total_failed += 1
-            processed.add(image_path)
-            continue
-
-        # Extract DISK features (with OOM retry at reduced resolution)
-        try:
-            tensor = tensor.to(device)
-            with torch.no_grad():
-                try:
-                    feats = extractor(tensor)[0]
-                except torch.cuda.OutOfMemoryError:
-                    del tensor
-                    try:
-                        torch.cuda.empty_cache()
-                    except RuntimeError:
-                        pass
-                    gc.collect()
-                    tensor = preprocess_image(image_path, max_dim=2048)
-                    if tensor is None:
-                        total_failed += 1
-                        processed.add(image_path)
-                        continue
-                    tensor = tensor.to(device)
-                    feats = extractor(tensor)[0]
-                descriptors = feats.descriptors.cpu().numpy()  # (N, 128)
-
-            if len(descriptors) == 0:
-                total_failed += 1
-                processed.add(image_path)
-                del tensor
+    while buffer.has_more():
+        batch = buffer.get_next_batch()
+        if not batch:
+            if buffer.has_more():
+                s = buffer.status()
+                # A single large folder/unit can take longer than get_next_batch timeout.
+                # Keep waiting instead of exiting early while copy work is still in flight.
+                if s['pending'] == 0 and s['ready'] == 0 and s['processing'] == 0 and s['errors'] > 0:
+                    sample = buffer.errors[0] if getattr(buffer, "errors", None) else ("unknown", "unknown copy error")
+                    raise RuntimeError(
+                        f"Staging failed: no units available and no in-flight work. "
+                        f"errors={s['errors']}. First error: {sample[0]} -> {sample[1]}"
+                    )
+                copy_label = s['copying'] if s['copying'] else "idle"
+                copy_elapsed = f"{s['copy_elapsed_s']:.0f}s" if s['copying'] else "-"
+                log(
+                    f"No staged batch ready yet (pending {s['pending']}, ready {s['ready']}, "
+                    f"processing {s['processing']}, copied {s['copied']}, "
+                    f"copying {copy_label} ({copy_elapsed}), errors {s['errors']}); waiting..."
+                )
                 continue
+            break
 
-            # Get or assign path ID (using NAS path)
-            nas_path = remap_path(image_path)
-            if nas_path not in path_to_id:
-                path_to_id[nas_path] = next_id
-                next_id += 1
-            pid = path_to_id[nas_path]
+        for folder, folder_size in batch:
+            folder_dir = os.path.join(local_source_dir if local_mode else LOCAL_BUFFER_DIR, folder)
+            images = find_images_recursive(folder_dir)
 
-            # Accumulate
-            chunk_descriptors.append(descriptors)
-            chunk_ids.extend([pid] * len(descriptors))
-            chunk_vector_count += len(descriptors)
-            chunk_image_count += 1
-            total_ok += 1
+            # Filter to only unprocessed images and feed into prefetch queue
+            to_process = []
+            for image_path in images:
+                nas_path = make_nas_path(image_path, local_source_dir=local_source_dir)
+                if nas_path in path_to_id:
+                    total_skipped += 1
+                    continue
+                if nas_path in known_bad_images:
+                    total_skipped += 1
+                    continue
+                if SKIP_IF_MAX_DIM_OVER > 0 and nas_path in skipped_large_paths:
+                    total_skipped_large += 1
+                    continue
+                to_process.append(image_path)
+                path_queue.put(image_path)
 
-        except Exception:
-            total_failed += 1
+            folder_image_total = len(to_process)
 
-        processed.add(image_path)
-        del tensor
-        if (i + 1) % 200 == 0:
-            gc.collect()
-            if device.type == 'cuda':
+            # Consume prefetched results from GPU
+            for j in range(folder_image_total):
+                image_path, tensor, prep_status = result_queue.get()
+                total_images += 1
+                folder_image_idx = j + 1
+                nas_path = make_nas_path(image_path, local_source_dir=local_source_dir)
+                image_name = os.path.basename(image_path)
+                if len(image_name) > 64:
+                    image_name = image_name[:61] + "..."
+                keypoints_found = 0
+                status_label = "ok"
+
+                if tensor is None:
+                    if prep_status.startswith("too-large:"):
+                        total_skipped_large += 1
+                        status_label = f"skip>{SKIP_IF_MAX_DIM_OVER}"
+                        if nas_path not in skipped_large_paths:
+                            skipped_large_paths.add(nas_path)
+                            skipped_large_pending_flush.append(nas_path)
+                        if total_skipped_large <= 20:
+                            dims = prep_status.split(":", 1)[1]
+                            log(f"  SKIP TOO LARGE: {image_path} ({dims})")
+                        elif total_skipped_large == 21:
+                            log("  (suppressing further skip-too-large logs)")
+                    else:
+                        total_failed += 1
+                        record_preprocess_bad_image(image_path, prep_status, preprocess_bad_images)
+                        known_bad_images.add(nas_path)
+                        if total_failed <= 20:
+                            log(f"  PREPROCESS FAIL: {image_path} ({prep_status})")
+                        elif total_failed == 21:
+                            log(f"  (suppressing further preprocess-fail logs)")
+                        status_label = "preprocess-fail"
+                    update_progress_line(format_progress_line(
+                        folders_done + 1, len(remaining), folder_image_idx, folder_image_total,
+                        chunk_num, chunk_vector_count, chunk_image_count,
+                        0, status_label, image_name
+                    ))
+                    continue
+
                 try:
-                    torch.cuda.empty_cache()
-                except RuntimeError:
-                    pass
+                    t_shape = tensor.shape
+                    tensor = tensor.to(device)
+                    with torch.no_grad():
+                        try:
+                            feats = extractor(tensor)[0]
+                        except torch.cuda.OutOfMemoryError:
+                            del tensor
+                            try:
+                                torch.cuda.empty_cache()
+                            except RuntimeError:
+                                pass
+                            gc.collect()
+                            tensor, retry_status = preprocess_image(image_path, max_dim=2048)
+                            if tensor is None:
+                                total_failed += 1
+                                if retry_status.startswith("too-large:"):
+                                    total_skipped_large += 1
+                                    if nas_path not in skipped_large_paths:
+                                        skipped_large_paths.add(nas_path)
+                                        skipped_large_pending_flush.append(nas_path)
+                                else:
+                                    record_preprocess_bad_image(image_path, retry_status, preprocess_bad_images)
+                                    known_bad_images.add(nas_path)
+                                status_label = f"oom-retry-fail:{retry_status}"
+                                if total_failed <= 20:
+                                    log(f"  OOM RETRY FAIL: {image_path} ({retry_status})")
+                                update_progress_line(format_progress_line(
+                                    folders_done + 1, len(remaining), folder_image_idx, folder_image_total,
+                                    chunk_num, chunk_vector_count, chunk_image_count,
+                                    0, status_label, image_name
+                                ))
+                                continue
+                            tensor = tensor.to(device)
+                            feats = extractor(tensor)[0]
+                        descriptors = feats.descriptors.cpu().numpy()
+                        keypoints_found = int(len(descriptors))
 
-        # Flush chunk when we hit the vector cap
-        if chunk_vector_count >= MAX_VECTORS_PER_CHUNK:
-            print(f"    Image {i+1}/{len(remaining)} done.    ")
-            chunk_time = time.time() - chunk_start
+                    if len(descriptors) == 0:
+                        total_failed += 1
+                        if total_failed <= 20:
+                            log(f"  ZERO KEYPOINTS: {image_path} (tensor shape {t_shape})")
+                        status_label = "no-keypoints"
+                        del tensor
+                        update_progress_line(format_progress_line(
+                            folders_done + 1, len(remaining), folder_image_idx, folder_image_total,
+                            chunk_num, chunk_vector_count, chunk_image_count,
+                            0, status_label, image_name
+                        ))
+                        continue
 
-            log(f"\n[Chunk {chunk_num:03d}] Flushing {chunk_vector_count:,} vectors "
-                f"from {chunk_image_count} images")
+                    if total_ok < 10 or total_ok % 5000 == 0:
+                        log(f"  SAMPLE OK: {os.path.basename(image_path)} "
+                            f"shape={t_shape} keypoints={len(descriptors)}")
 
-            num_vectors = save_chunk(chunk_num, chunk_descriptors, chunk_ids, chunk_image_count)
-            total_vectors += num_vectors
-            images_processed += chunk_image_count
+                    path_to_id[nas_path] = next_id
+                    next_id += 1
+                    pid = path_to_id[nas_path]
 
-            # Save progress
-            chunk_num += 1
-            save_progress(chunk_num, processed, next_id)
-            save_path_lookup(path_to_id)
+                    chunk_descriptors.append(descriptors)
+                    chunk_ids.extend([pid] * len(descriptors))
+                    chunk_vector_count += len(descriptors)
+                    chunk_image_count += 1
+                    total_ok += 1
+                    cuda_error_streak = 0
 
-            # ETA
-            elapsed = time.time() - start_time
-            images_left = len(remaining) - (i + 1)
-            rate = (i + 1) / elapsed if elapsed > 0 else 1
-            eta_hours = (images_left / rate) / 3600
+                except Exception as e:
+                    total_failed += 1
+                    status_label = f"extract-{type(e).__name__}"
+                    if total_failed <= 20:
+                        log(f"  EXTRACT FAIL: {image_path} - {type(e).__name__}: {e}")
 
-            log(f"  Time: {chunk_time:.0f}s | Total vectors: {total_vectors:,} | "
-                f"Unique paths: {len(path_to_id):,} | ETA: {eta_hours:.1f}h")
+                    if is_cuda_runtime_error(e):
+                        if "illegal memory access" in str(e).lower():
+                            cuda_error_streak = CUDA_ERROR_STREAK_FOR_RECOVERY
+                        else:
+                            cuda_error_streak += 1
+                        if cuda_error_streak == 1 or (cuda_error_streak % 10 == 0):
+                            log(
+                                f"  CUDA error streak {cuda_error_streak} "
+                                f"(recoveries used: {cuda_recovery_attempts}/{CUDA_MAX_RECOVERY_ATTEMPTS})"
+                            )
 
-            # Reset accumulator
-            chunk_descriptors = []
-            chunk_ids = []
-            chunk_vector_count = 0
-            chunk_image_count = 0
-            chunk_start = time.time()
+                        if cuda_error_streak >= CUDA_ERROR_STREAK_FOR_RECOVERY:
+                            if cuda_recovery_attempts < CUDA_MAX_RECOVERY_ATTEMPTS:
+                                cuda_recovery_attempts += 1
+                                log(
+                                    f"  CUDA recovery attempt {cuda_recovery_attempts}/"
+                                    f"{CUDA_MAX_RECOVERY_ATTEMPTS} after streak={cuda_error_streak}"
+                                )
+                                try:
+                                    extractor = reload_disk_model(device)
+                                    cuda_error_streak = 0
+                                    log("  CUDA recovery succeeded (DISK model reloaded)")
+                                except Exception as reload_err:
+                                    reason = f"recovery-failed: {type(reload_err).__name__}: {reload_err}"
+                                    record_cuda_bad_image(nas_path, reason, cuda_bad_images)
+                                    save_restart_checkpoint()
+                                    raise CudaPoisonedError(
+                                        f"CUDA recovery failed after streak={cuda_error_streak}: "
+                                        f"{type(reload_err).__name__}: {reload_err}"
+                                    ) from reload_err
+                            else:
+                                reason = f"streak-exhausted: {type(e).__name__}: {e}"
+                                record_cuda_bad_image(nas_path, reason, cuda_bad_images)
+                                save_restart_checkpoint()
+                                raise CudaPoisonedError(
+                                    f"Aborting build: CUDA error streak={cuda_error_streak} "
+                                    f"after {cuda_recovery_attempts} recovery attempts. "
+                                    f"Last error: {type(e).__name__}: {e}"
+                                ) from e
 
-    # Flush remaining vectors as final chunk
+                del tensor
+                update_progress_line(format_progress_line(
+                    folders_done + 1, len(remaining), folder_image_idx, folder_image_total,
+                    chunk_num, chunk_vector_count, chunk_image_count,
+                    keypoints_found, status_label, image_name
+                ))
+
+                if (time.time() - last_heartbeat) >= PROGRESS_HEARTBEAT_SEC:
+                    elapsed = time.time() - start_time
+                    partial_folder = (folder_image_idx / max(folder_image_total, 1))
+                    approx_folders_done = folders_done + partial_folder
+                    folders_left = max(0.0, len(remaining) - approx_folders_done)
+                    rate = approx_folders_done / elapsed if elapsed > 0 else 0.0
+                    eta_seconds = (folders_left / rate) if rate > 0 else float("inf")
+                    eta_str = format_eta(eta_seconds)
+                    finish_str = (
+                        (datetime.now() + timedelta(seconds=eta_seconds)).strftime("%m-%d %H:%M")
+                        if np.isfinite(eta_seconds) and eta_seconds > 0 else "unknown"
+                    )
+                    s = buffer.status()
+                    copy_label = s['copying'] if s['copying'] else "idle"
+                    copy_elapsed = f"{s['copy_elapsed_s']:.0f}s" if s['copying'] else "-"
+                    log(
+                        f"Heartbeat: folder {folders_done+1:,}/{len(remaining):,} "
+                        f"image {folder_image_idx:,}/{folder_image_total:,}, "
+                        f"chunk {chunk_num:03d}, chunk_vectors={chunk_vector_count:,}, "
+                        f"chunk_images={chunk_image_count:,}, last_kp={keypoints_found:,}, "
+                        f"new={total_ok:,}, failed={total_failed:,}, "
+                        f"skipped_indexed={total_skipped:,}, skipped_large={total_skipped_large:,}, "
+                        f"buffer_ready={s['ready_gb']:.1f}GB ({s['ready']} units), "
+                        f"buffer_pending={s['pending']}, copy={copy_label} ({copy_elapsed}), "
+                        f"cuda_streak={cuda_error_streak}, "
+                        f"cuda_recoveries={cuda_recovery_attempts}, "
+                        f"eta={eta_str}, finish={finish_str}"
+                    )
+                    last_heartbeat = time.time()
+
+                if total_images % 200 == 0:
+                    gc.collect()
+                    if device.type == 'cuda':
+                        try:
+                            torch.cuda.empty_cache()
+                        except RuntimeError:
+                            pass
+
+                # Flush chunk
+                if chunk_vector_count >= MAX_VECTORS_PER_CHUNK:
+                    chunk_time = time.time() - chunk_start
+                    log(f"\n[Chunk {chunk_num:03d}] Flushing {chunk_vector_count:,} vectors "
+                        f"from {chunk_image_count} images")
+
+                    num_vectors = save_chunk(chunk_num, chunk_descriptors, chunk_ids, chunk_image_count)
+                    total_vectors += num_vectors
+
+                    chunk_num += 1
+                    save_progress(chunk_num, scanned_counts, next_id)
+                    path_db_unsynced_chunks += 1
+                    sync_db_now = path_db_unsynced_chunks >= PATH_DB_SYNC_EVERY_CHUNKS
+                    save_path_lookup(path_to_id, sync_db=sync_db_now)
+                    if sync_db_now:
+                        path_db_unsynced_chunks = 0
+
+                    elapsed = time.time() - start_time
+                    partial_folder = (folder_image_idx / max(folder_image_total, 1))
+                    approx_folders_done = folders_done + partial_folder
+                    folders_left = max(0.0, len(remaining) - approx_folders_done)
+                    rate = approx_folders_done / elapsed if elapsed > 0 else 0.0
+                    eta_seconds = (folders_left / rate) if rate > 0 else float("inf")
+                    s = buffer.status()
+
+                    log(f"  Time: {chunk_time:.0f}s | Vectors: {total_vectors:,} | "
+                        f"Folders: {folders_done:,}/{len(remaining):,} | "
+                        f"Buffer: {s['ready_gb']:.1f} GB ready | ETA: {format_eta(eta_seconds)}")
+
+                    chunk_descriptors = []
+                    chunk_ids = []
+                    chunk_vector_count = 0
+                    chunk_image_count = 0
+                    chunk_start = time.time()
+
+            # Folder done - record image count for skip optimization on re-run
+            scanned_counts[folder] = len(images)
+            buffer.mark_done(folder, folder_size)
+            folders_done += 1
+
+            if folder_image_total == 0:
+                folder_label = folder if len(folder) <= 64 else (folder[:61] + "...")
+                update_progress_line(format_progress_line(
+                    folders_done, len(remaining), 0, 0, chunk_num, chunk_vector_count,
+                    chunk_image_count, 0, "folder-skip", folder_label
+                ))
+
+        # Save progress after each batch
+        save_progress(chunk_num, scanned_counts, next_id)
+        if skipped_large_pending_flush:
+            append_skipped_large_paths(skipped_large_pending_flush)
+            skipped_large_pending_flush = []
+
+    # Stop folder buffer
+    buffer.stop_copying()
+
+    # Stop prefetch workers
+    for _ in range(PREFETCH_WORKERS):
+        path_queue.put(None)
+    for t in prefetch_threads:
+        t.join()
+
+    # Flush final chunk
     if chunk_descriptors:
         log(f"\n[Chunk {chunk_num:03d}] Final chunk: {chunk_vector_count:,} vectors "
             f"from {chunk_image_count} images")
         num_vectors = save_chunk(chunk_num, chunk_descriptors, chunk_ids, chunk_image_count)
         total_vectors += num_vectors
-        images_processed += chunk_image_count
         chunk_num += 1
-        save_progress(chunk_num, processed, next_id)
-        save_path_lookup(path_to_id)
+        save_progress(chunk_num, scanned_counts, next_id)
+        save_path_lookup(path_to_id, sync_db=True)
+        path_db_unsynced_chunks = 0
 
-    # Wait for any pending NAS copy before reporting final stats
+    if skipped_large_pending_flush:
+        append_skipped_large_paths(skipped_large_pending_flush)
+        skipped_large_pending_flush = []
+
     wait_for_nas_copy()
+    with _console_lock:
+        _clear_progress_line_locked()
 
-    # Final summary
+    # Cleanup buffer (NAS mode only)
+    if (not local_mode) and os.path.exists(LOCAL_BUFFER_DIR):
+        shutil.rmtree(LOCAL_BUFFER_DIR, ignore_errors=True)
+
+    # Summary
+    elapsed = time.time() - start_time
+    chunks_created = chunk_num - next_chunk
     log("\n" + "=" * 70)
     log("BUILD COMPLETE!")
-    chunks_created = chunk_num - next_chunk
     log(f"  Chunks created: {chunks_created}")
     log(f"  Total vectors:  {total_vectors:,}")
-    log(f"  Images OK:      {total_ok:,}")
+    log(f"  Images new:     {total_ok:,}")
+    log(f"  Images skipped (already indexed): {total_skipped:,}")
+    if SKIP_IF_MAX_DIM_OVER > 0:
+        log(f"  Images skipped (>{SKIP_IF_MAX_DIM_OVER}px): {total_skipped_large:,}")
+        log(f"  Skip list file: {SKIPPED_LARGE_FILE}")
     log(f"  Images failed:  {total_failed:,}")
+    log(f"  Folders done:   {folders_done:,}")
     log(f"  Unique paths:   {len(path_to_id):,}")
-    log(f"  Avg chunk size: {total_vectors / max(chunks_created, 1):,.0f} vectors "
-        f"(~{total_vectors * 512 / max(chunks_created, 1) / (1024**3):.1f} GB)")
-    log(f"  Total time:     {(time.time() - start_time) / 3600:.1f} hours")
+    if chunks_created > 0:
+        log(f"  Avg chunk size: {total_vectors / chunks_created:,.0f} vectors "
+            f"(~{total_vectors * 512 / chunks_created / (1024**3):.1f} GB)")
+    log(f"  Total time:     {elapsed / 3600:.1f} hours")
     log(f"  Chunks at:      {NAS_CHUNKS_DIR}")
     log(f"  Compact IDs at: {CHUNK_IDS_DIR}")
+    if buffer.errors:
+        log(f"  Copy errors:    {len(buffer.errors)}")
     log("=" * 70)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except CudaPoisonedError as e:
+        log(f"CUDA context poisoned: {e}")
+        log(f"Exiting with code {CUDA_POISON_EXIT_CODE} for supervisor restart.")
+        sys.exit(CUDA_POISON_EXIT_CODE)
+    except Exception as e:
+        log(f"FATAL: {e}")
+        log(traceback.format_exc().rstrip())
+        raise
