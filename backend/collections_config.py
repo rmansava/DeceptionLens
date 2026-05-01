@@ -4,6 +4,9 @@ Defines paths and settings for different content categories (books, print_ads, e
 """
 import os
 
+# Search priority order — books and print_ads first, then others
+SEARCH_ORDER = ["board_games", "print_ads", "books", "comics", "albums", "cereal"]
+
 # Collection definitions
 # Each collection has CLIP (FAISS), face (OpenSearch), and DISK (file) indexes
 COLLECTIONS = {
@@ -67,8 +70,11 @@ COLLECTIONS = {
     "comics": {
         "name": "Comics",
         "description": "Comic book pages",
-        # DISK search chunks
-        "disk_chunks_dir": "U:/faiss/disk_retrieval/comics_chunks",
+        # DISK search chunks — split across T: (10GbE, ~1206 chunks) and U: (1GbE, remainder)
+        "disk_chunks_dirs": [
+            "T:/faiss/disk_retrieval/comics_chunks",
+            "U:/faiss/disk_retrieval/comics_chunks",
+        ],
         "disk_chunk_ids_dir": "D:/faiss/disk_retrieval/comics_chunk_ids",
         # Source data
         "source_path": "T:/comics",
@@ -98,17 +104,29 @@ def get_collection_config(collection_name: str) -> dict:
 def get_disk_collections(categories: list = None) -> dict:
     """Get DISK chunk paths for selected categories (or all if None).
 
-    Returns dict of category -> {'chunks_dir': ..., 'ids_dir': ...}
-    Only includes categories that have disk_chunks_dir configured.
+    Returns OrderedDict of category -> {'chunks_dirs': [...], 'ids_dir': ...}
+    Only includes categories that have disk_chunks_dir or disk_chunks_dirs configured.
+    Categories are returned in SEARCH_ORDER priority.
+    For multi-dir collections, chunks are deduplicated (first dir wins).
     """
     result = {}
-    for name, config in COLLECTIONS.items():
-        if "disk_chunks_dir" not in config:
+    # Use SEARCH_ORDER for priority, then any remaining collections
+    ordered_names = list(SEARCH_ORDER) + [n for n in COLLECTIONS if n not in SEARCH_ORDER]
+    for name in ordered_names:
+        if name not in COLLECTIONS:
+            continue
+        config = COLLECTIONS[name]
+        if "disk_chunks_dir" not in config and "disk_chunks_dirs" not in config:
             continue
         if categories is not None and name not in categories:
             continue
+        # Support single dir or list of dirs
+        if "disk_chunks_dirs" in config:
+            chunks_dirs = list(config["disk_chunks_dirs"])
+        else:
+            chunks_dirs = [config["disk_chunks_dir"]]
         result[name] = {
-            "chunks_dir": config["disk_chunks_dir"],
+            "chunks_dirs": chunks_dirs,
             "ids_dir": config["disk_chunk_ids_dir"],
         }
     return result

@@ -35,6 +35,15 @@ logger = logging.getLogger(__name__)
 
 # Local SSD buffer for streaming chunks during search (shared across all categories)
 LOCAL_CHUNK_BUFFER = "D:/faiss/disk_retrieval/chunk_buffer"
+# Direct NAS mode: mmap chunks directly from NAS instead of copying to local SSD.
+# Faster on 10GbE (~62s/chunk vs ~113s with copy).
+# Set to comma-separated drive letters that support fast direct reads (10GbE).
+# Chunks on other drives use the rolling buffer (copy to local SSD first).
+DIRECT_NAS_DRIVES = set(
+    d.strip().upper().rstrip(":")
+    for d in os.environ.get("DISK_DIRECT_NAS_DRIVES", "").split(",")
+    if d.strip()
+)
 SEARCH_CHECKPOINT_DIR = os.environ.get(
     "DISK_SEARCH_CHECKPOINT_DIR",
     "D:/faiss/disk_retrieval/search_checkpoints"
@@ -53,6 +62,7 @@ _gpu_search_available = None  # None = not checked, True/False after check
 GPU_SEARCH_BATCH_SIZE = int(os.environ.get("DISK_GPU_BATCH_SIZE", "4000000"))
 GPU_SEARCH_USE_FP16 = os.environ.get("DISK_GPU_FP16", "1") != "0"
 GPU_SEARCH_MAX_SCORES_BYTES = int(float(os.environ.get("DISK_GPU_MAX_SCORES_GB", "4")) * (1024 ** 3))
+MAX_QUERY_KEYPOINTS = int(os.environ.get("DISK_MAX_QUERY_KEYPOINTS", "2000"))
 DISK_PAGE0_DEBOOST = float(os.environ.get("DISK_PAGE0_DEBOOST", "0.5"))
 DISK_PAGE0_DEBOOST = min(1.0, max(0.0, DISK_PAGE0_DEBOOST))
 _PAGE0_BASENAME_RE = re.compile(r"(^|[-_])page0\.[a-z0-9]+$", re.IGNORECASE)
@@ -183,8 +193,9 @@ def _gpu_search_batch(index, query_list, k):
     n_vectors = index.ntotal
     dim = index.d
 
-    # Get all vectors as a numpy view directly from FAISS internal storage (zero copy)
-    all_vectors = faiss.vector_to_array(index.codes).view("float32").reshape(n_vectors, dim)
+    # Get a zero-copy numpy view of FAISS internal storage (avoids 10GB allocation)
+    xb = faiss.rev_swig_ptr(index.get_xb(), n_vectors * dim)
+    all_vectors = xb.reshape(n_vectors, dim)
 
     batch_size = GPU_SEARCH_BATCH_SIZE
 
@@ -233,7 +244,11 @@ def _gpu_search_batch(index, query_list, k):
                         q_batch = q_tensor[q_start:q_end]
 
                         # Inner product: (n_query_sub, dim) @ (dim, db_count) = (n_query_sub, db_count)
-                        scores = torch.mm(q_batch, db_t)
+                        try:
+                            scores = torch.mm(q_batch, db_t)
+                        except RuntimeError:
+                            # FP16 CUBLAS error fallback to FP32
+                            scores = torch.mm(q_batch.float(), db_t.float()).half() if tensor_dtype == torch.float16 else torch.mm(q_batch, db_t)
 
                         batch_scores, batch_idx = scores.topk(batch_k, dim=1)
                         batch_idx += current
@@ -523,6 +538,13 @@ def extract_disk_features_bundle(image_bytes: bytes):
     # Normalize descriptors
     norms = np.linalg.norm(descriptors, axis=1, keepdims=True)
     descriptors = descriptors / (norms + 1e-8)
+
+    # Cap keypoints to limit GPU search time in batch mode
+    if MAX_QUERY_KEYPOINTS > 0 and len(descriptors) > MAX_QUERY_KEYPOINTS:
+        # Keep keypoints with highest pre-normalization norms (most distinctive)
+        top_idx = np.argsort(norms.ravel())[-MAX_QUERY_KEYPOINTS:]
+        descriptors = descriptors[top_idx]
+        keypoints = keypoints[top_idx]
 
     return {
         "descriptors": descriptors.astype('float32'),
@@ -820,8 +842,9 @@ def _collect_chunks(categories=None):
     """
     Collect all chunk files across selected categories.
 
-    Returns list of (chunk_file, chunk_ids_dir) tuples sorted by filename,
+    Returns list of (chunk_file, chunk_ids_dir) tuples in SEARCH_ORDER priority,
     and a dict of category -> chunk_count for progress tracking.
+    For multi-dir collections, deduplicates by chunk name (first dir wins).
     """
     disk_collections = get_disk_collections(categories)
 
@@ -829,20 +852,29 @@ def _collect_chunks(categories=None):
     category_counts = {}
 
     for cat_name, cat_config in disk_collections.items():
-        chunks_dir = cat_config["chunks_dir"]
+        chunks_dirs = cat_config["chunks_dirs"]
         ids_dir = cat_config["ids_dir"]
 
-        chunk_files = sorted(glob(os.path.join(chunks_dir, "chunk_*.faiss")),
-                             key=lambda f: int(os.path.basename(f).split('_')[1].split('.')[0]))
-        category_counts[cat_name] = len(chunk_files)
+        # Collect from all dirs, deduplicate by chunk name (first dir wins)
+        seen_chunks = set()
+        cat_chunks = []
+        for chunks_dir in chunks_dirs:
+            chunk_files = sorted(glob(os.path.join(chunks_dir, "chunk_*.faiss")),
+                                 key=lambda f: int(os.path.basename(f).split('_')[1].split('.')[0]))
+            for cf in chunk_files:
+                chunk_name = os.path.basename(cf)
+                if chunk_name not in seen_chunks:
+                    seen_chunks.add(chunk_name)
+                    cat_chunks.append((cf, ids_dir))
 
-        for cf in chunk_files:
-            all_chunks.append((cf, ids_dir))
+        category_counts[cat_name] = len(cat_chunks)
+        all_chunks.extend(cat_chunks)
 
-        if chunk_files:
-            logger.info(f"  {cat_name}: {len(chunk_files)} chunks from {chunks_dir}")
+        if cat_chunks:
+            dir_summary = ", ".join(f"{d}" for d in chunks_dirs)
+            logger.info(f"  {cat_name}: {len(cat_chunks)} chunks from {dir_summary}")
         else:
-            logger.info(f"  {cat_name}: no chunks found in {chunks_dir}")
+            logger.info(f"  {cat_name}: no chunks found")
 
     return all_chunks, category_counts
 
@@ -996,26 +1028,39 @@ def _search_chunks_rolling_buffer(
     if start_idx > 0:
         logger.info(f"Resuming DISK search from chunk {start_idx + 1}/{total_chunks}")
 
-    # Clean buffer of any stale files from previous searches
-    if os.path.exists(LOCAL_CHUNK_BUFFER):
-        for f in os.listdir(LOCAL_CHUNK_BUFFER):
-            try:
-                os.remove(os.path.join(LOCAL_CHUNK_BUFFER, f))
-            except OSError:
-                pass
-    os.makedirs(LOCAL_CHUNK_BUFFER, exist_ok=True)
     search_start = time.time()
 
-    # Start continuous background copy of ALL chunks (keeps NAS pipe full)
-    copy_queue = Queue()
+    # Split chunks into direct-NAS (fast drives) and buffer-needed (slow drives)
+    buffer_chunks = [
+        (i, cf, ids) for i, (cf, ids) in enumerate(chunk_list)
+        if i >= start_idx and os.path.splitdrive(cf)[0].rstrip(":").upper() not in DIRECT_NAS_DRIVES
+    ]
+    needs_buffer = len(buffer_chunks) > 0
+    copy_queue = None
 
-    logger.info(f"Starting rolling buffer search (buffer size: {buffer_size} chunks, GPU: {use_gpu})")
-    copy_thread = Thread(
-        target=_copy_chunk_worker,
-        args=(copy_queue, chunk_list, start_idx, total_chunks - start_idx, buffer_size)
-    )
-    copy_thread.daemon = True
-    copy_thread.start()
+    logger.info(f"Starting search ({total_chunks} chunks, direct NAS drives: {DIRECT_NAS_DRIVES}, GPU: {use_gpu})")
+    if needs_buffer:
+        # Clean buffer of any stale files from previous searches
+        if os.path.exists(LOCAL_CHUNK_BUFFER):
+            for f in os.listdir(LOCAL_CHUNK_BUFFER):
+                try:
+                    os.remove(os.path.join(LOCAL_CHUNK_BUFFER, f))
+                except OSError:
+                    pass
+        os.makedirs(LOCAL_CHUNK_BUFFER, exist_ok=True)
+
+        # Build a chunk list of only the buffer-needed chunks for the copy worker
+        buffer_chunk_list = [(cf, ids) for _, cf, ids in buffer_chunks]
+        buffer_idx_set = {i for i, _, _ in buffer_chunks}
+        copy_queue = Queue()
+        logger.info(f"  Rolling buffer for {len(buffer_chunks)} slow-drive chunks (buffer size: {buffer_size})")
+        copy_thread = Thread(
+            target=_copy_chunk_worker,
+            args=(copy_queue, buffer_chunk_list, 0, len(buffer_chunk_list), buffer_size)
+        )
+        copy_thread.daemon = True
+        copy_thread.start()
+        buffer_copy_idx = 0  # tracks position in buffer_chunk_list
 
     for chunk_idx in range(start_idx, total_chunks):
         # Check if search was stopped
@@ -1026,33 +1071,42 @@ def _search_chunks_rolling_buffer(
 
         nas_chunk_file, chunk_ids_dir = chunk_list[chunk_idx]
         chunk_name = os.path.basename(nas_chunk_file)
-        local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
+        chunk_drive = os.path.splitdrive(nas_chunk_file)[0].rstrip(":").upper()
+        use_direct = chunk_drive in DIRECT_NAS_DRIVES
 
-        # Wait for this chunk to be ready
-        logger.info(f"[{chunk_idx + 1}/{total_chunks}] Waiting for {chunk_name}...")
-        ready = False
-        while not ready:
+        if use_direct:
+            # Direct NAS mode: mmap straight from NAS path
+            logger.info(f"[{chunk_idx + 1}/{total_chunks}] {chunk_name} (direct)...")
+            load_start = time.time()
+            index = faiss.read_index(nas_chunk_file, faiss.IO_FLAG_MMAP)
+        else:
+            # Rolling buffer mode: wait for local copy
+            local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
+
+            logger.info(f"[{chunk_idx + 1}/{total_chunks}] Waiting for {chunk_name} (buffer)...")
+            ready = False
+            while not ready:
+                if check_stopped and check_stopped():
+                    stopped = True
+                    break
+                try:
+                    ready_idx, _ = copy_queue.get(timeout=1)
+                    if ready_idx == buffer_copy_idx:
+                        ready = True
+                        buffer_copy_idx += 1
+                    else:
+                        copy_queue.put((ready_idx, _))
+                except Empty:
+                    pass  # keep waiting for queue signal
+
             if check_stopped and check_stopped():
+                logger.info(f"Search stopped by user while waiting for chunk")
                 stopped = True
                 break
-            try:
-                ready_idx, _ = copy_queue.get(timeout=1)
-                if ready_idx == chunk_idx:
-                    ready = True
-                else:
-                    copy_queue.put((ready_idx, _))
-            except Empty:
-                pass  # keep waiting for queue signal
 
-        if check_stopped and check_stopped():
-            logger.info(f"Search stopped by user while waiting for chunk")
-            stopped = True
-            break
-
-        # Load and search
-        logger.info(f"  Searching {chunk_name}...")
-        load_start = time.time()
-        index = faiss.read_index(local_chunk_file, faiss.IO_FLAG_MMAP)
+            logger.info(f"  Searching {chunk_name}...")
+            load_start = time.time()
+            index = faiss.read_index(local_chunk_file, faiss.IO_FLAG_MMAP)
 
         # Load paths using this chunk's category-specific IDs dir
         paths_or_ids, id_to_path = load_chunk_paths(nas_chunk_file, chunk_ids_dir)
@@ -1085,12 +1139,13 @@ def _search_chunks_rolling_buffer(
         # Free memory
         del index, paths_or_ids
 
-        # Delete this chunk to make room for more in the buffer
-        try:
-            os.remove(local_chunk_file)
-            logger.info(f"  Deleted {chunk_name} from buffer")
-        except Exception as e:
-            logger.warning(f"  Failed to delete {chunk_name}: {e}")
+        if not use_direct:
+            # Delete this chunk to make room for more in the buffer
+            try:
+                os.remove(local_chunk_file)
+                logger.info(f"  Deleted {chunk_name} from buffer")
+            except Exception as e:
+                logger.warning(f"  Failed to delete {chunk_name}: {e}")
 
         # Progress update
         elapsed = time.time() - search_start
@@ -1217,7 +1272,40 @@ def get_total_chunks(categories=None):
     return sum(category_counts.values())
 
 
-def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, progress_callback=None, check_stopped=None, excluded_paths: set = None):
+BATCH_CHECKPOINT_DIR = os.environ.get("DISK_BATCH_CHECKPOINT_DIR", "D:/faiss/disk_retrieval/batch_checkpoints")
+BATCH_CHECKPOINT_INTERVAL = max(1, int(os.environ.get("DISK_BATCH_CHECKPOINT_INTERVAL", "5")))
+
+
+def _save_batch_checkpoint(checkpoint_file: str, chunk_idx: int, per_image_votes: dict):
+    """Save batch search progress to a checkpoint file."""
+    os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
+    data = {
+        "chunk_idx": chunk_idx,
+        "votes": {name: dict(votes) for name, votes in per_image_votes.items()},
+    }
+    tmp = checkpoint_file + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.replace(tmp, checkpoint_file)
+    logger.info(f"  Checkpoint saved at chunk {chunk_idx}")
+
+
+def _load_batch_checkpoint(checkpoint_file: str):
+    """Load batch search checkpoint. Returns (chunk_idx, per_image_votes) or None."""
+    if not os.path.exists(checkpoint_file):
+        return None
+    try:
+        with open(checkpoint_file) as f:
+            data = json.load(f)
+        chunk_idx = data["chunk_idx"]
+        votes = {name: Counter(v) for name, v in data["votes"].items()}
+        return chunk_idx, votes
+    except Exception as e:
+        logger.warning(f"Failed to load checkpoint: {e}")
+        return None
+
+
+def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: int, threshold: float, top_n: int, buffer_size: int = 5, progress_callback=None, check_stopped=None, excluded_paths: set = None, checkpoint_file: str = None):
     """
     Search using rolling buffer with MULTIPLE query images at once.
 
@@ -1237,47 +1325,78 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
     excluded_paths = excluded_paths or set()
     total_chunks = len(chunk_list)
     use_gpu = _check_gpu_search()
+    start_idx = 0
 
-    # Clean buffer
-    if os.path.exists(LOCAL_CHUNK_BUFFER):
-        for f in os.listdir(LOCAL_CHUNK_BUFFER):
-            try:
-                os.remove(os.path.join(LOCAL_CHUNK_BUFFER, f))
-            except OSError:
-                pass
-    os.makedirs(LOCAL_CHUNK_BUFFER, exist_ok=True)
+    # Resume from checkpoint if available
+    if checkpoint_file:
+        checkpoint = _load_batch_checkpoint(checkpoint_file)
+        if checkpoint:
+            start_idx, saved_votes = checkpoint
+            # Restore votes for images that exist in current query_list
+            for name, votes in saved_votes.items():
+                if name in per_image_votes:
+                    per_image_votes[name] = votes
+            logger.info(f"Resumed from checkpoint: chunk {start_idx}/{total_chunks} ({len(saved_votes)} images)")
+        else:
+            logger.info("No checkpoint found, starting from chunk 1")
+
     search_start = time.time()
 
-    # Start continuous background copy of ALL chunks (keeps NAS pipe full)
-    copy_queue = Queue()
+    # Split chunks into direct-NAS (fast drives) and buffer-needed (slow drives)
+    buffer_chunks = [
+        (i, cf, ids) for i, (cf, ids) in enumerate(chunk_list)
+        if i >= start_idx and os.path.splitdrive(cf)[0].rstrip(":").upper() not in DIRECT_NAS_DRIVES
+    ]
+    needs_buffer = len(buffer_chunks) > 0
+    copy_queue = None
 
-    logger.info(f"Starting batch rolling buffer search ({len(query_list)} images, buffer: {buffer_size} chunks, GPU: {use_gpu})")
-    copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, chunk_list, 0, total_chunks, buffer_size))
-    copy_thread.daemon = True
-    copy_thread.start()
+    logger.info(f"Starting batch search ({len(query_list)} images, {total_chunks} chunks, start={start_idx+1}, direct NAS drives: {DIRECT_NAS_DRIVES}, GPU: {use_gpu})")
+    if needs_buffer:
+        if os.path.exists(LOCAL_CHUNK_BUFFER):
+            for f in os.listdir(LOCAL_CHUNK_BUFFER):
+                try:
+                    os.remove(os.path.join(LOCAL_CHUNK_BUFFER, f))
+                except OSError:
+                    pass
+        os.makedirs(LOCAL_CHUNK_BUFFER, exist_ok=True)
 
-    for chunk_idx in range(total_chunks):
+        buffer_chunk_list = [(cf, ids) for _, cf, ids in buffer_chunks]
+        copy_queue = Queue()
+        logger.info(f"  Rolling buffer for {len(buffer_chunks)} slow-drive chunks (buffer size: {buffer_size})")
+        copy_thread = Thread(target=_copy_chunk_worker, args=(copy_queue, buffer_chunk_list, 0, len(buffer_chunk_list), buffer_size))
+        copy_thread.daemon = True
+        copy_thread.start()
+        buffer_copy_idx = 0
+
+    for chunk_idx in range(start_idx, total_chunks):
         nas_chunk_file, chunk_ids_dir = chunk_list[chunk_idx]
         chunk_name = os.path.basename(nas_chunk_file)
-        local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
+        chunk_drive = os.path.splitdrive(nas_chunk_file)[0].rstrip(":").upper()
+        use_direct = chunk_drive in DIRECT_NAS_DRIVES
 
-        # Wait for this chunk to be ready
-        logger.info(f"[{chunk_idx + 1}/{total_chunks}] Waiting for {chunk_name}...")
-        ready = False
-        while not ready:
-            try:
-                ready_idx, _ = copy_queue.get(timeout=1)
-                if ready_idx == chunk_idx:
-                    ready = True
-                else:
-                    copy_queue.put((ready_idx, _))
-            except Empty:
-                pass
+        if use_direct:
+            logger.info(f"[{chunk_idx + 1}/{total_chunks}] {chunk_name} (direct)...")
+            load_start = time.time()
+            index = faiss.read_index(nas_chunk_file, faiss.IO_FLAG_MMAP)
+        else:
+            local_chunk_file = os.path.join(LOCAL_CHUNK_BUFFER, chunk_name)
 
-        # Load chunk
-        logger.info(f"  Loading {chunk_name}...")
-        load_start = time.time()
-        index = faiss.read_index(local_chunk_file, faiss.IO_FLAG_MMAP)
+            logger.info(f"[{chunk_idx + 1}/{total_chunks}] Waiting for {chunk_name} (buffer)...")
+            ready = False
+            while not ready:
+                try:
+                    ready_idx, _ = copy_queue.get(timeout=1)
+                    if ready_idx == buffer_copy_idx:
+                        ready = True
+                        buffer_copy_idx += 1
+                    else:
+                        copy_queue.put((ready_idx, _))
+                except Empty:
+                    pass
+
+            logger.info(f"  Loading {chunk_name}...")
+            load_start = time.time()
+            index = faiss.read_index(local_chunk_file, faiss.IO_FLAG_MMAP)
         paths_or_ids, id_to_path = load_chunk_paths(nas_chunk_file, chunk_ids_dir)
         load_time = time.time() - load_start
         logger.info(f"  Loaded in {load_time:.1f}s")
@@ -1337,15 +1456,21 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
         # Free memory
         del index, paths_or_ids
 
-        # Delete chunk to make room for more in the buffer
-        try:
-            os.remove(local_chunk_file)
-        except Exception as e:
-            logger.warning(f"  Failed to delete {chunk_name}: {e}")
+        if not use_direct:
+            # Delete chunk to make room for more in the buffer
+            try:
+                os.remove(local_chunk_file)
+            except Exception as e:
+                logger.warning(f"  Failed to delete {chunk_name}: {e}")
+
+        # Save checkpoint periodically
+        if checkpoint_file and (chunk_idx + 1) % BATCH_CHECKPOINT_INTERVAL == 0:
+            _save_batch_checkpoint(checkpoint_file, chunk_idx + 1, per_image_votes)
 
         # Progress
+        chunks_done = chunk_idx - start_idx + 1
         elapsed = time.time() - search_start
-        avg_per_chunk = elapsed / (chunk_idx + 1)
+        avg_per_chunk = elapsed / chunks_done
         remaining = (total_chunks - chunk_idx - 1) * avg_per_chunk
         logger.info(f"  Progress: {chunk_idx + 1}/{total_chunks} chunks | ETA: {remaining/60:.1f}m")
 
@@ -1375,7 +1500,7 @@ def _search_chunks_rolling_buffer_batch(query_list: list, chunk_list: list, k: i
     return per_image_votes
 
 
-def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: float = 0.7, categories: list = None, progress_callback=None, check_stopped=None, excluded_paths: set = None):
+def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: float = 0.7, categories: list = None, progress_callback=None, check_stopped=None, excluded_paths: set = None, checkpoint_file: str = None):
     """
     Batch DISK search: search multiple images in one pass through all chunks.
 
@@ -1417,7 +1542,8 @@ def search_disk_batch(image_list: list, top_k: int = 50, k: int = 5, threshold: 
         query_list, all_chunks, k, threshold, top_k,
         buffer_size=5, progress_callback=progress_callback,
         check_stopped=check_stopped,
-        excluded_paths=excluded_paths
+        excluded_paths=excluded_paths,
+        checkpoint_file=checkpoint_file
     )
 
     # Format results

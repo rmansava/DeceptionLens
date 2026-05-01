@@ -24,7 +24,8 @@ from disk_searcher import (
     search_disk_batch,
     get_total_chunks,
     localize_disk_results,
-    rerank_disk_results
+    rerank_disk_results,
+    BATCH_CHECKPOINT_DIR,
 )
 from db_helper import (
     create_search_session,
@@ -70,6 +71,7 @@ def main():
     parser.add_argument("--collections", type=str, default=None, help="Comma-separated collections (default: all)")
     parser.add_argument("--no-rerank", action="store_true", help="Disable geometric reranking secondary pass")
     parser.add_argument("--rerank_top_n", type=int, default=1000, help="Top candidates per image to localize/rerank (default: 1000)")
+    parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     args = parser.parse_args()
     rerank_enabled = not args.no_rerank
 
@@ -194,6 +196,18 @@ def main():
               f"ETA: {eta_str} | {vote_summary}     ",
               end="", flush=True)
 
+    # Checkpoint file for resume support
+    # Named by directory basename so different batch dirs get separate checkpoints
+    dir_name = os.path.basename(os.path.normpath(directory))
+    checkpoint_file = os.path.join(BATCH_CHECKPOINT_DIR, f"batch_{dir_name}.json")
+    if args.resume:
+        print(f"Resume mode: checking for checkpoint at {checkpoint_file}")
+    else:
+        # Clear old checkpoint for fresh run
+        if os.path.exists(checkpoint_file):
+            os.remove(checkpoint_file)
+            print(f"Cleared old checkpoint")
+
     # Run batch search
     print("Searching...")
     excluded_paths = get_excluded_paths(search_type="DISK")
@@ -207,8 +221,14 @@ def main():
         categories=categories,
         progress_callback=progress_callback,
         check_stopped=check_stopped,
-        excluded_paths=excluded_paths
+        excluded_paths=excluded_paths,
+        checkpoint_file=checkpoint_file
     )
+
+    # Clear checkpoint on successful completion
+    if os.path.exists(checkpoint_file):
+        os.remove(checkpoint_file)
+        print("Checkpoint cleared (search complete)")
     print()  # Newline after progress
 
     if rerank_enabled:
